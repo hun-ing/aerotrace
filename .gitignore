@@ -1,0 +1,25 @@
+# .gitignore (루트 디렉터리에 생성)
+
+# 1. OS & IDE
+.DS_Store
+.idea/
+*.iml
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+
+# 2. Backend (Java / Spring Boot)
+/backend/.gradle/
+/backend/build/
+/backend/bin/
+/backend/out/
+/backend/logs/
+
+# 3. Frontend (Node.js / Next.js)
+/frontend/node_modules/
+/frontend/.next/
+/frontend/out/
+/frontend/dist/
+/frontend/build/
+/frontend/.env*.local

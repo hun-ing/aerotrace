@@ -1,0 +1,28 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+exporters:
+  # 데이터가 잘 들어오는지 도커 로그로 확인하기 위한 용도
+  debug:
+    verbosity: detailed
+    
+  # 백엔드가 아직 없더라도, 훗날 띄울 Java 백엔드를 향해 데이터를 쏘도록 미리 설정
+  otlphttp:
+    endpoint: "http://host.docker.internal:8080/v1/traces" 
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, otlphttp]
