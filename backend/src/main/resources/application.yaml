@@ -1,0 +1,18 @@
+spring:
+  application:
+    name: aerotrace-backend
+
+  threads:
+    virtual:
+      enabled: true
+
+  main:
+    keep-alive: true
+
+server:
+  port: 8080
+
+management:
+  endpoint:
+    health:
+      show-details: never
