@@ -15,13 +15,18 @@ public record ParsedSpan(
         String traceId,
         String spanId,
         String parentSpanId,
+        String traceState,
+        long flags,
         String name,
         short spanKind,
         short statusCode,
         String statusMessage,
         Instant startTime,
         Instant endTime,
-        long durationNano
+        long durationNano,
+        long droppedAttributesCount,
+        long droppedEventsCount,
+        long droppedLinksCount
 ) {
 
   public ParsedSpan {

@@ -21,6 +21,8 @@ public class JdbcSpanWriter implements SpanWriter {
             trace_id,
             span_id,
             parent_span_id,
+            trace_state,
+            flags,
             service_name,
             scope_name,
             scope_version,
@@ -34,16 +36,21 @@ public class JdbcSpanWriter implements SpanWriter {
             resource_attributes,
             span_attributes,
             events,
-            links
+            links,
+            dropped_attributes_count,
+            dropped_events_count,
+            dropped_links_count
         )
         VALUES (
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
+            ?, ?,
             CAST(? AS jsonb),
             CAST(? AS jsonb),
             CAST(? AS jsonb),
-            CAST(? AS jsonb)
+            CAST(? AS jsonb),
+            ?, ?, ?
         )
         ON CONFLICT (
             tenant_id,
@@ -87,17 +94,20 @@ public class JdbcSpanWriter implements SpanWriter {
                 statement.setString(5, span.parentSpanId());
               }
 
-              statement.setString(6, span.serviceName());
-              statement.setString(7, span.scopeName());
-              statement.setString(8, span.scopeVersion());
-              statement.setString(9, span.name());
+              statement.setString(6, span.traceState());
+              statement.setLong(7, span.flags());
 
-              statement.setShort(10, span.spanKind());
-              statement.setShort(11, span.statusCode());
-              statement.setString(12, span.statusMessage());
+              statement.setString(8, span.serviceName());
+              statement.setString(9, span.scopeName());
+              statement.setString(10, span.scopeVersion());
+              statement.setString(11, span.name());
+
+              statement.setShort(12, span.spanKind());
+              statement.setShort(13, span.statusCode());
+              statement.setString(14, span.statusMessage());
 
               statement.setObject(
-                      13,
+                      15,
                       OffsetDateTime.ofInstant(
                               span.startTime(),
                               ZoneOffset.UTC
@@ -105,41 +115,56 @@ public class JdbcSpanWriter implements SpanWriter {
               );
 
               statement.setObject(
-                      14,
+                      16,
                       OffsetDateTime.ofInstant(
                               span.endTime(),
                               ZoneOffset.UTC
                       )
               );
 
-              statement.setLong(15, span.durationNano());
+              statement.setLong(17, span.durationNano());
 
               statement.setString(
-                      16,
+                      18,
                       objectMapper.writeValueAsString(
                               span.resourceAttributes()
                       )
               );
 
               statement.setString(
-                      17,
+                      19,
                       objectMapper.writeValueAsString(
                               span.spanAttributes()
                       )
               );
 
               statement.setString(
-                      18,
+                      20,
                       objectMapper.writeValueAsString(
                               span.events()
                       )
               );
 
               statement.setString(
-                      19,
+                      21,
                       objectMapper.writeValueAsString(
                               span.links()
                       )
+              );
+
+              statement.setLong(
+                      22,
+                      span.droppedAttributesCount()
+              );
+
+              statement.setLong(
+                      23,
+                      span.droppedEventsCount()
+              );
+
+              statement.setLong(
+                      24,
+                      span.droppedLinksCount()
               );
             }
     );

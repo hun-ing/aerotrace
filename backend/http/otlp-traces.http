@@ -534,3 +534,110 @@ X-AeroTrace-Project-Id: {{projectId}}
         );
     });
 %}
+
+### 13. Span traceState, flags, dropped count 저장
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
+
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "span-metadata-test-service"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "span-metadata-test",
+            "version": "1.0.0"
+          },
+          "spans": [
+            {
+              "traceId": "abababababababababababababababab",
+              "spanId": "cdcdcdcdcdcdcdcd",
+              "traceState": "vendor=value",
+              "flags": 257,
+              "name": "GET /span-metadata",
+              "kind": 2,
+              "startTimeUnixNano": "1581452780000000000",
+              "endTimeUnixNano": "1581452780500000000",
+              "droppedAttributesCount": 3,
+              "droppedEventsCount": 2,
+              "droppedLinksCount": 1,
+              "status": {
+                "code": 1
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("Span 메타데이터 요청은 200을 반환한다", function () {
+        client.assert(
+            response.status === 200,
+            "예상 상태는 200이지만 실제 상태는 " + response.status
+        );
+    });
+%}
+
+### 14. unsigned 32비트 범위를 초과한 flags
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
+
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "invalid-flags-test"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "traceId": "10101010101010101010101010101010",
+              "spanId": "2020202020202020",
+              "flags": 4294967296,
+              "name": "invalid flags",
+              "startTimeUnixNano": "1581452780000000000",
+              "endTimeUnixNano": "1581452780500000000"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("uint32 범위 초과 flags는 400을 반환한다", function () {
+        client.assert(
+            response.status === 400,
+            "예상 상태는 400이지만 실제 상태는 " +
+            response.status
+        );
+    });
+%}

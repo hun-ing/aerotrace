@@ -162,6 +162,27 @@ public class OtlpTraceRequestParser {
             path + ".links"
     );
 
+    long droppedAttributesCount = optionalUnsignedInt(
+            span,
+            "droppedAttributesCount",
+            path,
+            0
+    );
+
+    long droppedEventsCount = optionalUnsignedInt(
+            span,
+            "droppedEventsCount",
+            path,
+            0
+    );
+
+    long droppedLinksCount = optionalUnsignedInt(
+            span,
+            "droppedLinksCount",
+            path,
+            0
+    );
+
     String traceId = requiredHexId(
             span,
             "traceId",
@@ -179,6 +200,20 @@ public class OtlpTraceRequestParser {
     );
 
     String parentSpanId = optionalParentSpanId(span, path);
+
+    String traceState = optionalString(
+            span,
+            "traceState",
+            path,
+            ""
+    );
+
+    long flags = optionalUnsignedInt(
+            span,
+            "flags",
+            path,
+            0
+    );
 
     String name = requiredNonBlankString(
             span,
@@ -243,13 +278,18 @@ public class OtlpTraceRequestParser {
             traceId,
             spanId,
             parentSpanId,
+            traceState,
+            flags,
             name,
             spanKind,
             status.code(),
             status.message(),
             toInstant(startTimeUnixNano),
             toInstant(endTimeUnixNano),
-            durationNano
+            durationNano,
+            droppedAttributesCount,
+            droppedEventsCount,
+            droppedLinksCount
     );
   }
 

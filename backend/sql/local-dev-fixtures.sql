@@ -4,7 +4,9 @@ WHERE tenant_id = '11111111-1111-1111-1111-111111111111'
   AND project_id = '22222222-2222-2222-2222-222222222222'
   AND service_name IN (
                        'aerotrace-manual-test',
-                       'attribute-test-service'
+                       'attribute-test-service',
+                       'event-link-test-service',
+                       'span-metadata-test-service'
     );
 
 
