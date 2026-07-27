@@ -11,11 +11,19 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.regex.Pattern;
+import java.util.Map;
 
 @Component
 public class OtlpTraceRequestParser {
 
   private static final long NANOS_PER_SECOND = 1_000_000_000L;
+  private final OtlpAnyValueParser anyValueParser;
+
+  public OtlpTraceRequestParser(
+          OtlpAnyValueParser anyValueParser
+  ) {
+    this.anyValueParser = anyValueParser;
+  }
 
   private static final Pattern TRACE_ID_PATTERN =
           Pattern.compile("^[0-9a-fA-F]{32}$");
@@ -45,7 +53,7 @@ public class OtlpTraceRequestParser {
 
       requireObject(resourceSpan, resourcePath);
 
-      String serviceName = findServiceName(
+      ResourceDetails resourceDetails = parseResource(
               resourceSpan.get("resource"),
               resourcePath + ".resource"
       );
@@ -62,7 +70,7 @@ public class OtlpTraceRequestParser {
       parseScopeSpans(
               scopeSpans,
               scopeSpansPath,
-              serviceName,
+              resourceDetails,
               parsedSpans
       );
     }
@@ -73,7 +81,7 @@ public class OtlpTraceRequestParser {
   private void parseScopeSpans(
           JsonNode scopeSpans,
           String scopeSpansPath,
-          String serviceName,
+          ResourceDetails resourceDetails,
           List<ParsedSpan> parsedSpans
   ) {
     for (int scopeIndex = 0;
@@ -108,7 +116,7 @@ public class OtlpTraceRequestParser {
 
         requireObject(span, spanPath);
 
-        if (serviceName == null) {
+        if (resourceDetails.serviceName() == null) {
           throw invalidRequest(
                   spanPath
                           + " requires resource attribute service.name"
@@ -119,7 +127,7 @@ public class OtlpTraceRequestParser {
                 parseSpan(
                         span,
                         spanPath,
-                        serviceName,
+                        resourceDetails,
                         scopeDetails
                 )
         );
@@ -130,9 +138,15 @@ public class OtlpTraceRequestParser {
   private ParsedSpan parseSpan(
           JsonNode span,
           String path,
-          String serviceName,
+          ResourceDetails resourceDetails,
           ScopeDetails scopeDetails
   ) {
+    Map<String, Object> spanAttributes =
+            anyValueParser.parseAttributes(
+                    span.get("attributes"),
+                    path + ".attributes"
+            );
+
     String traceId = requiredHexId(
             span,
             "traceId",
@@ -204,7 +218,9 @@ public class OtlpTraceRequestParser {
     }
 
     return new ParsedSpan(
-            serviceName,
+            resourceDetails.serviceName(),
+            resourceDetails.attributes(),
+            spanAttributes,
             scopeDetails.name(),
             scopeDetails.version(),
             traceId,
@@ -220,69 +236,53 @@ public class OtlpTraceRequestParser {
     );
   }
 
-  private String findServiceName(
+  private ResourceDetails parseResource(
           JsonNode resource,
           String path
   ) {
     if (isMissing(resource)) {
-      return null;
+      return new ResourceDetails(
+              null,
+              Map.of()
+      );
     }
 
     requireObject(resource, path);
 
-    JsonNode attributes = resource.get("attributes");
+    Map<String, Object> attributes =
+            anyValueParser.parseAttributes(
+                    resource.get("attributes"),
+                    path + ".attributes"
+            );
 
-    if (isMissing(attributes)) {
-      return null;
+    Object serviceNameValue =
+            attributes.get("service.name");
+
+    if (serviceNameValue == null) {
+      return new ResourceDetails(
+              null,
+              attributes
+      );
     }
 
-    String attributesPath = path + ".attributes";
-    requireArray(attributes, attributesPath);
-
-    for (int index = 0; index < attributes.size(); index++) {
-      JsonNode attribute = attributes.get(index);
-      String attributePath = attributesPath + "[" + index + "]";
-
-      requireObject(attribute, attributePath);
-
-      JsonNode keyNode = attribute.get("key");
-
-      if (keyNode == null || !keyNode.isString()) {
-        throw invalidRequest(
-                attributePath + ".key must be a JSON string"
-        );
-      }
-
-      if (!"service.name".equals(keyNode.asString())) {
-        continue;
-      }
-
-      JsonNode value = attribute.get("value");
-      String valuePath = attributePath + ".value";
-
-      requireObject(value, valuePath);
-
-      JsonNode stringValue = value.get("stringValue");
-
-      if (stringValue == null || !stringValue.isString()) {
-        throw invalidRequest(
-                valuePath
-                        + ".stringValue must be a JSON string"
-        );
-      }
-
-      String serviceName = stringValue.asString();
-
-      if (serviceName.isBlank()) {
-        throw invalidRequest(
-                valuePath + ".stringValue must not be blank"
-        );
-      }
-
-      return serviceName;
+    if (!(serviceNameValue instanceof String serviceName)) {
+      throw invalidRequest(
+              path
+                      + ".attributes service.name must be a string"
+      );
     }
 
-    return null;
+    if (serviceName.isBlank()) {
+      throw invalidRequest(
+              path
+                      + ".attributes service.name must not be blank"
+      );
+    }
+
+    return new ResourceDetails(
+            serviceName,
+            attributes
+    );
   }
 
   private ScopeDetails parseScope(
@@ -581,6 +581,12 @@ public class OtlpTraceRequestParser {
   private record StatusDetails(
           short code,
           String message
+  ) {
+  }
+
+  private record ResourceDetails(
+          String serviceName,
+          Map<String, Object> attributes
   ) {
   }
 }

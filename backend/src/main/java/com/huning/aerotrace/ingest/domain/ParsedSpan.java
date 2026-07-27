@@ -1,9 +1,12 @@
 package com.huning.aerotrace.ingest.domain;
 
 import java.time.Instant;
+import java.util.Map;
 
 public record ParsedSpan(
         String serviceName,
+        Map<String, Object> resourceAttributes,
+        Map<String, Object> spanAttributes,
         String scopeName,
         String scopeVersion,
         String traceId,
@@ -17,4 +20,9 @@ public record ParsedSpan(
         Instant endTime,
         long durationNano
 ) {
+
+  public ParsedSpan {
+    resourceAttributes = Map.copyOf(resourceAttributes);
+    spanAttributes = Map.copyOf(spanAttributes);
+  }
 }

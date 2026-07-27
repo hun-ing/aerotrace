@@ -264,3 +264,126 @@ Accept: application/json
         );
     });
 %}
+
+### 9. 다양한 Attribute 자료형 파싱
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "attribute-test-service"
+            }
+          },
+          {
+            "key": "deployment.environment.name",
+            "value": {
+              "stringValue": "local"
+            }
+          },
+          {
+            "key": "host.cpu.count",
+            "value": {
+              "intValue": "4"
+            }
+          },
+          {
+            "key": "debug",
+            "value": {
+              "boolValue": true
+            }
+          },
+          {
+            "key": "sample.ratio",
+            "value": {
+              "doubleValue": 0.25
+            }
+          },
+          {
+            "key": "tags",
+            "value": {
+              "arrayValue": {
+                "values": [
+                  {
+                    "stringValue": "backend"
+                  },
+                  {
+                    "stringValue": "otel"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "key": "metadata",
+            "value": {
+              "kvlistValue": {
+                "values": [
+                  {
+                    "key": "region",
+                    "value": {
+                      "stringValue": "local-home-server"
+                    }
+                  },
+                  {
+                    "key": "instance",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "attribute-test",
+            "version": "1.0.0"
+          },
+          "spans": [
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902b7",
+              "name": "GET /attributes",
+              "kind": 2,
+              "startTimeUnixNano": "1581452772000000321",
+              "endTimeUnixNano": "1581452773000000789",
+              "attributes": [
+                {
+                  "key": "http.request.method",
+                  "value": {
+                    "stringValue": "GET"
+                  }
+                },
+                {
+                  "key": "http.response.status_code",
+                  "value": {
+                    "intValue": "200"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("다양한 Attribute 요청은 200을 반환한다", function () {
+        client.assert(
+            response.status === 200,
+            "예상 상태는 200이지만 실제 상태는 " + response.status
+        );
+    });
+%}

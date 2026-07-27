@@ -45,10 +45,12 @@ public class OtlpTraceController {
       ParsedSpan firstSpan = parsedRequest.spans().getFirst();
 
       log.info(
-              "OTLP trace request parsed: spans={}, firstService={}, firstSpan={}",
+              "OTLP trace request parsed: spans={}, firstService={}, firstSpan={}, resourceAttributes={}, spanAttributes={}",
               parsedRequest.spanCount(),
               firstSpan.serviceName(),
-              firstSpan.name()
+              firstSpan.name(),
+              firstSpan.resourceAttributes().size(),
+              firstSpan.spanAttributes().size()
       );
     }
 
