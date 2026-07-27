@@ -9,6 +9,18 @@ spring:
   main:
     keep-alive: true
 
+  datasource:
+    url: ${AEROTRACE_DB_URL:jdbc:postgresql://localhost:5432/aerotrace}
+    username: ${AEROTRACE_DB_USERNAME:postgres}
+    password: ${AEROTRACE_DB_PASSWORD:postgres}
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+    validate-on-migrate: true
+    clean-disabled: true
+
 server:
   port: 8080
 
