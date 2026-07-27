@@ -3,6 +3,7 @@ package com.huning.aerotrace.ingest.api;
 import com.huning.aerotrace.ingest.application.OtlpTraceRequestParser;
 import com.huning.aerotrace.ingest.application.ParsedTraceRequest;
 import com.huning.aerotrace.ingest.application.TraceIngestionService;
+import com.huning.aerotrace.ingest.domain.ParsedSpan;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
@@ -60,12 +61,22 @@ public class OtlpTraceController {
     int duplicateCount =
             parsedRequest.spanCount() - insertedCount;
 
-    log.info(
-            "OTLP trace request stored: received={}, inserted={}, duplicates={}",
-            parsedRequest.spanCount(),
-            insertedCount,
-            duplicateCount
-    );
+    if (parsedRequest.spans().isEmpty()) {
+      log.info(
+              "OTLP trace request stored: received=0, inserted=0, duplicates=0"
+      );
+    } else {
+      ParsedSpan firstSpan = parsedRequest.spans().getFirst();
+
+      log.info(
+              "OTLP trace request stored: received={}, inserted={}, duplicates={}, firstEvents={}, firstLinks={}",
+              parsedRequest.spanCount(),
+              insertedCount,
+              duplicateCount,
+              firstSpan.events().size(),
+              firstSpan.links().size()
+      );
+    }
 
     return ResponseEntity
             .ok()

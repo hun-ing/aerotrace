@@ -1,11 +1,15 @@
 package com.huning.aerotrace.ingest.application;
 
 import com.huning.aerotrace.ingest.domain.ParsedSpan;
+import com.huning.aerotrace.ingest.domain.ParsedSpanEvent;
+import com.huning.aerotrace.ingest.domain.ParsedSpanLink;
+
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.web.server.ResponseStatusException;
 import tools.jackson.databind.JsonNode;
 
+import java.math.BigInteger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -16,6 +20,7 @@ import java.util.Map;
 @Component
 public class OtlpTraceRequestParser {
 
+  private static final BigInteger MAX_UNSIGNED_INT = new BigInteger("4294967295");
   private static final long NANOS_PER_SECOND = 1_000_000_000L;
   private final OtlpAnyValueParser anyValueParser;
 
@@ -147,6 +152,16 @@ public class OtlpTraceRequestParser {
                     path + ".attributes"
             );
 
+    List<ParsedSpanEvent> events = parseEvents(
+            span.get("events"),
+            path + ".events"
+    );
+
+    List<ParsedSpanLink> links = parseLinks(
+            span.get("links"),
+            path + ".links"
+    );
+
     String traceId = requiredHexId(
             span,
             "traceId",
@@ -221,6 +236,8 @@ public class OtlpTraceRequestParser {
             resourceDetails.serviceName(),
             resourceDetails.attributes(),
             spanAttributes,
+            events,
+            links,
             scopeDetails.name(),
             scopeDetails.version(),
             traceId,
@@ -234,6 +251,172 @@ public class OtlpTraceRequestParser {
             toInstant(endTimeUnixNano),
             durationNano
     );
+  }
+
+  private List<ParsedSpanEvent> parseEvents(
+          JsonNode eventsNode,
+          String path
+  ) {
+    if (isMissing(eventsNode)) {
+      return List.of();
+    }
+
+    requireArray(eventsNode, path);
+
+    List<ParsedSpanEvent> events = new ArrayList<>();
+
+    for (int index = 0; index < eventsNode.size(); index++) {
+      JsonNode eventNode = eventsNode.get(index);
+      String eventPath = path + "[" + index + "]";
+
+      requireObject(eventNode, eventPath);
+
+      long timeUnixNano = requiredNanoTimestamp(
+              eventNode,
+              "timeUnixNano",
+              eventPath
+      );
+
+      String name = requiredNonBlankString(
+              eventNode,
+              "name",
+              eventPath
+      );
+
+      Map<String, Object> attributes =
+              anyValueParser.parseAttributes(
+                      eventNode.get("attributes"),
+                      eventPath + ".attributes"
+              );
+
+      long droppedAttributesCount = optionalUnsignedInt(
+              eventNode,
+              "droppedAttributesCount",
+              eventPath,
+              0
+      );
+
+      events.add(
+              new ParsedSpanEvent(
+                      timeUnixNano,
+                      name,
+                      attributes,
+                      droppedAttributesCount
+              )
+      );
+    }
+
+    return List.copyOf(events);
+  }
+
+  private List<ParsedSpanLink> parseLinks(
+          JsonNode linksNode,
+          String path
+  ) {
+    if (isMissing(linksNode)) {
+      return List.of();
+    }
+
+    requireArray(linksNode, path);
+
+    List<ParsedSpanLink> links = new ArrayList<>();
+
+    for (int index = 0; index < linksNode.size(); index++) {
+      JsonNode linkNode = linksNode.get(index);
+      String linkPath = path + "[" + index + "]";
+
+      requireObject(linkNode, linkPath);
+
+      String traceId = requiredHexId(
+              linkNode,
+              "traceId",
+              linkPath,
+              TRACE_ID_PATTERN,
+              32
+      );
+
+      String spanId = requiredHexId(
+              linkNode,
+              "spanId",
+              linkPath,
+              SPAN_ID_PATTERN,
+              16
+      );
+
+      String traceState = optionalString(
+              linkNode,
+              "traceState",
+              linkPath,
+              ""
+      );
+
+      Map<String, Object> attributes =
+              anyValueParser.parseAttributes(
+                      linkNode.get("attributes"),
+                      linkPath + ".attributes"
+              );
+
+      long droppedAttributesCount = optionalUnsignedInt(
+              linkNode,
+              "droppedAttributesCount",
+              linkPath,
+              0
+      );
+
+      long flags = optionalUnsignedInt(
+              linkNode,
+              "flags",
+              linkPath,
+              0
+      );
+
+      links.add(
+              new ParsedSpanLink(
+                      traceId,
+                      spanId,
+                      traceState,
+                      attributes,
+                      droppedAttributesCount,
+                      flags
+              )
+      );
+    }
+
+    return List.copyOf(links);
+  }
+
+  private long optionalUnsignedInt(
+          JsonNode object,
+          String fieldName,
+          String path,
+          long defaultValue
+  ) {
+    JsonNode node = object.get(fieldName);
+
+    if (isMissing(node)) {
+      return defaultValue;
+    }
+
+    if (!node.isIntegralNumber()) {
+      throw invalidRequest(
+              path + "." + fieldName
+                      + " must be a JSON integer"
+      );
+    }
+
+    BigInteger value = node.bigIntegerValue();
+
+    if (
+            value.signum() < 0
+                    || value.compareTo(MAX_UNSIGNED_INT) > 0
+    ) {
+      throw invalidRequest(
+              path + "." + fieldName
+                      + " must be between 0 and 4294967295"
+      );
+    }
+
+    return value.longValue();
   }
 
   private ResourceDetails parseResource(

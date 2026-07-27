@@ -15,41 +15,45 @@ import java.util.UUID;
 public class JdbcSpanWriter implements SpanWriter {
 
   private static final String INSERT_SQL = """
-            INSERT INTO spans (
-                tenant_id,
-                project_id,
-                trace_id,
-                span_id,
-                parent_span_id,
-                service_name,
-                scope_name,
-                scope_version,
-                name,
-                span_kind,
-                status_code,
-                status_message,
-                start_time,
-                end_time,
-                duration_nano,
-                resource_attributes,
-                span_attributes
-            )
-            VALUES (
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                CAST(? AS jsonb),
-                CAST(? AS jsonb)
-            )
-            ON CONFLICT (
-                tenant_id,
-                project_id,
-                trace_id,
-                span_id,
-                start_time
-            )
-            DO NOTHING
-            """;
+        INSERT INTO spans (
+            tenant_id,
+            project_id,
+            trace_id,
+            span_id,
+            parent_span_id,
+            service_name,
+            scope_name,
+            scope_version,
+            name,
+            span_kind,
+            status_code,
+            status_message,
+            start_time,
+            end_time,
+            duration_nano,
+            resource_attributes,
+            span_attributes,
+            events,
+            links
+        )
+        VALUES (
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            CAST(? AS jsonb),
+            CAST(? AS jsonb),
+            CAST(? AS jsonb),
+            CAST(? AS jsonb)
+        )
+        ON CONFLICT (
+            tenant_id,
+            project_id,
+            trace_id,
+            span_id,
+            start_time
+        )
+        DO NOTHING
+        """;
 
   private final JdbcTemplate jdbcTemplate;
   private final ObjectMapper objectMapper;
@@ -121,6 +125,20 @@ public class JdbcSpanWriter implements SpanWriter {
                       17,
                       objectMapper.writeValueAsString(
                               span.spanAttributes()
+                      )
+              );
+
+              statement.setString(
+                      18,
+                      objectMapper.writeValueAsString(
+                              span.events()
+                      )
+              );
+
+              statement.setString(
+                      19,
+                      objectMapper.writeValueAsString(
+                              span.links()
                       )
               );
             }

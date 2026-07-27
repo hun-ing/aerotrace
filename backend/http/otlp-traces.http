@@ -389,3 +389,148 @@ Accept: application/json
         );
     });
 %}
+
+### 11. Event와 Link 파싱 및 저장
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
+
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "event-link-test-service"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "event-link-test",
+            "version": "1.0.0"
+          },
+          "spans": [
+            {
+              "traceId": "cccccccccccccccccccccccccccccccc",
+              "spanId": "dddddddddddddddd",
+              "name": "POST /orders",
+              "kind": 2,
+              "startTimeUnixNano": "1581452772000000321",
+              "endTimeUnixNano": "1581452773000000789",
+              "events": [
+                {
+                  "timeUnixNano": "1581452772500000000",
+                  "name": "exception",
+                  "attributes": [
+                    {
+                      "key": "exception.type",
+                      "value": {
+                        "stringValue": "java.lang.IllegalStateException"
+                      }
+                    },
+                    {
+                      "key": "exception.message",
+                      "value": {
+                        "stringValue": "주문 상태를 변경할 수 없습니다"
+                      }
+                    }
+                  ],
+                  "droppedAttributesCount": 0
+                }
+              ],
+              "links": [
+                {
+                  "traceId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                  "spanId": "ffffffffffffffff",
+                  "traceState": "vendor=value",
+                  "attributes": [
+                    {
+                      "key": "messaging.operation.type",
+                      "value": {
+                        "stringValue": "receive"
+                      }
+                    }
+                  ],
+                  "droppedAttributesCount": 0,
+                  "flags": 1
+                }
+              ],
+              "status": {
+                "code": 2,
+                "message": "order processing failed"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("Event와 Link 포함 요청은 200을 반환한다", function () {
+        client.assert(
+            response.status === 200,
+            "예상 상태는 200이지만 실제 상태는 " + response.status
+        );
+    });
+%}
+
+### 12. 잘못된 Link Trace ID
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
+
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "invalid-link-test"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "traceId": "12121212121212121212121212121212",
+              "spanId": "3434343434343434",
+              "name": "invalid link",
+              "startTimeUnixNano": "1581452772000000321",
+              "endTimeUnixNano": "1581452773000000789",
+              "links": [
+                {
+                  "traceId": "1234",
+                  "spanId": "5656565656565656"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("잘못된 Link Trace ID는 400을 반환한다", function () {
+        client.assert(
+            response.status === 400,
+            "예상 상태는 400이지만 실제 상태는 " + response.status
+        );
+    });
+%}
