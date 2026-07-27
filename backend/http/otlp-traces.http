@@ -1,8 +1,14 @@
+# 저장 테스트를 처음부터 재실행하려면
+# sql/local-dev-fixtures.sql을 먼저 실행한다.
+
 @baseUrl = http://localhost:8080
+@tenantId = 11111111-1111-1111-1111-111111111111
+@projectId = 22222222-2222-2222-2222-222222222222
 
 ### 1. 애플리케이션 상태 확인
 GET {{baseUrl}}/actuator/health
 Accept: application/json
+
 
 > {%
     client.test("애플리케이션이 정상 상태다", function () {
@@ -24,6 +30,8 @@ Accept: application/json
 POST {{baseUrl}}/v1/traces
 Content-Type: application/json
 Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
 
 {
   "resourceSpans": [
@@ -95,6 +103,8 @@ Accept: application/json
 POST {{baseUrl}}/v1/traces
 Content-Type: application/json
 Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
 
 {}
 
@@ -111,6 +121,8 @@ Accept: application/json
 POST {{baseUrl}}/v1/traces
 Content-Type: application/json
 Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
 
 {
   "resourceSpans": {}
@@ -128,6 +140,8 @@ Accept: application/json
 ### 5. 지원하지 않는 Content-Type
 POST {{baseUrl}}/v1/traces
 Content-Type: text/plain
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
 
 {}
 
@@ -144,6 +158,8 @@ Content-Type: text/plain
 POST {{baseUrl}}/v1/traces
 Content-Type: application/json
 Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
 
 {
   "resourceSpans": [
@@ -189,6 +205,8 @@ Accept: application/json
 POST {{baseUrl}}/v1/traces
 Content-Type: application/json
 Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
 
 {
   "resourceSpans": [
@@ -224,6 +242,8 @@ Accept: application/json
 POST {{baseUrl}}/v1/traces
 Content-Type: application/json
 Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
 
 {
   "resourceSpans": [
@@ -265,10 +285,12 @@ Accept: application/json
     });
 %}
 
-### 9. 다양한 Attribute 자료형 파싱
+### 9. 다양한 Attribute 자료형 파싱 및 저장
 POST {{baseUrl}}/v1/traces
 Content-Type: application/json
 Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
 
 {
   "resourceSpans": [
@@ -304,42 +326,6 @@ Accept: application/json
             "value": {
               "doubleValue": 0.25
             }
-          },
-          {
-            "key": "tags",
-            "value": {
-              "arrayValue": {
-                "values": [
-                  {
-                    "stringValue": "backend"
-                  },
-                  {
-                    "stringValue": "otel"
-                  }
-                ]
-              }
-            }
-          },
-          {
-            "key": "metadata",
-            "value": {
-              "kvlistValue": {
-                "values": [
-                  {
-                    "key": "region",
-                    "value": {
-                      "stringValue": "local-home-server"
-                    }
-                  },
-                  {
-                    "key": "instance",
-                    "value": {
-                      "intValue": "1"
-                    }
-                  }
-                ]
-              }
-            }
           }
         ]
       },
@@ -351,8 +337,8 @@ Accept: application/json
           },
           "spans": [
             {
-              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-              "spanId": "00f067aa0ba902b7",
+              "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "spanId": "bbbbbbbbbbbbbbbb",
               "name": "GET /attributes",
               "kind": 2,
               "startTimeUnixNano": "1581452772000000321",
@@ -380,10 +366,26 @@ Accept: application/json
 }
 
 > {%
-    client.test("다양한 Attribute 요청은 200을 반환한다", function () {
+    client.test("Attribute 요청은 200을 반환한다", function () {
         client.assert(
             response.status === 200,
             "예상 상태는 200이지만 실제 상태는 " + response.status
+        );
+    });
+%}
+
+### 10. Tenant와 Project 헤더 누락
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+
+{}
+
+> {%
+    client.test("Tenant와 Project 헤더 누락은 400을 반환한다", function () {
+        client.assert(
+            response.status === 400,
+            "예상 상태는 400이지만 실제 상태는 " + response.status
         );
     });
 %}

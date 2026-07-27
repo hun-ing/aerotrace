@@ -2,17 +2,19 @@ package com.huning.aerotrace.ingest.api;
 
 import com.huning.aerotrace.ingest.application.OtlpTraceRequestParser;
 import com.huning.aerotrace.ingest.application.ParsedTraceRequest;
-import com.huning.aerotrace.ingest.domain.ParsedSpan;
+import com.huning.aerotrace.ingest.application.TraceIngestionService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 import tools.jackson.databind.JsonNode;
 
 import java.util.Map;
+import java.util.UUID;
 
 @RestController
 public class OtlpTraceController {
@@ -21,11 +23,14 @@ public class OtlpTraceController {
           LoggerFactory.getLogger(OtlpTraceController.class);
 
   private final OtlpTraceRequestParser requestParser;
+  private final TraceIngestionService ingestionService;
 
   public OtlpTraceController(
-          OtlpTraceRequestParser requestParser
+          OtlpTraceRequestParser requestParser,
+          TraceIngestionService ingestionService
   ) {
     this.requestParser = requestParser;
+    this.ingestionService = ingestionService;
   }
 
   @PostMapping(
@@ -34,25 +39,33 @@ public class OtlpTraceController {
           produces = MediaType.APPLICATION_JSON_VALUE
   )
   public ResponseEntity<Map<String, Object>> exportTraces(
-          @RequestBody JsonNode request
+          @RequestHeader("X-AeroTrace-Tenant-Id")
+          UUID tenantId,
+
+          @RequestHeader("X-AeroTrace-Project-Id")
+          UUID projectId,
+
+          @RequestBody
+          JsonNode request
   ) {
     ParsedTraceRequest parsedRequest =
             requestParser.parse(request);
 
-    if (parsedRequest.spans().isEmpty()) {
-      log.info("Empty OTLP trace request accepted");
-    } else {
-      ParsedSpan firstSpan = parsedRequest.spans().getFirst();
+    int insertedCount = ingestionService.ingest(
+            tenantId,
+            projectId,
+            parsedRequest
+    );
 
-      log.info(
-              "OTLP trace request parsed: spans={}, firstService={}, firstSpan={}, resourceAttributes={}, spanAttributes={}",
-              parsedRequest.spanCount(),
-              firstSpan.serviceName(),
-              firstSpan.name(),
-              firstSpan.resourceAttributes().size(),
-              firstSpan.spanAttributes().size()
-      );
-    }
+    int duplicateCount =
+            parsedRequest.spanCount() - insertedCount;
+
+    log.info(
+            "OTLP trace request stored: received={}, inserted={}, duplicates={}",
+            parsedRequest.spanCount(),
+            insertedCount,
+            duplicateCount
+    );
 
     return ResponseEntity
             .ok()
