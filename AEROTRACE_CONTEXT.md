@@ -247,31 +247,34 @@ V4__add_span_drop_counts.sql
 * Windows 개발 PC
 * Docker Desktop
 * PostgreSQL 15 기반 TimescaleDB
-* HTTP와 JSON 파싱을 제외한 persistence-only 측정
+* HTTP와 OTLP JSON 파싱을 제외한 persistence-only 측정
 * 단건과 batch 모두 요청당 트랜잭션 1개
+* JSON 직렬화, 트랜잭션, JDBC 저장 시간을 동일하게 포함
+* 저장 결과 검증과 테스트 데이터 삭제는 측정에서 제외
 * 워밍업 후 반복 측정
+* 실행 순서를 교차하여 편향 완화
 * 중앙값 기준 비교
 
 ### 주요 결과
 
 | Span 수 |      단건 중앙값 | JDBC batch 중앙값 | Batch 개선 |
 | -----: | ----------: | -------------: | -------: |
-|    100 |    85.974ms |       29.663ms |  약 2.90배 |
-|  1,000 |   914.118ms |      301.192ms |  약 3.03배 |
-|  5,000 | 4,715.305ms |    1,610.337ms |  약 2.93배 |
+|    100 |    91.084ms |       30.460ms |  약 2.99배 |
+|  1,000 |   874.985ms |      299.167ms |  약 2.92배 |
+|  5,000 | 4,566.945ms |    1,485.885ms |  약 3.07배 |
 
 측정된 처리량 범위:
 
 ```text
-단건 저장: 약 1,030~1,163 spans/sec
-Batch 저장: 약 2,979~3,452 spans/sec
+단건 저장: 약 1,095~1,143 spans/sec
+Batch 저장: 약 3,283~3,365 spans/sec
 ```
 
 `reWriteBatchedInserts=true`는 현재 환경에서 일관된 개선을 보이지 않았다.
 
-* 100 Span: 약 1.0% 개선
-* 1,000 Span: 약 0.5% 개선
-* 5,000 Span: 약 4.2% 악화
+* 100 Span: 약 7.8% 악화
+* 1,000 Span: 약 3.5% 개선
+* 5,000 Span: 약 7.2% 악화
 
 따라서 JDBC batch는 유지하고, `reWriteBatchedInserts`는 현재 활성화하지 않는다.
 

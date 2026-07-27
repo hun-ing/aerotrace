@@ -134,7 +134,8 @@ public final class JdbcSpanWriteBenchmark {
                     + "- Span 수: %,d%n"
                     + "- 측정 횟수: %d%n"
                     + "- reWriteBatchedInserts: %s%n"
-                    + "- 단건·batch 모두 요청당 트랜잭션 1개%n%n",
+                    + "- 측정 범위: JSON 직렬화 + 트랜잭션 + JDBC 저장%n"
+                    + "- 저장 결과 검증과 테스트 데이터 삭제는 측정에서 제외%n%n",
             spanCount,
             measurementCount,
             rewriteBatchedInserts
@@ -204,16 +205,16 @@ public final class JdbcSpanWriteBenchmark {
   ) {
     cleanBenchmarkSpans();
 
-    List<JdbcSpanPersistenceSupport.PreparedSpanRow> rows =
-            persistenceSupport.prepareRows(
-                    TENANT_ID,
-                    PROJECT_ID,
-                    spans
-            );
-
     long startNano = System.nanoTime();
 
     transactionTemplate.executeWithoutResult(status -> {
+      List<JdbcSpanPersistenceSupport.PreparedSpanRow> rows =
+              persistenceSupport.prepareRows(
+                      TENANT_ID,
+                      PROJECT_ID,
+                      spans
+              );
+
       for (
               JdbcSpanPersistenceSupport.PreparedSpanRow row
               : rows

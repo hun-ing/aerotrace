@@ -456,15 +456,38 @@ unknown=0
 
 동일한 SQL, 바인딩, Span 데이터, DB 스키마, 트랜잭션 조건에서 단건 반복과 JDBC batch 성능을 비교한다.
 
+### 측정 조건 보정
+
+초기 벤치마크에서는 단건 방식의 JSON 직렬화가 시간 측정 전에 수행됐지만, batch 방식은 시간 측정 안에서 수행되는 차이가 발견됐다.
+
+단건 측정도 다음 범위를 포함하도록 보정했다.
+
+```text
+JSON 직렬화
+→ 트랜잭션 시작
+→ JDBC 저장
+→ 트랜잭션 완료
+```
+
+최종 측정에서는 단건과 batch 모두 다음 범위를 동일하게 포함한다.
+
+* JSON 직렬화
+* 트랜잭션
+* JDBC 저장
+
+다음 항목은 측정에서 제외했다.
+
+* 저장 행 수 검증
+* 다음 측정을 위한 테스트 데이터 삭제
+
 ### 테스트 환경
 
 * Java 21
 * Spring Boot 4.1.0
-* PostgreSQL 15.18
-* TimescaleDB 2.28.3
+* PostgreSQL 15 기반 TimescaleDB
 * Windows 개발 PC
 * Docker Desktop
-* persistence-only
+* persistence-only 측정
 * 워밍업 수행
 * 반복 측정
 * 실행 순서 교차
@@ -472,31 +495,40 @@ unknown=0
 * 매 측정 전 테스트 Span 삭제
 * 저장 행 수 검증
 
-### 결과
+### 보정된 측정 결과
 
 | Span 수 | Rewrite |      단건 중앙값 |   Batch 중앙값 |          단건 처리량 |       Batch 처리량 |    배율 |
 | -----: | :-----: | ----------: | ----------: | --------------: | --------------: | ----: |
-|    100 |   OFF   |    85.974ms |    29.663ms | 1,163 spans/sec | 3,371 spans/sec | 2.90배 |
-|    100 |    ON   |    90.740ms |    29.354ms | 1,102 spans/sec | 3,407 spans/sec | 3.09배 |
-|  1,000 |  OFF 1차 |   918.588ms |   297.324ms | 1,089 spans/sec | 3,363 spans/sec | 3.09배 |
-|  1,000 |  ON 1차  |   884.527ms |   289.700ms | 1,131 spans/sec | 3,452 spans/sec | 3.05배 |
-|  1,000 |  ON 2차  |   895.522ms |   305.014ms | 1,117 spans/sec | 3,279 spans/sec | 2.94배 |
-|  1,000 |  OFF 2차 |   912.754ms |   301.204ms | 1,096 spans/sec | 3,320 spans/sec | 3.03배 |
-|  5,000 |   OFF   | 4,715.305ms | 1,610.337ms | 1,060 spans/sec | 3,105 spans/sec | 2.93배 |
-|  5,000 |    ON   | 4,853.439ms | 1,678.639ms | 1,030 spans/sec | 2,979 spans/sec | 2.89배 |
+|    100 |   OFF   |    91.084ms |    30.460ms | 1,098 spans/sec | 3,283 spans/sec | 2.99배 |
+|    100 |    ON   |    98.687ms |    32.836ms | 1,013 spans/sec | 3,045 spans/sec | 3.01배 |
+|  1,000 |   OFF   |   874.985ms |   299.167ms | 1,143 spans/sec | 3,343 spans/sec | 2.92배 |
+|  1,000 |    ON   |   865.236ms |   288.642ms | 1,156 spans/sec | 3,465 spans/sec | 3.00배 |
+|  5,000 |   OFF   | 4,566.945ms | 1,485.885ms | 1,095 spans/sec | 3,365 spans/sec | 3.07배 |
+|  5,000 |    ON   | 4,672.900ms | 1,593.576ms | 1,070 spans/sec | 3,138 spans/sec | 2.93배 |
 
-### 해석
+### 이상치
 
-* JDBC batch는 모든 구간에서 약 2.9~3.1배 높은 처리량을 보였다.
-* Batch 저장 채택을 측정 결과로 정당화했다.
-* `reWriteBatchedInserts=true`는 일관된 개선 효과가 없었다.
-* 5,000 Span에서는 rewrite 활성화 결과가 더 느렸다.
+100 Span 단건 측정에서 다음과 같은 큰 값이 일부 관찰됐다.
+
+* Rewrite OFF: 218.136ms
+* Rewrite ON: 280.925ms
+
+소규모 테스트는 JVM, Docker, 디스크, 운영체제 스케줄링 같은 일시적인 영향이 전체 결과에서 차지하는 비율이 크다.
+
+최솟값이나 평균값이 아니라 중앙값을 사용해 이상치 영향을 제한했다.
+
+### 결과 해석
+
+* JDBC batch는 모든 테스트 크기에서 단건 반복보다 약 2.9~3.1배 높은 처리량을 보였다.
+* 측정 범위를 동일하게 보정한 뒤에도 batch 채택 결론이 유지됐다.
+* `reWriteBatchedInserts=true`는 Span 수에 따라 개선과 악화가 혼재했다.
+* 현재 환경에서는 rewrite 옵션의 일관된 효과를 확인하지 못했다.
 
 ### 결정
 
-* JDBC batch 유지
-* `reWriteBatchedInserts` 비활성 상태 유지
-* 다음 단계에서 batch chunk 크기 비교
+* 요청 단위 JDBC batch 저장 유지
+* `reWriteBatchedInserts` 비활성 유지
+* 다음 단계에서 고정된 총 Span 수를 chunk로 나눠 저장하는 방식을 비교
 
 ### 측정 제한
 
@@ -504,14 +536,14 @@ unknown=0
 
 * HTTP 네트워크
 * OTLP JSON 파싱
-* Collector
+* OpenTelemetry Collector
 * 동시 요청
 * 원격 DB
 * N100 홈서버
-* JVM 최대 heap
 * CPU 사용률
-* WAL 양
-* 실제 DB statement 수
+* 최대 JVM heap
+* WAL 발생량
+* 실제 서버 측 SQL statement 수
 
 ---
 
