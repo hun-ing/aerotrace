@@ -1,7 +1,8 @@
 package com.huning.aerotrace.ingest.api;
 
-import com.huning.aerotrace.ingest.application.OtlpTraceRequestInspector;
-import com.huning.aerotrace.ingest.application.TraceRequestSummary;
+import com.huning.aerotrace.ingest.application.OtlpTraceRequestParser;
+import com.huning.aerotrace.ingest.application.ParsedTraceRequest;
+import com.huning.aerotrace.ingest.domain.ParsedSpan;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
@@ -19,12 +20,12 @@ public class OtlpTraceController {
   private static final Logger log =
           LoggerFactory.getLogger(OtlpTraceController.class);
 
-  private final OtlpTraceRequestInspector requestInspector;
+  private final OtlpTraceRequestParser requestParser;
 
   public OtlpTraceController(
-          OtlpTraceRequestInspector requestInspector
+          OtlpTraceRequestParser requestParser
   ) {
-    this.requestInspector = requestInspector;
+    this.requestParser = requestParser;
   }
 
   @PostMapping(
@@ -35,14 +36,21 @@ public class OtlpTraceController {
   public ResponseEntity<Map<String, Object>> exportTraces(
           @RequestBody JsonNode request
   ) {
-    TraceRequestSummary summary = requestInspector.inspect(request);
+    ParsedTraceRequest parsedRequest =
+            requestParser.parse(request);
 
-    log.info(
-            "OTLP trace request accepted: resourceSpans={}, scopeSpans={}, spans={}",
-            summary.resourceSpanCount(),
-            summary.scopeSpanCount(),
-            summary.spanCount()
-    );
+    if (parsedRequest.spans().isEmpty()) {
+      log.info("Empty OTLP trace request accepted");
+    } else {
+      ParsedSpan firstSpan = parsedRequest.spans().getFirst();
+
+      log.info(
+              "OTLP trace request parsed: spans={}, firstService={}, firstSpan={}",
+              parsedRequest.spanCount(),
+              firstSpan.serviceName(),
+              firstSpan.name()
+      );
+    }
 
     return ResponseEntity
             .ok()

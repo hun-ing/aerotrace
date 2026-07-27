@@ -1,0 +1,586 @@
+package com.huning.aerotrace.ingest.application;
+
+import com.huning.aerotrace.ingest.domain.ParsedSpan;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Component;
+import org.springframework.web.server.ResponseStatusException;
+import tools.jackson.databind.JsonNode;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.regex.Pattern;
+
+@Component
+public class OtlpTraceRequestParser {
+
+  private static final long NANOS_PER_SECOND = 1_000_000_000L;
+
+  private static final Pattern TRACE_ID_PATTERN =
+          Pattern.compile("^[0-9a-fA-F]{32}$");
+
+  private static final Pattern SPAN_ID_PATTERN =
+          Pattern.compile("^[0-9a-fA-F]{16}$");
+
+  public ParsedTraceRequest parse(JsonNode root) {
+    requireObject(root, "$");
+
+    JsonNode resourceSpans = root.get("resourceSpans");
+
+    if (isMissing(resourceSpans)) {
+      return new ParsedTraceRequest(List.of());
+    }
+
+    requireArray(resourceSpans, "$.resourceSpans");
+
+    List<ParsedSpan> parsedSpans = new ArrayList<>();
+
+    for (int resourceIndex = 0;
+         resourceIndex < resourceSpans.size();
+         resourceIndex++) {
+
+      JsonNode resourceSpan = resourceSpans.get(resourceIndex);
+      String resourcePath = "$.resourceSpans[" + resourceIndex + "]";
+
+      requireObject(resourceSpan, resourcePath);
+
+      String serviceName = findServiceName(
+              resourceSpan.get("resource"),
+              resourcePath + ".resource"
+      );
+
+      JsonNode scopeSpans = resourceSpan.get("scopeSpans");
+
+      if (isMissing(scopeSpans)) {
+        continue;
+      }
+
+      String scopeSpansPath = resourcePath + ".scopeSpans";
+      requireArray(scopeSpans, scopeSpansPath);
+
+      parseScopeSpans(
+              scopeSpans,
+              scopeSpansPath,
+              serviceName,
+              parsedSpans
+      );
+    }
+
+    return new ParsedTraceRequest(parsedSpans);
+  }
+
+  private void parseScopeSpans(
+          JsonNode scopeSpans,
+          String scopeSpansPath,
+          String serviceName,
+          List<ParsedSpan> parsedSpans
+  ) {
+    for (int scopeIndex = 0;
+         scopeIndex < scopeSpans.size();
+         scopeIndex++) {
+
+      JsonNode scopeSpan = scopeSpans.get(scopeIndex);
+      String scopePath = scopeSpansPath + "[" + scopeIndex + "]";
+
+      requireObject(scopeSpan, scopePath);
+
+      ScopeDetails scopeDetails = parseScope(
+              scopeSpan.get("scope"),
+              scopePath + ".scope"
+      );
+
+      JsonNode spans = scopeSpan.get("spans");
+
+      if (isMissing(spans)) {
+        continue;
+      }
+
+      String spansPath = scopePath + ".spans";
+      requireArray(spans, spansPath);
+
+      for (int spanIndex = 0;
+           spanIndex < spans.size();
+           spanIndex++) {
+
+        String spanPath = spansPath + "[" + spanIndex + "]";
+        JsonNode span = spans.get(spanIndex);
+
+        requireObject(span, spanPath);
+
+        if (serviceName == null) {
+          throw invalidRequest(
+                  spanPath
+                          + " requires resource attribute service.name"
+          );
+        }
+
+        parsedSpans.add(
+                parseSpan(
+                        span,
+                        spanPath,
+                        serviceName,
+                        scopeDetails
+                )
+        );
+      }
+    }
+  }
+
+  private ParsedSpan parseSpan(
+          JsonNode span,
+          String path,
+          String serviceName,
+          ScopeDetails scopeDetails
+  ) {
+    String traceId = requiredHexId(
+            span,
+            "traceId",
+            path,
+            TRACE_ID_PATTERN,
+            32
+    );
+
+    String spanId = requiredHexId(
+            span,
+            "spanId",
+            path,
+            SPAN_ID_PATTERN,
+            16
+    );
+
+    String parentSpanId = optionalParentSpanId(span, path);
+
+    String name = requiredNonBlankString(
+            span,
+            "name",
+            path
+    );
+
+    short spanKind = optionalCode(
+            span,
+            "kind",
+            path,
+            0,
+            5,
+            (short) 0
+    );
+
+    StatusDetails status = parseStatus(
+            span.get("status"),
+            path + ".status"
+    );
+
+    long startTimeUnixNano = requiredNanoTimestamp(
+            span,
+            "startTimeUnixNano",
+            path
+    );
+
+    long endTimeUnixNano = requiredNanoTimestamp(
+            span,
+            "endTimeUnixNano",
+            path
+    );
+
+    if (endTimeUnixNano < startTimeUnixNano) {
+      throw invalidRequest(
+              path + ".endTimeUnixNano must be greater than "
+                      + "or equal to startTimeUnixNano"
+      );
+    }
+
+    final long durationNano;
+
+    try {
+      durationNano = Math.subtractExact(
+              endTimeUnixNano,
+              startTimeUnixNano
+      );
+    } catch (ArithmeticException exception) {
+      throw invalidRequest(
+              path + " duration exceeds the supported range"
+      );
+    }
+
+    return new ParsedSpan(
+            serviceName,
+            scopeDetails.name(),
+            scopeDetails.version(),
+            traceId,
+            spanId,
+            parentSpanId,
+            name,
+            spanKind,
+            status.code(),
+            status.message(),
+            toInstant(startTimeUnixNano),
+            toInstant(endTimeUnixNano),
+            durationNano
+    );
+  }
+
+  private String findServiceName(
+          JsonNode resource,
+          String path
+  ) {
+    if (isMissing(resource)) {
+      return null;
+    }
+
+    requireObject(resource, path);
+
+    JsonNode attributes = resource.get("attributes");
+
+    if (isMissing(attributes)) {
+      return null;
+    }
+
+    String attributesPath = path + ".attributes";
+    requireArray(attributes, attributesPath);
+
+    for (int index = 0; index < attributes.size(); index++) {
+      JsonNode attribute = attributes.get(index);
+      String attributePath = attributesPath + "[" + index + "]";
+
+      requireObject(attribute, attributePath);
+
+      JsonNode keyNode = attribute.get("key");
+
+      if (keyNode == null || !keyNode.isString()) {
+        throw invalidRequest(
+                attributePath + ".key must be a JSON string"
+        );
+      }
+
+      if (!"service.name".equals(keyNode.asString())) {
+        continue;
+      }
+
+      JsonNode value = attribute.get("value");
+      String valuePath = attributePath + ".value";
+
+      requireObject(value, valuePath);
+
+      JsonNode stringValue = value.get("stringValue");
+
+      if (stringValue == null || !stringValue.isString()) {
+        throw invalidRequest(
+                valuePath
+                        + ".stringValue must be a JSON string"
+        );
+      }
+
+      String serviceName = stringValue.asString();
+
+      if (serviceName.isBlank()) {
+        throw invalidRequest(
+                valuePath + ".stringValue must not be blank"
+        );
+      }
+
+      return serviceName;
+    }
+
+    return null;
+  }
+
+  private ScopeDetails parseScope(
+          JsonNode scope,
+          String path
+  ) {
+    if (isMissing(scope)) {
+      return new ScopeDetails("", "");
+    }
+
+    requireObject(scope, path);
+
+    return new ScopeDetails(
+            optionalString(scope, "name", path, ""),
+            optionalString(scope, "version", path, "")
+    );
+  }
+
+  private StatusDetails parseStatus(
+          JsonNode status,
+          String path
+  ) {
+    if (isMissing(status)) {
+      return new StatusDetails((short) 0, "");
+    }
+
+    requireObject(status, path);
+
+    return new StatusDetails(
+            optionalCode(
+                    status,
+                    "code",
+                    path,
+                    0,
+                    2,
+                    (short) 0
+            ),
+            optionalString(
+                    status,
+                    "message",
+                    path,
+                    ""
+            )
+    );
+  }
+
+  private String requiredHexId(
+          JsonNode object,
+          String fieldName,
+          String path,
+          Pattern pattern,
+          int expectedLength
+  ) {
+    String value = requiredNonBlankString(
+            object,
+            fieldName,
+            path
+    );
+
+    if (!pattern.matcher(value).matches()) {
+      throw invalidRequest(
+              path + "." + fieldName
+                      + " must be a "
+                      + expectedLength
+                      + "-character hexadecimal string"
+      );
+    }
+
+    String normalized = value.toLowerCase(Locale.ROOT);
+
+    if (normalized.chars().allMatch(character -> character == '0')) {
+      throw invalidRequest(
+              path + "." + fieldName + " must not be all zeros"
+      );
+    }
+
+    return normalized;
+  }
+
+  private String optionalParentSpanId(
+          JsonNode span,
+          String path
+  ) {
+    JsonNode node = span.get("parentSpanId");
+
+    if (isMissing(node)) {
+      return null;
+    }
+
+    if (!node.isString()) {
+      throw invalidRequest(
+              path + ".parentSpanId must be a JSON string"
+      );
+    }
+
+    String value = node.asString();
+
+    if (value.isBlank()) {
+      return null;
+    }
+
+    if (!SPAN_ID_PATTERN.matcher(value).matches()) {
+      throw invalidRequest(
+              path
+                      + ".parentSpanId must be a "
+                      + "16-character hexadecimal string"
+      );
+    }
+
+    String normalized = value.toLowerCase(Locale.ROOT);
+
+    if (normalized.chars().allMatch(character -> character == '0')) {
+      throw invalidRequest(
+              path + ".parentSpanId must not be all zeros"
+      );
+    }
+
+    return normalized;
+  }
+
+  private long requiredNanoTimestamp(
+          JsonNode object,
+          String fieldName,
+          String path
+  ) {
+    JsonNode node = object.get(fieldName);
+
+    if (node == null || !node.isString()) {
+      throw invalidRequest(
+              path + "." + fieldName
+                      + " must be a decimal string"
+      );
+    }
+
+    final long value;
+
+    try {
+      value = Long.parseLong(node.asString());
+    } catch (NumberFormatException exception) {
+      throw invalidRequest(
+              path + "." + fieldName
+                      + " must fit in a signed 64-bit integer"
+      );
+    }
+
+    if (value <= 0) {
+      throw invalidRequest(
+              path + "." + fieldName + " must be greater than zero"
+      );
+    }
+
+    return value;
+  }
+
+  private short optionalCode(
+          JsonNode object,
+          String fieldName,
+          String path,
+          int minimum,
+          int maximum,
+          short defaultValue
+  ) {
+    JsonNode node = object.get(fieldName);
+
+    if (isMissing(node)) {
+      return defaultValue;
+    }
+
+    if (!node.isNumber()) {
+      throw invalidRequest(
+              path + "." + fieldName + " must be a JSON number"
+      );
+    }
+
+    final int value;
+
+    try {
+      value = node.intValue();
+    } catch (RuntimeException exception) {
+      throw invalidRequest(
+              path + "." + fieldName + " must be an integer"
+      );
+    }
+
+    if (value < minimum || value > maximum) {
+      throw invalidRequest(
+              path + "." + fieldName
+                      + " must be between "
+                      + minimum
+                      + " and "
+                      + maximum
+      );
+    }
+
+    return (short) value;
+  }
+
+  private String requiredNonBlankString(
+          JsonNode object,
+          String fieldName,
+          String path
+  ) {
+    JsonNode node = object.get(fieldName);
+
+    if (node == null || !node.isString()) {
+      throw invalidRequest(
+              path + "." + fieldName
+                      + " must be a JSON string"
+      );
+    }
+
+    String value = node.asString();
+
+    if (value.isBlank()) {
+      throw invalidRequest(
+              path + "." + fieldName + " must not be blank"
+      );
+    }
+
+    return value;
+  }
+
+  private String optionalString(
+          JsonNode object,
+          String fieldName,
+          String path,
+          String defaultValue
+  ) {
+    JsonNode node = object.get(fieldName);
+
+    if (isMissing(node)) {
+      return defaultValue;
+    }
+
+    if (!node.isString()) {
+      throw invalidRequest(
+              path + "." + fieldName
+                      + " must be a JSON string"
+      );
+    }
+
+    return node.asString();
+  }
+
+  private Instant toInstant(long unixNano) {
+    long epochSecond = unixNano / NANOS_PER_SECOND;
+    long nanoAdjustment = unixNano % NANOS_PER_SECOND;
+
+    return Instant.ofEpochSecond(
+            epochSecond,
+            nanoAdjustment
+    );
+  }
+
+  private static boolean isMissing(JsonNode node) {
+    return node == null || node.isNull();
+  }
+
+  private static void requireObject(
+          JsonNode node,
+          String path
+  ) {
+    if (node == null || !node.isObject()) {
+      throw invalidRequest(
+              path + " must be a JSON object"
+      );
+    }
+  }
+
+  private static void requireArray(
+          JsonNode node,
+          String path
+  ) {
+    if (!node.isArray()) {
+      throw invalidRequest(
+              path + " must be a JSON array"
+      );
+    }
+  }
+
+  private static ResponseStatusException invalidRequest(
+          String message
+  ) {
+    return new ResponseStatusException(
+            HttpStatus.BAD_REQUEST,
+            message
+    );
+  }
+
+  private record ScopeDetails(
+          String name,
+          String version
+  ) {
+  }
+
+  private record StatusDetails(
+          short code,
+          String message
+  ) {
+  }
+}

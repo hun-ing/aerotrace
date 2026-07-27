@@ -139,3 +139,128 @@ Content-Type: text/plain
         );
     });
 %}
+
+### 6. 잘못된 Trace ID
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "invalid-trace-test"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "traceId": "1234",
+              "spanId": "00f067aa0ba902b7",
+              "name": "invalid trace id",
+              "kind": 2,
+              "startTimeUnixNano": "1581452772000000321",
+              "endTimeUnixNano": "1581452773000000789"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("잘못된 Trace ID는 400을 반환한다", function () {
+        client.assert(
+            response.status === 400,
+            "예상 상태는 400이지만 실제 상태는 " + response.status
+        );
+    });
+%}
+
+### 7. service.name 누락
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+
+{
+  "resourceSpans": [
+    {
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902b7",
+              "name": "missing service name",
+              "kind": 2,
+              "startTimeUnixNano": "1581452772000000321",
+              "endTimeUnixNano": "1581452773000000789"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("service.name 누락은 400을 반환한다", function () {
+        client.assert(
+            response.status === 400,
+            "예상 상태는 400이지만 실제 상태는 " + response.status
+        );
+    });
+%}
+
+### 8. 종료 시각이 시작 시각보다 빠름
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "invalid-time-test"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902b7",
+              "name": "invalid time",
+              "kind": 2,
+              "startTimeUnixNano": "1581452773000000789",
+              "endTimeUnixNano": "1581452772000000321"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("잘못된 시간 순서는 400을 반환한다", function () {
+        client.assert(
+            response.status === 400,
+            "예상 상태는 400이지만 실제 상태는 " + response.status
+        );
+    });
+%}
