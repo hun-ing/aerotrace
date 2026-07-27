@@ -1,66 +1,74 @@
 package com.huning.aerotrace.ingest.infrastructure;
 
+import com.huning.aerotrace.ingest.application.SpanWriteResult;
 import com.huning.aerotrace.ingest.application.SpanWriter;
 import com.huning.aerotrace.ingest.domain.ParsedSpan;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
 
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.sql.Types;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 @Repository
 public class JdbcSpanWriter implements SpanWriter {
 
   private static final String INSERT_SQL = """
-        INSERT INTO spans (
-            tenant_id,
-            project_id,
-            trace_id,
-            span_id,
-            parent_span_id,
-            trace_state,
-            flags,
-            service_name,
-            scope_name,
-            scope_version,
-            name,
-            span_kind,
-            status_code,
-            status_message,
-            start_time,
-            end_time,
-            duration_nano,
-            resource_attributes,
-            span_attributes,
-            events,
-            links,
-            dropped_attributes_count,
-            dropped_events_count,
-            dropped_links_count
-        )
-        VALUES (
-            ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?,
-            CAST(? AS jsonb),
-            CAST(? AS jsonb),
-            CAST(? AS jsonb),
-            CAST(? AS jsonb),
-            ?, ?, ?
-        )
-        ON CONFLICT (
-            tenant_id,
-            project_id,
-            trace_id,
-            span_id,
-            start_time
-        )
-        DO NOTHING
-        """;
+            INSERT INTO spans (
+                tenant_id,
+                project_id,
+                trace_id,
+                span_id,
+                parent_span_id,
+                trace_state,
+                flags,
+                service_name,
+                scope_name,
+                scope_version,
+                name,
+                span_kind,
+                status_code,
+                status_message,
+                start_time,
+                end_time,
+                duration_nano,
+                resource_attributes,
+                span_attributes,
+                events,
+                links,
+                dropped_attributes_count,
+                dropped_events_count,
+                dropped_links_count
+            )
+            VALUES (
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?,
+                CAST(? AS jsonb),
+                CAST(? AS jsonb),
+                CAST(? AS jsonb),
+                CAST(? AS jsonb),
+                ?, ?, ?
+            )
+            ON CONFLICT (
+                tenant_id,
+                project_id,
+                trace_id,
+                span_id,
+                start_time
+            )
+            DO NOTHING
+            """;
 
   private final JdbcTemplate jdbcTemplate;
   private final ObjectMapper objectMapper;
@@ -74,101 +82,243 @@ public class JdbcSpanWriter implements SpanWriter {
   }
 
   @Override
-  public boolean insert(
+  public SpanWriteResult insertBatch(
+          UUID tenantId,
+          UUID projectId,
+          List<ParsedSpan> spans
+  ) {
+    if (spans.isEmpty()) {
+      return SpanWriteResult.empty();
+    }
+
+    List<PreparedSpanRow> rows = prepareRows(
+            tenantId,
+            projectId,
+            spans
+    );
+
+    int[] updateCounts = jdbcTemplate.batchUpdate(
+            INSERT_SQL,
+            new BatchPreparedStatementSetter() {
+
+              @Override
+              public void setValues(
+                      PreparedStatement statement,
+                      int index
+              ) throws SQLException {
+                bindStatement(
+                        statement,
+                        rows.get(index)
+                );
+              }
+
+              @Override
+              public int getBatchSize() {
+                return rows.size();
+              }
+            }
+    );
+
+    return classifyResult(
+            rows.size(),
+            updateCounts
+    );
+  }
+
+  private List<PreparedSpanRow> prepareRows(
+          UUID tenantId,
+          UUID projectId,
+          List<ParsedSpan> spans
+  ) {
+    List<PreparedSpanRow> rows =
+            new ArrayList<>(spans.size());
+
+    for (ParsedSpan span : spans) {
+      rows.add(
+              prepareRow(
+                      tenantId,
+                      projectId,
+                      span
+              )
+      );
+    }
+
+    return List.copyOf(rows);
+  }
+
+  private PreparedSpanRow prepareRow(
           UUID tenantId,
           UUID projectId,
           ParsedSpan span
   ) {
-    int affectedRows = jdbcTemplate.update(
-            INSERT_SQL,
-            statement -> {
-              statement.setObject(1, tenantId);
-              statement.setObject(2, projectId);
+    try {
+      return new PreparedSpanRow(
+              tenantId,
+              projectId,
+              span,
+              objectMapper.writeValueAsString(
+                      span.resourceAttributes()
+              ),
+              objectMapper.writeValueAsString(
+                      span.spanAttributes()
+              ),
+              objectMapper.writeValueAsString(
+                      span.events()
+              ),
+              objectMapper.writeValueAsString(
+                      span.links()
+              )
+      );
+    } catch (JacksonException exception) {
+      throw new IllegalStateException(
+              "Failed to serialize parsed Span as JSON",
+              exception
+      );
+    }
+  }
 
-              statement.setString(3, span.traceId());
-              statement.setString(4, span.spanId());
+  private void bindStatement(
+          PreparedStatement statement,
+          PreparedSpanRow row
+  ) throws SQLException {
+    ParsedSpan span = row.span();
 
-              if (span.parentSpanId() == null) {
-                statement.setNull(5, Types.VARCHAR);
-              } else {
-                statement.setString(5, span.parentSpanId());
-              }
+    statement.setObject(1, row.tenantId());
+    statement.setObject(2, row.projectId());
 
-              statement.setString(6, span.traceState());
-              statement.setLong(7, span.flags());
+    statement.setString(3, span.traceId());
+    statement.setString(4, span.spanId());
 
-              statement.setString(8, span.serviceName());
-              statement.setString(9, span.scopeName());
-              statement.setString(10, span.scopeVersion());
-              statement.setString(11, span.name());
+    if (span.parentSpanId() == null) {
+      statement.setNull(5, Types.VARCHAR);
+    } else {
+      statement.setString(
+              5,
+              span.parentSpanId()
+      );
+    }
 
-              statement.setShort(12, span.spanKind());
-              statement.setShort(13, span.statusCode());
-              statement.setString(14, span.statusMessage());
+    statement.setString(6, span.traceState());
+    statement.setLong(7, span.flags());
 
-              statement.setObject(
-                      15,
-                      OffsetDateTime.ofInstant(
-                              span.startTime(),
-                              ZoneOffset.UTC
-                      )
-              );
+    statement.setString(8, span.serviceName());
+    statement.setString(9, span.scopeName());
+    statement.setString(10, span.scopeVersion());
+    statement.setString(11, span.name());
 
-              statement.setObject(
-                      16,
-                      OffsetDateTime.ofInstant(
-                              span.endTime(),
-                              ZoneOffset.UTC
-                      )
-              );
+    statement.setShort(12, span.spanKind());
+    statement.setShort(13, span.statusCode());
+    statement.setString(14, span.statusMessage());
 
-              statement.setLong(17, span.durationNano());
-
-              statement.setString(
-                      18,
-                      objectMapper.writeValueAsString(
-                              span.resourceAttributes()
-                      )
-              );
-
-              statement.setString(
-                      19,
-                      objectMapper.writeValueAsString(
-                              span.spanAttributes()
-                      )
-              );
-
-              statement.setString(
-                      20,
-                      objectMapper.writeValueAsString(
-                              span.events()
-                      )
-              );
-
-              statement.setString(
-                      21,
-                      objectMapper.writeValueAsString(
-                              span.links()
-                      )
-              );
-
-              statement.setLong(
-                      22,
-                      span.droppedAttributesCount()
-              );
-
-              statement.setLong(
-                      23,
-                      span.droppedEventsCount()
-              );
-
-              statement.setLong(
-                      24,
-                      span.droppedLinksCount()
-              );
-            }
+    statement.setObject(
+            15,
+            OffsetDateTime.ofInstant(
+                    span.startTime(),
+                    ZoneOffset.UTC
+            )
     );
 
-    return affectedRows == 1;
+    statement.setObject(
+            16,
+            OffsetDateTime.ofInstant(
+                    span.endTime(),
+                    ZoneOffset.UTC
+            )
+    );
+
+    statement.setLong(
+            17,
+            span.durationNano()
+    );
+
+    statement.setString(
+            18,
+            row.resourceAttributesJson()
+    );
+
+    statement.setString(
+            19,
+            row.spanAttributesJson()
+    );
+
+    statement.setString(
+            20,
+            row.eventsJson()
+    );
+
+    statement.setString(
+            21,
+            row.linksJson()
+    );
+
+    statement.setLong(
+            22,
+            span.droppedAttributesCount()
+    );
+
+    statement.setLong(
+            23,
+            span.droppedEventsCount()
+    );
+
+    statement.setLong(
+            24,
+            span.droppedLinksCount()
+    );
+  }
+
+  private SpanWriteResult classifyResult(
+          int requestedCount,
+          int[] updateCounts
+  ) {
+    int insertedCount = 0;
+    int duplicateCount = 0;
+    int unknownSuccessCount = 0;
+
+    for (int updateCount : updateCounts) {
+      if (updateCount > 0) {
+        insertedCount++;
+        continue;
+      }
+
+      if (updateCount == 0) {
+        duplicateCount++;
+        continue;
+      }
+
+      if (updateCount == Statement.SUCCESS_NO_INFO) {
+        unknownSuccessCount++;
+        continue;
+      }
+
+      if (updateCount == Statement.EXECUTE_FAILED) {
+        throw new IllegalStateException(
+                "A JDBC batch entry failed"
+        );
+      }
+
+      throw new IllegalStateException(
+              "Unexpected JDBC batch update count: "
+                      + updateCount
+      );
+    }
+
+    return new SpanWriteResult(
+            requestedCount,
+            insertedCount,
+            duplicateCount,
+            unknownSuccessCount
+    );
+  }
+
+  private record PreparedSpanRow(
+          UUID tenantId,
+          UUID projectId,
+          ParsedSpan span,
+          String resourceAttributesJson,
+          String spanAttributesJson,
+          String eventsJson,
+          String linksJson
+  ) {
   }
 }

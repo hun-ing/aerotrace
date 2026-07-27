@@ -2,13 +2,14 @@ package com.huning.aerotrace.ingest.application;
 
 import com.huning.aerotrace.ingest.domain.ParsedSpan;
 
+import java.util.List;
 import java.util.UUID;
 
 public interface SpanWriter {
 
-  boolean insert(
+  SpanWriteResult insertBatch(
           UUID tenantId,
           UUID projectId,
-          ParsedSpan span
+          List<ParsedSpan> spans
   );
 }

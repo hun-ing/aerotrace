@@ -641,3 +641,97 @@ X-AeroTrace-Project-Id: {{projectId}}
         );
     });
 %}
+
+### 15. 다중 Span JDBC batch 저장
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
+
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "batch-test-service"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "batch-test",
+            "version": "1.0.0"
+          },
+          "spans": [
+            {
+              "traceId": "31313131313131313131313131313131",
+              "spanId": "4141414141414141",
+              "name": "POST /batch/root",
+              "kind": 2,
+              "startTimeUnixNano": "1581452800000000000",
+              "endTimeUnixNano": "1581452800300000000",
+              "attributes": [
+                {
+                  "key": "batch.index",
+                  "value": {
+                    "intValue": "1"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "31313131313131313131313131313131",
+              "spanId": "4242424242424242",
+              "parentSpanId": "4141414141414141",
+              "name": "SELECT orders",
+              "kind": 3,
+              "startTimeUnixNano": "1581452800050000000",
+              "endTimeUnixNano": "1581452800150000000",
+              "attributes": [
+                {
+                  "key": "batch.index",
+                  "value": {
+                    "intValue": "2"
+                  }
+                }
+              ]
+            },
+            {
+              "traceId": "31313131313131313131313131313131",
+              "spanId": "4343434343434343",
+              "parentSpanId": "4141414141414141",
+              "name": "publish order event",
+              "kind": 4,
+              "startTimeUnixNano": "1581452800160000000",
+              "endTimeUnixNano": "1581452800250000000",
+              "attributes": [
+                {
+                  "key": "batch.index",
+                  "value": {
+                    "intValue": "3"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("다중 Span 요청은 200을 반환한다", function () {
+        client.assert(
+            response.status === 200,
+            "예상 상태는 200이지만 실제 상태는 "
+            + response.status
+        );
+    });
+%}

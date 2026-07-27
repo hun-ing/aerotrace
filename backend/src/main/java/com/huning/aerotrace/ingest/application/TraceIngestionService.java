@@ -1,6 +1,5 @@
 package com.huning.aerotrace.ingest.application;
 
-import com.huning.aerotrace.ingest.domain.ParsedSpan;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -16,25 +15,15 @@ public class TraceIngestionService {
   }
 
   @Transactional
-  public int ingest(
+  public SpanWriteResult ingest(
           UUID tenantId,
           UUID projectId,
           ParsedTraceRequest request
   ) {
-    int insertedCount = 0;
-
-    for (ParsedSpan span : request.spans()) {
-      boolean inserted = spanWriter.insert(
-              tenantId,
-              projectId,
-              span
-      );
-
-      if (inserted) {
-        insertedCount++;
-      }
-    }
-
-    return insertedCount;
+    return spanWriter.insertBatch(
+            tenantId,
+            projectId,
+            request.spans()
+    );
   }
 }

@@ -4,6 +4,8 @@ import com.huning.aerotrace.ingest.application.OtlpTraceRequestParser;
 import com.huning.aerotrace.ingest.application.ParsedTraceRequest;
 import com.huning.aerotrace.ingest.application.TraceIngestionService;
 import com.huning.aerotrace.ingest.domain.ParsedSpan;
+import com.huning.aerotrace.ingest.application.SpanWriteResult;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
@@ -52,27 +54,27 @@ public class OtlpTraceController {
     ParsedTraceRequest parsedRequest =
             requestParser.parse(request);
 
-    int insertedCount = ingestionService.ingest(
-            tenantId,
-            projectId,
-            parsedRequest
-    );
-
-    int duplicateCount =
-            parsedRequest.spanCount() - insertedCount;
+    SpanWriteResult writeResult =
+            ingestionService.ingest(
+                    tenantId,
+                    projectId,
+                    parsedRequest
+            );
 
     if (parsedRequest.spans().isEmpty()) {
       log.info(
-              "OTLP trace request stored: received=0, inserted=0, duplicates=0"
+              "OTLP trace request stored: received=0, inserted=0, duplicates=0, unknown=0"
       );
     } else {
-      ParsedSpan firstSpan = parsedRequest.spans().getFirst();
+      ParsedSpan firstSpan =
+              parsedRequest.spans().getFirst();
 
       log.info(
-              "OTLP trace request stored: received={}, inserted={}, duplicates={}, firstEvents={}, firstLinks={}",
-              parsedRequest.spanCount(),
-              insertedCount,
-              duplicateCount,
+              "OTLP trace request stored: received={}, inserted={}, duplicates={}, unknown={}, firstEvents={}, firstLinks={}",
+              writeResult.requestedCount(),
+              writeResult.insertedCount(),
+              writeResult.duplicateCount(),
+              writeResult.unknownSuccessCount(),
               firstSpan.events().size(),
               firstSpan.links().size()
       );
