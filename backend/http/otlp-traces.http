@@ -1,0 +1,141 @@
+@baseUrl = http://localhost:8080
+
+### 1. 애플리케이션 상태 확인
+GET {{baseUrl}}/actuator/health
+Accept: application/json
+
+> {%
+    client.test("애플리케이션이 정상 상태다", function () {
+        client.assert(
+            response.status === 200,
+            "예상 상태는 200이지만 실제 상태는 " + response.status
+        );
+    });
+
+    client.test("Health 상태가 UP이다", function () {
+        client.assert(
+            response.body.status === "UP",
+            "Health 상태가 UP이 아니다"
+        );
+    });
+%}
+
+### 2. 정상 OTLP Trace 요청
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "aerotrace-manual-test"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "manual-test",
+            "version": "1.0.0"
+          },
+          "spans": [
+            {
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902b7",
+              "name": "GET /hello",
+              "kind": 2,
+              "startTimeUnixNano": "1581452772000000321",
+              "endTimeUnixNano": "1581452773000000789",
+              "status": {
+                "code": 1
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("정상 요청은 200을 반환한다", function () {
+        client.assert(
+            response.status === 200,
+            "예상 상태는 200이지만 실제 상태는 " + response.status
+        );
+    });
+
+    client.test("응답 Content-Type은 JSON이다", function () {
+        client.assert(
+            response.contentType.mimeType === "application/json",
+            "실제 Content-Type: " + response.contentType.mimeType
+        );
+    });
+
+    client.test("완전 성공 응답은 빈 JSON 객체다", function () {
+        const responseText =
+            typeof response.body === "string"
+                ? response.body.trim()
+                : JSON.stringify(response.body);
+
+        client.assert(
+            responseText === "{}",
+            "예상 응답은 {}이지만 실제 응답은 " + responseText
+        );
+    });
+%}
+
+### 3. 빈 OTLP 요청
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+
+{}
+
+> {%
+    client.test("빈 OTLP 요청도 200을 반환한다", function () {
+        client.assert(
+            response.status === 200,
+            "예상 상태는 200이지만 실제 상태는 " + response.status
+        );
+    });
+%}
+
+### 4. 잘못된 resourceSpans 구조
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+
+{
+  "resourceSpans": {}
+}
+
+> {%
+    client.test("잘못된 구조는 400을 반환한다", function () {
+        client.assert(
+            response.status === 400,
+            "예상 상태는 400이지만 실제 상태는 " + response.status
+        );
+    });
+%}
+
+### 5. 지원하지 않는 Content-Type
+POST {{baseUrl}}/v1/traces
+Content-Type: text/plain
+
+{}
+
+> {%
+    client.test("지원하지 않는 Content-Type을 거부한다", function () {
+        client.assert(
+            response.status === 415,
+            "예상 상태는 415이지만 실제 상태는 " + response.status
+        );
+    });
+%}
