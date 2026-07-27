@@ -10,6 +10,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.Locale;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -19,6 +20,8 @@ import java.util.Map;
 import java.util.UUID;
 
 public final class JdbcSpanWriteBenchmark {
+
+  private static final String DEFAULT_DB_URL = "jdbc:postgresql://localhost:5432/aerotrace";
 
   private static final UUID TENANT_ID =
           UUID.fromString(
@@ -65,9 +68,22 @@ public final class JdbcSpanWriteBenchmark {
     int measurementCount = parsePositiveArgument(
             args,
             1,
-            5,
+            7,
             "measurementCount"
     );
+
+    boolean rewriteBatchedInserts =
+            parseBooleanArgument(
+                    args,
+                    2,
+                    false,
+                    "rewriteBatchedInserts"
+            );
+
+    String benchmarkJdbcUrl =
+            buildBenchmarkJdbcUrl(
+                    rewriteBatchedInserts
+            );
 
     try (
             ConfigurableApplicationContext context =
@@ -77,7 +93,9 @@ public final class JdbcSpanWriteBenchmark {
                             .web(WebApplicationType.NONE)
                             .properties(
                                     "spring.main.banner-mode=off",
-                                    "logging.level.root=WARN"
+                                    "logging.level.root=WARN",
+                                    "spring.datasource.url="
+                                            + benchmarkJdbcUrl
                             )
                             .run()
     ) {
@@ -95,14 +113,16 @@ public final class JdbcSpanWriteBenchmark {
 
       benchmark.run(
               spanCount,
-              measurementCount
+              measurementCount,
+              rewriteBatchedInserts
       );
     }
   }
 
   private void run(
           int spanCount,
-          int measurementCount
+          int measurementCount,
+          boolean rewriteBatchedInserts
   ) {
     prepareTenantAndProject();
 
@@ -113,9 +133,11 @@ public final class JdbcSpanWriteBenchmark {
             "%nAeroTrace JDBC 저장 벤치마크%n"
                     + "- Span 수: %,d%n"
                     + "- 측정 횟수: %d%n"
+                    + "- reWriteBatchedInserts: %s%n"
                     + "- 단건·batch 모두 요청당 트랜잭션 1개%n%n",
             spanCount,
-            measurementCount
+            measurementCount,
+            rewriteBatchedInserts
     );
 
     warmUp(spans);
@@ -484,6 +506,58 @@ public final class JdbcSpanWriteBenchmark {
             sorted.get(middle - 1)
                     + sorted.get(middle)
     ) / 2;
+  }
+
+  private static String buildBenchmarkJdbcUrl(
+          boolean rewriteBatchedInserts
+  ) {
+    String baseUrl = System.getenv()
+            .getOrDefault(
+                    "AEROTRACE_DB_URL",
+                    DEFAULT_DB_URL
+            );
+
+    if (
+            baseUrl.toLowerCase(Locale.ROOT)
+                    .contains("rewritebatchedinserts=")
+    ) {
+      throw new IllegalArgumentException(
+              "Remove reWriteBatchedInserts from "
+                      + "AEROTRACE_DB_URL during the benchmark"
+      );
+    }
+
+    String separator =
+            baseUrl.contains("?") ? "&" : "?";
+
+    return baseUrl
+            + separator
+            + "reWriteBatchedInserts="
+            + rewriteBatchedInserts;
+  }
+
+  private static boolean parseBooleanArgument(
+          String[] args,
+          int index,
+          boolean defaultValue,
+          String argumentName
+  ) {
+    if (args.length <= index) {
+      return defaultValue;
+    }
+
+    return switch (
+            args[index]
+                    .trim()
+                    .toLowerCase(Locale.ROOT)
+            ) {
+      case "true" -> true;
+      case "false" -> false;
+      default -> throw new IllegalArgumentException(
+              argumentName
+                      + " must be true or false"
+      );
+    };
   }
 
   private static int parsePositiveArgument(
