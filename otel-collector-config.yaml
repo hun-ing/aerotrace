@@ -12,22 +12,42 @@ processors:
     send_batch_size: 1024
 
 exporters:
-  # 데이터가 잘 들어오는지 도커 로그로 확인하기 위한 용도
-  debug:
-    verbosity: detailed
-    
-  # 백엔드가 아직 없더라도, 훗날 띄울 Java 백엔드를 향해 데이터를 쏘도록 미리 설정
-  otlphttp:
-    endpoint: "http://host.docker.internal:8080/v1/traces" 
+  otlp_http/aerotrace:
+    endpoint: "${env:AEROTRACE_BACKEND_ENDPOINT}"
+
+    encoding: json
+    compression: none
+    timeout: 5s
+
+    headers:
+      Authorization: "Bearer ${env:AEROTRACE_API_KEY}"
+
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 0s
+
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      sizer: items
+      queue_size: 50000
+      block_on_overflow: false
+      storage: file_storage/aerotrace
 
 service:
   extensions:
     - file_storage/aerotrace
+
   pipelines:
     traces:
-      receivers: [otlp]
-      processors: [batch]
-      exporters: [debug, otlphttp]
+      receivers:
+        - otlp
+      processors:
+        - batch
+      exporters:
+        - otlp_http/aerotrace
 
 extensions:
   file_storage/aerotrace:

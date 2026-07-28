@@ -1,0 +1,52 @@
+### Collector를 통한 Trace 전달 검증
+POST http://localhost:4318/v1/traces
+Content-Type: application/json
+Accept: application/json
+
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "collector-forwarding-verification"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "aerotrace.collector.verifier",
+            "version": "1.0.0"
+          },
+          "spans": [
+            {
+              "traceId": "a1000000000000000000000000000001",
+              "spanId": "b100000000000001",
+              "name": "collector-forwarding-check",
+              "kind": 2,
+              "startTimeUnixNano": "1785218400000000000",
+              "endTimeUnixNano": "1785218400005000000",
+              "status": {
+                "code": 1
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+> {%
+    client.test("Collector가 OTLP 요청을 수신한다", function () {
+        client.assert(
+            response.status === 200,
+            "예상 상태는 200이지만 실제 상태는 "
+            + response.status
+        );
+    });
+%}

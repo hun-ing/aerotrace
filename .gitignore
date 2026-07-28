@@ -25,3 +25,4 @@
 /frontend/.env*.local
 
 http-client.private.env.json
+/otel-collector.env

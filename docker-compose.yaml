@@ -33,6 +33,8 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.157.0
     container_name: aerotrace-otel-collector
+    env_file:
+      - ./otel-collector.env
     command:
       - --config=/etc/otel-collector-config.yaml
     volumes:
