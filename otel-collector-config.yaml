@@ -21,8 +21,23 @@ exporters:
     endpoint: "http://host.docker.internal:8080/v1/traces" 
 
 service:
+  extensions:
+    - file_storage/aerotrace
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
       exporters: [debug, otlphttp]
+
+extensions:
+  file_storage/aerotrace:
+    directory: /var/lib/otelcol/storage
+    create_directory: true
+    directory_permissions: "0750"
+    timeout: 1s
+    max_size: 536870912
+    fsync: true
+    compaction:
+      on_start: true
+      cleanup_on_start: true
+      directory: /var/lib/otelcol/compaction

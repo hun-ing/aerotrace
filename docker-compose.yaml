@@ -15,18 +15,37 @@ services:
       - aerotrace-network
     restart: unless-stopped
 
-  otel-collector:
-    image: otel/opentelemetry-collector:latest
-    container_name: aerotrace-otel-collector
-    command: ["--config=/etc/otel-collector-config.yaml"]
+  otel-storage-init:
+    image: alpine:3.22
+    container_name: aerotrace-otel-storage-init
+    command:
+      - sh
+      - -c
+      - >
+        mkdir -p /var/lib/otelcol/storage
+        /var/lib/otelcol/compaction
+        &&
+        chown -R 10001:10001 /var/lib/otelcol
     volumes:
-      # 로컬에 작성할 설정 파일을 컨테이너 내부로 맵핑(읽기 전용)
+      - aerotrace-otelcol-data:/var/lib/otelcol
+    restart: "no"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.157.0
+    container_name: aerotrace-otel-collector
+    command:
+      - --config=/etc/otel-collector-config.yaml
+    volumes:
       - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+      - aerotrace-otelcol-data:/var/lib/otelcol
     ports:
-      - "4317:4317" # OTLP gRPC (앱에서 데이터를 쏠 포트)
-      - "4318:4318" # OTLP HTTP
+      - "4317:4317"
+      - "4318:4318"
     depends_on:
-      - timescaledb
+      timescaledb:
+        condition: service_started
+      otel-storage-init:
+        condition: service_completed_successfully
     networks:
       - aerotrace-network
     restart: unless-stopped
@@ -34,6 +53,9 @@ services:
 # 볼륨 선언 (윈도우/우분투 이식성 확보)
 volumes:
   aerotrace-db-data:
+
+  aerotrace-otelcol-data:
+    name: aerotrace-otelcol-data
 
 # 서비스 간 통신을 격리하고 보호하기 위한 전용 네트워크
 networks:
