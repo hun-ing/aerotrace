@@ -3,6 +3,9 @@ package com.huning.aerotrace.ingest.infrastructure;
 import com.huning.aerotrace.ingest.application.SpanWriteResult;
 import com.huning.aerotrace.ingest.application.SpanWriter;
 import com.huning.aerotrace.ingest.domain.ParsedSpan;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -16,15 +19,30 @@ import java.util.UUID;
 @Repository
 public class JdbcSpanWriter implements SpanWriter {
 
+  private static final Logger log =
+          LoggerFactory.getLogger(JdbcSpanWriter.class);
+
   private final JdbcTemplate jdbcTemplate;
   private final JdbcSpanPersistenceSupport persistenceSupport;
+  private final int batchSize;
 
   public JdbcSpanWriter(
           JdbcTemplate jdbcTemplate,
-          JdbcSpanPersistenceSupport persistenceSupport
+          JdbcSpanPersistenceSupport persistenceSupport,
+          @Value(
+                  "${aerotrace.ingest.jdbc.batch-size:1000}"
+          )
+          int batchSize
   ) {
+    if (batchSize <= 0) {
+      throw new IllegalArgumentException(
+              "JDBC Span batch size must be greater than zero"
+      );
+    }
+
     this.jdbcTemplate = jdbcTemplate;
     this.persistenceSupport = persistenceSupport;
+    this.batchSize = batchSize;
   }
 
   @Override
@@ -37,14 +55,86 @@ public class JdbcSpanWriter implements SpanWriter {
       return SpanWriteResult.empty();
     }
 
-    List<JdbcSpanPersistenceSupport.PreparedSpanRow> rows =
-            persistenceSupport.prepareRows(
-                    tenantId,
-                    projectId,
-                    spans
+    int insertedCount = 0;
+    int duplicateCount = 0;
+    int unknownSuccessCount = 0;
+    int batchExecutionCount = 0;
+
+    int fromIndex = 0;
+
+    while (fromIndex < spans.size()) {
+      int remainingCount =
+              spans.size() - fromIndex;
+
+      int currentBatchSize =
+              Math.min(
+                      batchSize,
+                      remainingCount
+              );
+
+      int toIndex =
+              fromIndex + currentBatchSize;
+
+      List<ParsedSpan> chunk =
+              spans.subList(
+                      fromIndex,
+                      toIndex
+              );
+
+      List<JdbcSpanPersistenceSupport.PreparedSpanRow> rows =
+              persistenceSupport.prepareRows(
+                      tenantId,
+                      projectId,
+                      chunk
+              );
+
+      int[] updateCounts =
+              executeBatch(rows);
+
+      SpanWriteResult chunkResult =
+              classifyResult(
+                      rows.size(),
+                      updateCounts
+              );
+
+      insertedCount +=
+              chunkResult.insertedCount();
+
+      duplicateCount +=
+              chunkResult.duplicateCount();
+
+      unknownSuccessCount +=
+              chunkResult.unknownSuccessCount();
+
+      batchExecutionCount++;
+      fromIndex = toIndex;
+    }
+
+    SpanWriteResult result =
+            new SpanWriteResult(
+                    spans.size(),
+                    insertedCount,
+                    duplicateCount,
+                    unknownSuccessCount
             );
 
-    int[] updateCounts = jdbcTemplate.batchUpdate(
+    log.debug(
+            "JDBC Span batch completed: requested={}, batchSize={}, executions={}, inserted={}, duplicates={}, unknown={}",
+            result.requestedCount(),
+            batchSize,
+            batchExecutionCount,
+            result.insertedCount(),
+            result.duplicateCount(),
+            result.unknownSuccessCount()
+    );
+
+    return result;
+  }
+
+  private int[] executeBatch(
+          List<JdbcSpanPersistenceSupport.PreparedSpanRow> rows
+  ) {
+    return jdbcTemplate.batchUpdate(
             JdbcSpanPersistenceSupport.INSERT_SQL,
             new BatchPreparedStatementSetter() {
 
@@ -64,11 +154,6 @@ public class JdbcSpanWriter implements SpanWriter {
                 return rows.size();
               }
             }
-    );
-
-    return classifyResult(
-            rows.size(),
-            updateCounts
     );
   }
 

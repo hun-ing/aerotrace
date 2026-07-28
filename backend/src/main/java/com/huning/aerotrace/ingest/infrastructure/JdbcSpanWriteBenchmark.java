@@ -111,10 +111,19 @@ public final class JdbcSpanWriteBenchmark {
                       )
               );
 
+      int configuredBatchSize =
+              context.getEnvironment()
+                      .getProperty(
+                              "aerotrace.ingest.jdbc.batch-size",
+                              Integer.class,
+                              1_000
+                      );
+
       benchmark.run(
               spanCount,
               measurementCount,
-              rewriteBatchedInserts
+              rewriteBatchedInserts,
+              configuredBatchSize
       );
     }
   }
@@ -122,7 +131,8 @@ public final class JdbcSpanWriteBenchmark {
   private void run(
           int spanCount,
           int measurementCount,
-          boolean rewriteBatchedInserts
+          boolean rewriteBatchedInserts,
+          int configuredBatchSize
   ) {
     prepareTenantAndProject();
 
@@ -134,11 +144,13 @@ public final class JdbcSpanWriteBenchmark {
                     + "- Span 수: %,d%n"
                     + "- 측정 횟수: %d%n"
                     + "- reWriteBatchedInserts: %s%n"
+                    + "- 운영 batch 크기: %,d%n"
                     + "- 측정 범위: JSON 직렬화 + 트랜잭션 + JDBC 저장%n"
                     + "- 저장 결과 검증과 테스트 데이터 삭제는 측정에서 제외%n%n",
             spanCount,
             measurementCount,
-            rewriteBatchedInserts
+            rewriteBatchedInserts,
+            configuredBatchSize
     );
 
     warmUp(spans);
@@ -177,7 +189,10 @@ public final class JdbcSpanWriteBenchmark {
             spanCount,
             batchTimes,
             batchMedian,
-            1
+            divideRoundingUp(
+                    spanCount,
+                    configuredBatchSize
+            )
     );
 
     double speedup =
@@ -189,6 +204,15 @@ public final class JdbcSpanWriteBenchmark {
     );
 
     cleanBenchmarkSpans();
+  }
+
+  private int divideRoundingUp(
+          int dividend,
+          int divisor
+  ) {
+    return (
+            dividend + divisor - 1
+    ) / divisor;
   }
 
   private void warmUp(List<ParsedSpan> spans) {
@@ -452,7 +476,7 @@ public final class JdbcSpanWriteBenchmark {
           int spanCount,
           List<Long> times,
           long medianNano,
-          int jdbcTemplateCallCount
+          int jdbcCallCount
   ) {
     double medianMillis =
             medianNano / 1_000_000.0;
@@ -466,12 +490,12 @@ public final class JdbcSpanWriteBenchmark {
                     + "- 각 측정: %s ms%n"
                     + "- 중앙값: %.3f ms%n"
                     + "- 처리량: %.0f spans/sec%n"
-                    + "- JdbcTemplate 호출 수: %,d%n",
+                    + "- JDBC 저장 호출 수: %,d%n",
             label,
             formatMillis(times),
             medianMillis,
             throughput,
-            jdbcTemplateCallCount
+            jdbcCallCount
     );
   }
 

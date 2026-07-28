@@ -84,7 +84,9 @@ public final class JdbcBatchChunkBenchmark {
                                     "spring.main.banner-mode=off",
                                     "logging.level.root=WARN",
                                     "spring.datasource.url="
-                                            + benchmarkJdbcUrl
+                                            + benchmarkJdbcUrl,
+                                    "aerotrace.ingest.jdbc.batch-size="
+                                            + TOTAL_SPAN_COUNT
                             )
                             .run()
     ) {
@@ -285,18 +287,19 @@ public final class JdbcBatchChunkBenchmark {
                       / medianNano;
 
       System.out.printf(
-              "[chunk %,d]%n"
-                      + "- 각 측정: %s ms%n"
-                      + "- 중앙값: %.3f ms%n"
-                      + "- 처리량: %.0f spans/sec%n"
-                      + "- batchUpdate 실행 횟수: %,d%n"
-                      + "- chunk 5,000 대비 배율: %.3fx%n%n",
-              chunkSize,
-              formatMillis(times),
-              medianMillis,
-              throughput,
-              batchExecutionCount,
-              relativeToFullBatch
+              "%nAeroTrace JDBC batch chunk 벤치마크%n"
+                      + "- 총 Span 수: %,d%n"
+                      + "- 측정 횟수: %d%n"
+                      + "- chunk 크기: %s%n"
+                      + "- reWriteBatchedInserts: false%n"
+                      + "- 내부 JdbcSpanWriter batch 크기: %,d%n"
+                      + "- 모든 chunk는 요청당 트랜잭션 1개%n"
+                      + "- 측정 범위: JSON 직렬화 + 트랜잭션 + JDBC 저장%n"
+                      + "- 저장 검증과 데이터 삭제는 측정에서 제외%n%n",
+              TOTAL_SPAN_COUNT,
+              MEASUREMENT_COUNT,
+              CHUNK_SIZES,
+              TOTAL_SPAN_COUNT
       );
     }
   }
