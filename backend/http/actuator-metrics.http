@@ -33,3 +33,7 @@ Accept: application/json
 GET {{baseUrl}}/actuator/metrics/aerotrace.auth.api_key.lookup.duration
     ?tag=result:not_found
 Accept: application/json
+
+###
+GET http://localhost:8080/actuator/health
+Accept: application/json

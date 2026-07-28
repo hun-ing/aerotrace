@@ -11,6 +11,11 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import tools.jackson.databind.ObjectMapper;
 
+import com.huning.aerotrace.auth.application
+        .ProjectApiKeyLookupUnavailableException;
+import io.micrometer.core.instrument.simple
+        .SimpleMeterRegistry;
+
 import com.huning.aerotrace.auth.application.ProjectApiKeyAuthenticationMetrics;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
@@ -197,6 +202,94 @@ class OtlpApiKeyAuthenticationFilterTest {
 
     assertTrue(chainCalled.get());
     assertEquals(200, response.getStatus());
+  }
+
+  @Test
+  void returns503WhenApiKeyDatabaseIsUnavailable()
+          throws Exception {
+    ProjectApiKeyTokenService tokenService =
+            new ProjectApiKeyTokenService();
+
+    GeneratedProjectApiKey generated =
+            tokenService.generate();
+
+    ProjectApiKeyCredentialStore unavailableStore =
+            keyId -> {
+              throw new ProjectApiKeyLookupUnavailableException(
+                      new IllegalStateException(
+                              "Simulated database outage"
+                      )
+              );
+            };
+
+    SimpleMeterRegistry meterRegistry =
+            new SimpleMeterRegistry();
+
+    ProjectApiKeyAuthenticationMetrics metrics =
+            new ProjectApiKeyAuthenticationMetrics(
+                    meterRegistry
+            );
+
+    ProjectApiKeyAuthenticationService
+            authenticationService =
+            new ProjectApiKeyAuthenticationService(
+                    tokenService,
+                    unavailableStore,
+                    metrics
+            );
+
+    OtlpApiKeyAuthenticationFilter filter =
+            new OtlpApiKeyAuthenticationFilter(
+                    authenticationService,
+                    new ObjectMapper(),
+                    metrics
+            );
+
+    MockHttpServletRequest request =
+            traceRequest();
+
+    request.addHeader(
+            HttpHeaders.AUTHORIZATION,
+            "Bearer " + generated.rawKey()
+    );
+
+    MockHttpServletResponse response =
+            new MockHttpServletResponse();
+
+    AtomicBoolean chainCalled =
+            new AtomicBoolean(false);
+
+    filter.doFilter(
+            request,
+            response,
+            (
+                    servletRequest,
+                    servletResponse
+            ) ->
+                    chainCalled.set(true)
+    );
+
+    assertEquals(
+            503,
+            response.getStatus()
+    );
+
+    assertTrue(
+            response.getContentAsString()
+                    .contains(
+                            "Authentication service is "
+                                    + "temporarily unavailable"
+                    )
+    );
+
+    assertEquals(
+            null,
+            response.getHeader(
+                    HttpHeaders.WWW_AUTHENTICATE
+            )
+    );
+
+    assertFalse(chainCalled.get());
   }
 
   private Fixture createFixture() {

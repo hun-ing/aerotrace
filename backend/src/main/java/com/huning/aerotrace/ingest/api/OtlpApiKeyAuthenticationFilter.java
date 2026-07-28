@@ -16,6 +16,11 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 import tools.jackson.databind.ObjectMapper;
 
+import com.huning.aerotrace.auth.application
+        .ProjectApiKeyLookupUnavailableException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
@@ -29,6 +34,11 @@ import static com.huning.aerotrace.auth.application.ProjectApiKeyAuthenticationM
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 10)
 public class OtlpApiKeyAuthenticationFilter extends OncePerRequestFilter {
+
+  private static final Logger log =
+          LoggerFactory.getLogger(
+                  OtlpApiKeyAuthenticationFilter.class
+          );
 
   /**
    * 이 Filter가 인증할 OTLP Trace 수신 경로다.
@@ -144,11 +154,28 @@ public class OtlpApiKeyAuthenticationFilter extends OncePerRequestFilter {
       return;
     }
 
-    Optional<AuthenticatedProject>
-            authenticatedProject =
-            authenticationService.authenticate(
-                    rawKey.orElseThrow()
-            );
+    Optional<AuthenticatedProject> authenticatedProject;
+
+    try {
+      authenticatedProject =
+              authenticationService.authenticate(
+                      rawKey.orElseThrow()
+              );
+    } catch (
+            ProjectApiKeyLookupUnavailableException exception
+    ) {
+      /*
+       * 원문 API Key나 keyId는 로그에 넣지 않는다.
+       */
+      log.warn(
+              "Project API Key authentication "
+                      + "backend is temporarily unavailable",
+              exception
+      );
+
+      writeServiceUnavailableResponse(response);
+      return;
+    }
 
     /*
      * 존재하지 않는 Key, 잘못된 Secret, 만료, 폐기 등을
@@ -260,6 +287,35 @@ public class OtlpApiKeyAuthenticationFilter extends OncePerRequestFilter {
             response.getOutputStream(),
             new OtlpHttpStatusResponse(
                     UNAUTHORIZED_MESSAGE
+            )
+    );
+  }
+
+  private void writeServiceUnavailableResponse(
+          HttpServletResponse response
+  ) throws IOException {
+    response.setStatus(
+            HttpStatus.SERVICE_UNAVAILABLE.value()
+    );
+
+    response.setHeader(
+            HttpHeaders.CACHE_CONTROL,
+            "no-store"
+    );
+
+    response.setContentType(
+            MediaType.APPLICATION_JSON_VALUE
+    );
+
+    response.setCharacterEncoding(
+            StandardCharsets.UTF_8.name()
+    );
+
+    objectMapper.writeValue(
+            response.getOutputStream(),
+            new OtlpHttpStatusResponse(
+                    "Authentication service is "
+                            + "temporarily unavailable"
             )
     );
   }

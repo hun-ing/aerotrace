@@ -10,6 +10,9 @@ import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.RecoverableDataAccessException;
+import org.springframework.dao.TransientDataAccessException;
 
 @RestControllerAdvice
 public class OtlpExceptionHandler {
@@ -89,6 +92,21 @@ public class OtlpExceptionHandler {
     return response(
             HttpStatus.UNSUPPORTED_MEDIA_TYPE,
             "Unsupported OTLP Content-Type"
+    );
+  }
+
+  @ExceptionHandler({
+          DataAccessResourceFailureException.class,
+          RecoverableDataAccessException.class,
+          TransientDataAccessException.class
+  })
+  public ResponseEntity<OtlpHttpStatusResponse>
+  handleTemporaryStorageFailure(
+          RuntimeException exception
+  ) {
+    return response(
+            HttpStatus.SERVICE_UNAVAILABLE,
+            "Telemetry storage is temporarily unavailable"
     );
   }
 

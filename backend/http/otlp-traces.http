@@ -890,10 +890,36 @@ Accept: application/json
 ### 21
 GET http://localhost:8080/actuator/metrics
 
-### 21
+### DB 장애 시 인증 요청은 503
 POST {{baseUrl}}/v1/traces
 Content-Type: application/json
 Accept: application/json
-Authorization: Bearer atr_AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+Authorization: Bearer {{apiKey}}
 
-{}
+{
+  "resourceSpans": []
+}
+
+> {%
+    client.test("인증 DB 장애는 503을 반환한다", function () {
+        client.assert(
+            response.status === 503,
+            "예상 상태는 503이지만 실제 상태는 "
+            + response.status
+        );
+
+        client.assert(
+            response.body.message
+            === "Authentication service is temporarily unavailable",
+            "예상하지 못한 오류 메시지: "
+            + response.body.message
+        );
+
+        client.assert(
+            response.headers.valueOf(
+                "WWW-Authenticate"
+            ) === null,
+            "DB 장애 응답에 인증 challenge가 있으면 안 된다"
+        );
+    });
+%}
