@@ -2,12 +2,15 @@ package com.huning.aerotrace.auth.application;
 
 import org.junit.jupiter.api.Test;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
 import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
 
 class ProjectApiKeyAuthenticationServiceTest {
 
@@ -207,7 +210,10 @@ class ProjectApiKeyAuthenticationServiceTest {
 
     return new ProjectApiKeyAuthenticationService(
             tokenService,
-            store
+            store,
+            new ProjectApiKeyAuthenticationMetrics(
+                    new SimpleMeterRegistry()
+            )
     );
   }
 

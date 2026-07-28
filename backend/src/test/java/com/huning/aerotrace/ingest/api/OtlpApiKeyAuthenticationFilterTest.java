@@ -11,6 +11,9 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import tools.jackson.databind.ObjectMapper;
 
+import com.huning.aerotrace.auth.application.ProjectApiKeyAuthenticationMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
 import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
@@ -227,17 +230,28 @@ class OtlpApiKeyAuthenticationFilterTest {
               );
             };
 
+    SimpleMeterRegistry meterRegistry =
+            new SimpleMeterRegistry();
+
+    ProjectApiKeyAuthenticationMetrics
+            authenticationMetrics =
+            new ProjectApiKeyAuthenticationMetrics(
+                    meterRegistry
+            );
+
     ProjectApiKeyAuthenticationService
             authenticationService =
             new ProjectApiKeyAuthenticationService(
                     tokenService,
-                    credentialStore
+                    credentialStore,
+                    authenticationMetrics
             );
 
     OtlpApiKeyAuthenticationFilter filter =
             new OtlpApiKeyAuthenticationFilter(
                     authenticationService,
-                    new ObjectMapper()
+                    new ObjectMapper(),
+                    authenticationMetrics
             );
 
     return new Fixture(

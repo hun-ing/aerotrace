@@ -6,6 +6,14 @@ import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;
 
+import static com.huning.aerotrace.auth.application
+        .ProjectApiKeyAuthenticationMetrics
+        .AuthenticationResult;
+
+import static com.huning.aerotrace.auth.application
+        .ProjectApiKeyAuthenticationMetrics
+        .LookupResult;
+
 @Service
 public class ProjectApiKeyAuthenticationService {
 
@@ -13,14 +21,23 @@ public class ProjectApiKeyAuthenticationService {
           new byte[32];
 
   private final ProjectApiKeyTokenService tokenService;
-  private final ProjectApiKeyCredentialStore credentialStore;
+
+  private final ProjectApiKeyCredentialStore
+          credentialStore;
+
+  private final ProjectApiKeyAuthenticationMetrics
+          authenticationMetrics;
 
   public ProjectApiKeyAuthenticationService(
           ProjectApiKeyTokenService tokenService,
-          ProjectApiKeyCredentialStore credentialStore
+          ProjectApiKeyCredentialStore credentialStore,
+          ProjectApiKeyAuthenticationMetrics
+                  authenticationMetrics
   ) {
     this.tokenService = tokenService;
     this.credentialStore = credentialStore;
+    this.authenticationMetrics =
+            authenticationMetrics;
   }
 
   public Optional<AuthenticatedProject> authenticate(
@@ -45,17 +62,54 @@ public class ProjectApiKeyAuthenticationService {
             tokenService.parse(rawKey);
 
     if (parsedOptional.isEmpty()) {
+      authenticationMetrics.recordAuthentication(
+              AuthenticationResult.MALFORMED_KEY
+      );
+
       return Optional.empty();
     }
 
     ParsedProjectApiKey parsed =
             parsedOptional.orElseThrow();
 
+    long lookupStartedAt =
+            System.nanoTime();
+
     Optional<ProjectApiKeyCredentialStore.StoredProjectApiKey>
-            storedOptional =
-            credentialStore.findByKeyId(
-                    parsed.keyId()
-            );
+            storedOptional;
+
+    try {
+      storedOptional =
+              credentialStore.findByKeyId(
+                      parsed.keyId()
+              );
+    } catch (RuntimeException exception) {
+      long elapsedNanoseconds =
+              System.nanoTime()
+                      - lookupStartedAt;
+
+      authenticationMetrics.recordLookup(
+              elapsedNanoseconds,
+              LookupResult.ERROR
+      );
+
+      authenticationMetrics.recordAuthentication(
+              AuthenticationResult.LOOKUP_ERROR
+      );
+
+      throw exception;
+    }
+
+    long elapsedNanoseconds =
+            System.nanoTime()
+                    - lookupStartedAt;
+
+    authenticationMetrics.recordLookup(
+            elapsedNanoseconds,
+            storedOptional.isPresent()
+                    ? LookupResult.FOUND
+                    : LookupResult.NOT_FOUND
+    );
 
     byte[] expectedSecretHash =
             storedOptional
@@ -68,21 +122,29 @@ public class ProjectApiKeyAuthenticationService {
                             UNKNOWN_KEY_DUMMY_HASH
                     );
 
-    /*
-     * 존재하지 않는 keyId도 더미 해시와 비교한다.
-     * 단, 이 처리만으로 전체 인증 시간이 완전히
-     * 일정해진다고 보장할 수는 없다.
-     */
     boolean secretMatches =
             tokenService.matchesSecret(
                     parsed.secret(),
                     expectedSecretHash
             );
 
-    if (
-            storedOptional.isEmpty()
-                    || !secretMatches
-    ) {
+    /*
+     * 존재하지 않는 Key도 위에서 더미 해시와
+     * 비교한 뒤 동일한 인증 실패를 반환한다.
+     */
+    if (storedOptional.isEmpty()) {
+      authenticationMetrics.recordAuthentication(
+              AuthenticationResult.UNKNOWN_KEY
+      );
+
+      return Optional.empty();
+    }
+
+    if (!secretMatches) {
+      authenticationMetrics.recordAuthentication(
+              AuthenticationResult.SECRET_MISMATCH
+      );
+
       return Optional.empty();
     }
 
@@ -91,6 +153,10 @@ public class ProjectApiKeyAuthenticationService {
             storedOptional.orElseThrow();
 
     if (stored.revokedAt() != null) {
+      authenticationMetrics.recordAuthentication(
+              AuthenticationResult.REVOKED
+      );
+
       return Optional.empty();
     }
 
@@ -99,8 +165,16 @@ public class ProjectApiKeyAuthenticationService {
                     && !stored.expiresAt()
                     .isAfter(authenticatedAt)
     ) {
+      authenticationMetrics.recordAuthentication(
+              AuthenticationResult.EXPIRED
+      );
+
       return Optional.empty();
     }
+
+    authenticationMetrics.recordAuthentication(
+            AuthenticationResult.SUCCESS
+    );
 
     return Optional.of(
             new AuthenticatedProject(

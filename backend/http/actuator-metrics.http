@@ -1,0 +1,35 @@
+@baseUrl = http://localhost:8080
+
+### 인증 성공 횟수
+GET {{baseUrl}}/actuator/metrics/aerotrace.auth.api_key.attempts
+    ?tag=outcome:success
+    &tag=reason:none
+Accept: application/json
+
+### 인증 헤더 누락 횟수
+GET {{baseUrl}}/actuator/metrics/aerotrace.auth.api_key.attempts
+    ?tag=outcome:failure
+    &tag=reason:missing_credentials
+Accept: application/json
+
+### 잘못된 Key 형식 횟수
+GET {{baseUrl}}/actuator/metrics/aerotrace.auth.api_key.attempts
+    ?tag=outcome:failure
+    &tag=reason:malformed_key
+Accept: application/json
+
+### 존재하지 않는 Key 횟수
+GET {{baseUrl}}/actuator/metrics/aerotrace.auth.api_key.attempts
+    ?tag=outcome:failure
+    &tag=reason:unknown_key
+Accept: application/json
+
+### Key 조회 성공 지연시간
+GET {{baseUrl}}/actuator/metrics/aerotrace.auth.api_key.lookup.duration
+    ?tag=result:found
+Accept: application/json
+
+### Key 조회 실패 지연시간
+GET {{baseUrl}}/actuator/metrics/aerotrace.auth.api_key.lookup.duration
+    ?tag=result:not_found
+Accept: application/json

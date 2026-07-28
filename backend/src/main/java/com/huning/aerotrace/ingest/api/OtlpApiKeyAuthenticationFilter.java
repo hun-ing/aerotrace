@@ -22,14 +22,17 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
+import com.huning.aerotrace.auth.application.ProjectApiKeyAuthenticationMetrics;
+
+import static com.huning.aerotrace.auth.application.ProjectApiKeyAuthenticationMetrics.AuthenticationResult;
+
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 10)
-public class OtlpApiKeyAuthenticationFilter
-        extends OncePerRequestFilter {
+public class OtlpApiKeyAuthenticationFilter extends OncePerRequestFilter {
 
   /**
    * 이 Filter가 인증할 OTLP Trace 수신 경로다.
-   *
+   * <p>
    * 다른 Actuator endpoint나 향후 관리 API에는
    * 이 Filter를 적용하지 않는다.
    */
@@ -38,7 +41,7 @@ public class OtlpApiKeyAuthenticationFilter
 
   /**
    * Authorization 헤더에서 허용할 인증 방식이다.
-   *
+   * <p>
    * Authorization: Bearer <API Key>
    */
   private static final String BEARER_SCHEME =
@@ -52,27 +55,24 @@ public class OtlpApiKeyAuthenticationFilter
 
   /**
    * 외부에는 인증 실패 원인을 구분해서 노출하지 않는다.
-   *
+   * <p>
    * Key 형식 오류, 존재하지 않는 Key, 잘못된 Secret,
    * 만료된 Key, 폐기된 Key 모두 같은 메시지를 사용한다.
    */
-  private static final String UNAUTHORIZED_MESSAGE =
-          "Authentication credentials are missing or invalid";
+  private static final String UNAUTHORIZED_MESSAGE = "Authentication credentials are missing or invalid";
 
-  private final ProjectApiKeyAuthenticationService
-          authenticationService;
-
+  private final ProjectApiKeyAuthenticationService authenticationService;
   private final ObjectMapper objectMapper;
+  private final ProjectApiKeyAuthenticationMetrics authenticationMetrics;
 
   public OtlpApiKeyAuthenticationFilter(
           ProjectApiKeyAuthenticationService authenticationService,
-          ObjectMapper objectMapper
+          ObjectMapper objectMapper,
+          ProjectApiKeyAuthenticationMetrics authenticationMetrics
   ) {
-    this.authenticationService =
-            authenticationService;
-
-    this.objectMapper =
-            objectMapper;
+    this.authenticationService = authenticationService;
+    this.objectMapper = objectMapper;
+    this.authenticationMetrics = authenticationMetrics;
   }
 
   /**
@@ -105,13 +105,41 @@ public class OtlpApiKeyAuthenticationFilter
           HttpServletResponse response,
           FilterChain filterChain
   ) throws ServletException, IOException {
-    Optional<String> rawApiKey =
-            resolveBearerToken(request);
+    List<String> authorizationHeaders =
+            Collections.list(
+                    request.getHeaders(
+                            HttpHeaders.AUTHORIZATION
+                    )
+            );
 
-    /*
-     * Authorization 헤더가 없거나 Bearer 형식이 잘못된 경우다.
-     */
-    if (rawApiKey.isEmpty()) {
+    if (authorizationHeaders.isEmpty()) {
+      authenticationMetrics.recordAuthentication(
+              AuthenticationResult.MISSING_CREDENTIALS
+      );
+
+      writeUnauthorizedResponse(response);
+      return;
+    }
+
+    if (authorizationHeaders.size() != 1) {
+      authenticationMetrics.recordAuthentication(
+              AuthenticationResult.INVALID_AUTHORIZATION
+      );
+
+      writeUnauthorizedResponse(response);
+      return;
+    }
+
+    Optional<String> rawKey =
+            resolveBearerToken(
+                    authorizationHeaders.getFirst()
+            );
+
+    if (rawKey.isEmpty()) {
+      authenticationMetrics.recordAuthentication(
+              AuthenticationResult.INVALID_AUTHORIZATION
+      );
+
       writeUnauthorizedResponse(response);
       return;
     }
@@ -119,7 +147,7 @@ public class OtlpApiKeyAuthenticationFilter
     Optional<AuthenticatedProject>
             authenticatedProject =
             authenticationService.authenticate(
-                    rawApiKey.orElseThrow()
+                    rawKey.orElseThrow()
             );
 
     /*
@@ -155,25 +183,8 @@ public class OtlpApiKeyAuthenticationFilter
    * Authorization 헤더에서 Bearer Token을 추출한다.
    */
   private Optional<String> resolveBearerToken(
-          HttpServletRequest request
+          String authorization
   ) {
-    List<String> authorizationHeaders =
-            Collections.list(
-                    request.getHeaders(
-                            HttpHeaders.AUTHORIZATION
-                    )
-            );
-
-    /*
-     * Authorization 헤더가 없거나 여러 개면 거부한다.
-     */
-    if (authorizationHeaders.size() != 1) {
-      return Optional.empty();
-    }
-
-    String authorization =
-            authorizationHeaders.get(0);
-
     if (
             authorization == null
                     || authorization.isBlank()
@@ -181,9 +192,6 @@ public class OtlpApiKeyAuthenticationFilter
       return Optional.empty();
     }
 
-    /*
-     * "Bearer API_KEY"에서 첫 공백 위치를 찾는다.
-     */
     int separatorIndex =
             authorization.indexOf(' ');
 
@@ -205,21 +213,21 @@ public class OtlpApiKeyAuthenticationFilter
       return Optional.empty();
     }
 
-    String rawApiKey =
+    String rawKey =
             authorization.substring(
                     separatorIndex + 1
             ).trim();
 
-    if (rawApiKey.isEmpty()) {
+    if (rawKey.isEmpty()) {
       return Optional.empty();
     }
 
-    return Optional.of(rawApiKey);
+    return Optional.of(rawKey);
   }
 
   /**
    * 인증 실패 응답을 직접 작성한다.
-   *
+   * <p>
    * Filter에서 발생한 인증 실패는
    * OtlpExceptionHandler까지 도달하지 않기 때문이다.
    */
