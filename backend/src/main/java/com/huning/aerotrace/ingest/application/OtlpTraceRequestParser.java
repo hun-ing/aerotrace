@@ -4,6 +4,7 @@ import com.huning.aerotrace.ingest.domain.ParsedSpan;
 import com.huning.aerotrace.ingest.domain.ParsedSpanEvent;
 import com.huning.aerotrace.ingest.domain.ParsedSpanLink;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.web.server.ResponseStatusException;
@@ -23,11 +24,25 @@ public class OtlpTraceRequestParser {
   private static final BigInteger MAX_UNSIGNED_INT = new BigInteger("4294967295");
   private static final long NANOS_PER_SECOND = 1_000_000_000L;
   private final OtlpAnyValueParser anyValueParser;
+  private final int maxSpansPerRequest;
 
   public OtlpTraceRequestParser(
-          OtlpAnyValueParser anyValueParser
+          OtlpAnyValueParser anyValueParser,
+          @Value(
+                  "${aerotrace.ingest.max-spans-per-request:5000}"
+          )
+          int maxSpansPerRequest
   ) {
+    if (maxSpansPerRequest <= 0) {
+      throw new IllegalArgumentException(
+              "Maximum Span count per OTLP request "
+                      + "must be greater than zero"
+      );
+    }
+
     this.anyValueParser = anyValueParser;
+    this.maxSpansPerRequest =
+            maxSpansPerRequest;
   }
 
   private static final Pattern TRACE_ID_PATTERN =
@@ -128,6 +143,10 @@ public class OtlpTraceRequestParser {
           );
         }
 
+        checkSpanLimit(
+                parsedSpans.size()
+        );
+
         parsedSpans.add(
                 parseSpan(
                         span,
@@ -137,6 +156,19 @@ public class OtlpTraceRequestParser {
                 )
         );
       }
+    }
+  }
+
+  private void checkSpanLimit(
+          int currentSpanCount
+  ) {
+    if (
+            currentSpanCount
+                    >= maxSpansPerRequest
+    ) {
+      throw new OtlpSpanLimitExceededException(
+              maxSpansPerRequest
+      );
     }
   }
 

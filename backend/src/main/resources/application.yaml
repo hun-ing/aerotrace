@@ -31,5 +31,6 @@ management:
 
 aerotrace:
   ingest:
+    max-spans-per-request: 5000
     jdbc:
       batch-size: 1000
