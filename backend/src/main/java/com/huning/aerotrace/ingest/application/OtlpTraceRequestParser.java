@@ -5,9 +5,7 @@ import com.huning.aerotrace.ingest.domain.ParsedSpanEvent;
 import com.huning.aerotrace.ingest.domain.ParsedSpanLink;
 
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
-import org.springframework.web.server.ResponseStatusException;
 import tools.jackson.databind.JsonNode;
 
 import java.math.BigInteger;
@@ -818,11 +816,10 @@ public class OtlpTraceRequestParser {
     }
   }
 
-  private static ResponseStatusException invalidRequest(
+  private static OtlpInvalidRequestException invalidRequest(
           String message
   ) {
-    return new ResponseStatusException(
-            HttpStatus.BAD_REQUEST,
+    return new OtlpInvalidRequestException(
             message
     );
   }

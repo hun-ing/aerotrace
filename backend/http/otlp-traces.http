@@ -146,10 +146,27 @@ X-AeroTrace-Project-Id: {{projectId}}
 {}
 
 > {%
-    client.test("지원하지 않는 Content-Type을 거부한다", function () {
+    client.test("지원하지 않는 Content-Type은 OTLP 오류 응답을 반환한다", function () {
         client.assert(
             response.status === 415,
-            "예상 상태는 415이지만 실제 상태는 " + response.status
+            "예상 상태는 415이지만 실제 상태는 "
+            + response.status
+        );
+
+        client.assert(
+            response.body.message === "Unsupported OTLP Content-Type",
+            "예상하지 못한 message: "
+            + response.body.message
+        );
+
+        client.assert(
+            response.body.timestamp === undefined,
+            "Spring 기본 오류 응답이 반환되면 안 된다"
+        );
+
+        client.assert(
+            response.body.error === undefined,
+            "Spring 기본 error 필드가 반환되면 안 된다"
         );
     });
 %}
@@ -193,10 +210,16 @@ X-AeroTrace-Project-Id: {{projectId}}
 }
 
 > {%
-    client.test("잘못된 Trace ID는 400을 반환한다", function () {
+    client.test("잘못된 Trace ID는 400과 message를 반환한다", function () {
         client.assert(
             response.status === 400,
-            "예상 상태는 400이지만 실제 상태는 " + response.status
+            "예상 상태는 400이지만 실제 상태는 "
+            + response.status
+        );
+
+        client.assert(
+            response.body.message !== undefined,
+            "message 필드가 필요하다"
         );
     });
 %}
@@ -732,6 +755,72 @@ X-AeroTrace-Project-Id: {{projectId}}
             response.status === 200,
             "예상 상태는 200이지만 실제 상태는 "
             + response.status
+        );
+    });
+%}
+
+### 16. 잘못된 JSON은 OTLP 오류 응답을 반환
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+X-AeroTrace-Tenant-Id: {{tenantId}}
+X-AeroTrace-Project-Id: {{projectId}}
+
+{
+  "resourceSpans":
+
+> {%
+    client.test("잘못된 JSON은 400과 message를 반환한다", function () {
+        client.assert(
+            response.status === 400,
+            "예상 상태는 400이지만 실제 상태는 "
+            + response.status
+        );
+
+        client.assert(
+            response.body.message !== undefined,
+            "message 필드가 필요하다"
+        );
+    });
+%}
+
+### 17. 잘못된 Tenant UUID 헤더는 400 반환
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+X-AeroTrace-Tenant-Id: invalid-uuid
+X-AeroTrace-Project-Id: {{projectId}}
+
+{}
+
+> {%
+    client.test("잘못된 Tenant UUID는 OTLP 오류 응답을 반환한다", function () {
+        client.assert(
+            response.status === 400,
+            "예상 상태는 400이지만 실제 상태는 "
+            + response.status
+        );
+
+        client.assert(
+            response.body.message !== undefined,
+            "message 필드가 필요하다"
+        );
+
+        client.assert(
+            response.body.message.includes(
+                "X-AeroTrace-Tenant-Id"
+            ),
+            "오류가 발생한 헤더 이름이 message에 필요하다"
+        );
+
+        client.assert(
+            response.body.timestamp === undefined,
+            "Spring 기본 오류 응답이 반환되면 안 된다"
+        );
+
+        client.assert(
+            response.body.error === undefined,
+            "Spring 기본 error 필드가 반환되면 안 된다"
         );
     });
 %}

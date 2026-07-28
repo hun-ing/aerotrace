@@ -32,5 +32,6 @@ management:
 aerotrace:
   ingest:
     max-spans-per-request: 5000
+    max-request-body-bytes: 10485760
     jdbc:
       batch-size: 1000
