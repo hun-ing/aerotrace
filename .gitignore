@@ -23,3 +23,5 @@
 /frontend/dist/
 /frontend/build/
 /frontend/.env*.local
+
+http-client.private.env.json

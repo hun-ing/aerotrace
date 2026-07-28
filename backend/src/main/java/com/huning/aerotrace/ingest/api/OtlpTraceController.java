@@ -12,12 +12,12 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
+import com.huning.aerotrace.auth.application.AuthenticatedProject;
+import org.springframework.web.bind.annotation.RequestAttribute;
 import org.springframework.web.bind.annotation.RestController;
 import tools.jackson.databind.JsonNode;
 
 import java.util.Map;
-import java.util.UUID;
 
 @RestController
 public class OtlpTraceController {
@@ -42,11 +42,10 @@ public class OtlpTraceController {
           produces = MediaType.APPLICATION_JSON_VALUE
   )
   public ResponseEntity<Map<String, Object>> exportTraces(
-          @RequestHeader("X-AeroTrace-Tenant-Id")
-          UUID tenantId,
-
-          @RequestHeader("X-AeroTrace-Project-Id")
-          UUID projectId,
+          @RequestAttribute(
+                  OtlpRequestAttributes.AUTHENTICATED_PROJECT
+          )
+          AuthenticatedProject authenticatedProject,
 
           @RequestBody
           JsonNode request
@@ -56,8 +55,8 @@ public class OtlpTraceController {
 
     SpanWriteResult writeResult =
             ingestionService.ingest(
-                    tenantId,
-                    projectId,
+                    authenticatedProject.tenantId(),
+                    authenticatedProject.projectId(),
                     parsedRequest
             );
 
