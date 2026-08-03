@@ -884,8 +884,14 @@ Authorization: Bearer atr_invalid
 %}
 
 ### 21
-GET http://localhost:8080/actuator/health
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
 Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+{
+  "resourceSpans": []
+}
 
 ### DB 장애 시 인증 요청은 503
 POST {{baseUrl}}/v1/traces
