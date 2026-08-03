@@ -59,12 +59,37 @@ public class TraceQueryService {
           TraceListCursor cursor,
           int limit
   ) {
-    return findTracePage(
+    validateQuery(
             authenticatedProject,
             from,
             to,
+            limit
+    );
+
+    validateCursor(
             cursor,
-            null,
+            from,
+            to
+    );
+
+    int internalLimit =
+            Math.addExact(
+                    limit,
+                    1
+            );
+
+    List<TraceListItem> fetchedItems =
+            repository.findTraceList(
+                    authenticatedProject.tenantId(),
+                    authenticatedProject.projectId(),
+                    from,
+                    to,
+                    cursor,
+                    internalLimit
+            );
+
+    return createPage(
+            fetchedItems,
             limit
     );
   }
@@ -93,44 +118,125 @@ public class TraceQueryService {
     String normalizedServiceName =
             normalizeServiceName(serviceName);
 
+    if (normalizedServiceName == null) {
+      return findTracePage(
+              authenticatedProject,
+              from,
+              to,
+              cursor,
+              limit
+      );
+    }
+
     int internalLimit =
             Math.addExact(
                     limit,
                     1
             );
 
-    List<TraceListItem> fetchedItems;
+    List<TraceListItem> fetchedItems =
+            repository.findTraceList(
+                    authenticatedProject.tenantId(),
+                    authenticatedProject.projectId(),
+                    from,
+                    to,
+                    cursor,
+                    normalizedServiceName,
+                    internalLimit
+            );
 
-    if (normalizedServiceName == null) {
-      fetchedItems =
-              repository.findTraceList(
-                      authenticatedProject.tenantId(),
-                      authenticatedProject.projectId(),
-                      from,
-                      to,
-                      cursor,
-                      internalLimit
-              );
-    } else {
-      fetchedItems =
-              repository.findTraceList(
-                      authenticatedProject.tenantId(),
-                      authenticatedProject.projectId(),
-                      from,
-                      to,
-                      cursor,
-                      normalizedServiceName,
-                      internalLimit
-              );
+    return createPage(
+            fetchedItems,
+            limit
+    );
+  }
+
+  public TraceListPage findTracePage(
+          AuthenticatedProject authenticatedProject,
+          Instant from,
+          Instant to,
+          TraceListCursor cursor,
+          String serviceName,
+          boolean errorOnly,
+          int limit
+  ) {
+    /*
+     * 기존 테스트와 호출 계약을 유지하기 위해
+     * errorOnly=false는 기존 overload로 위임한다.
+     */
+    if (!errorOnly) {
+      if (serviceName == null) {
+        return findTracePage(
+                authenticatedProject,
+                from,
+                to,
+                cursor,
+                limit
+        );
+      }
+
+      return findTracePage(
+              authenticatedProject,
+              from,
+              to,
+              cursor,
+              serviceName,
+              limit
+      );
     }
 
+    validateQuery(
+            authenticatedProject,
+            from,
+            to,
+            limit
+    );
+
+    validateCursor(
+            cursor,
+            from,
+            to
+    );
+
+    String normalizedServiceName =
+            normalizeServiceName(serviceName);
+
+    int internalLimit =
+            Math.addExact(
+                    limit,
+                    1
+            );
+
+    List<TraceListItem> fetchedItems =
+            repository.findTraceList(
+                    authenticatedProject.tenantId(),
+                    authenticatedProject.projectId(),
+                    from,
+                    to,
+                    cursor,
+                    normalizedServiceName,
+                    true,
+                    internalLimit
+            );
+
+    return createPage(
+            fetchedItems,
+            limit
+    );
+  }
+
+  private static TraceListPage createPage(
+          List<TraceListItem> fetchedItems,
+          int requestedLimit
+  ) {
     boolean hasNext =
-            fetchedItems.size() > limit;
+            fetchedItems.size()
+                    > requestedLimit;
 
     int returnedItemCount =
             Math.min(
                     fetchedItems.size(),
-                    limit
+                    requestedLimit
             );
 
     List<TraceListItem> returnedItems =

@@ -340,4 +340,112 @@ class TraceListPaginationControllerTest {
                             .value(2)
             );
   }
+
+  @Test
+  void passesCombinedServiceAndErrorFilter()
+          throws Exception {
+    TraceListItem item =
+            new TraceListItem(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    Instant.parse(
+                            "2026-08-02T10:00:00Z"
+                    ),
+                    2,
+                    2,
+                    10_000_000L
+            );
+
+    when(
+            authenticatedProjectRequestResolver.resolve(
+                    any(HttpServletRequest.class)
+            )
+    ).thenReturn(authenticatedProject);
+
+    when(
+            traceQueryService.findTracePage(
+                    authenticatedProject,
+                    FROM,
+                    TO,
+                    null,
+                    "orders-service",
+                    true,
+                    50
+            )
+    ).thenReturn(
+            new TraceListPage(
+                    List.of(item),
+                    null
+            )
+    );
+
+    mockMvc.perform(
+                    get("/api/v1/traces")
+                            .queryParam(
+                                    "from",
+                                    "2026-08-01T00:00:00Z"
+                            )
+                            .queryParam(
+                                    "to",
+                                    "2026-08-03T06:00:00Z"
+                            )
+                            .queryParam(
+                                    "serviceName",
+                                    "orders-service"
+                            )
+                            .queryParam(
+                                    "errorOnly",
+                                    "true"
+                            )
+            )
+            .andExpect(
+                    status().isOk()
+            )
+            .andExpect(
+                    jsonPath("$.items.length()")
+                            .value(1)
+            )
+            .andExpect(
+                    jsonPath("$.items[0].traceId")
+                            .value(item.traceId())
+            )
+            .andExpect(
+                    jsonPath("$.items[0].spanCount")
+                            .value(2)
+            );
+  }
+
+  @Test
+  void returnsBadRequestForInvalidErrorOnly()
+          throws Exception {
+    when(
+            authenticatedProjectRequestResolver.resolve(
+                    any(HttpServletRequest.class)
+            )
+    ).thenReturn(authenticatedProject);
+
+    mockMvc.perform(
+                    get("/api/v1/traces")
+                            .queryParam(
+                                    "from",
+                                    "2026-08-01T00:00:00Z"
+                            )
+                            .queryParam(
+                                    "to",
+                                    "2026-08-03T06:00:00Z"
+                            )
+                            .queryParam(
+                                    "errorOnly",
+                                    "yes"
+                            )
+            )
+            .andExpect(
+                    status().isBadRequest()
+            )
+            .andExpect(
+                    jsonPath("$.message")
+                            .value(
+                                    "errorOnly must be true or false"
+                            )
+            );
+  }
 }

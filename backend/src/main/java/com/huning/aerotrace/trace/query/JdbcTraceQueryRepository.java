@@ -24,11 +24,19 @@ public class JdbcTraceQueryRepository {
   private static final int MAX_SERVICE_NAME_LENGTH =
           255;
 
+  /*
+   * serviceName과 errorOnly 사용 여부를 boolean parameter로 받아
+   * 필터 조합마다 SQL을 별도로 만들지 않는다.
+   *
+   * HAVING을 사용하므로 선택된 Trace의 집계값은
+   * 필터에 일치한 Span이 아닌 Trace 전체를 기준으로 계산된다.
+   */
   private static final String FIND_TRACE_LIST_SQL = """
             SELECT trace_id,
                    MIN(start_time) AS trace_start_time,
                    COUNT(*) AS span_count,
-                   COUNT(DISTINCT service_name) AS service_count,
+                   COUNT(DISTINCT service_name)
+                       AS service_count,
                    MAX(duration_nano)
                        AS longest_span_duration_nano
             FROM public.spans
@@ -37,26 +45,14 @@ public class JdbcTraceQueryRepository {
               AND start_time >= ?
               AND start_time < ?
             GROUP BY trace_id
-            ORDER BY trace_start_time DESC,
-                     trace_id DESC
-            LIMIT ?
-            """;
-
-  private static final String
-          FIND_TRACE_LIST_BY_SERVICE_SQL = """
-            SELECT trace_id,
-                   MIN(start_time) AS trace_start_time,
-                   COUNT(*) AS span_count,
-                   COUNT(DISTINCT service_name) AS service_count,
-                   MAX(duration_nano)
-                       AS longest_span_duration_nano
-            FROM public.spans
-            WHERE tenant_id = ?
-              AND project_id = ?
-              AND start_time >= ?
-              AND start_time < ?
-            GROUP BY trace_id
-            HAVING BOOL_OR(service_name = ?)
+            HAVING (
+                       ? = FALSE
+                       OR BOOL_OR(service_name = ?)
+                   )
+               AND (
+                       ? = FALSE
+                       OR BOOL_OR(status_code = 2)
+                   )
             ORDER BY trace_start_time DESC,
                      trace_id DESC
             LIMIT ?
@@ -80,42 +76,14 @@ public class JdbcTraceQueryRepository {
                   AND start_time >= ?
                   AND start_time < ?
                 GROUP BY trace_id
-            )
-            SELECT trace_id,
-                   trace_start_time,
-                   span_count,
-                   service_count,
-                   longest_span_duration_nano
-            FROM trace_summaries
-            WHERE trace_start_time < ?
-               OR (
-                    trace_start_time = ?
-                    AND trace_id < ?
-               )
-            ORDER BY trace_start_time DESC,
-                     trace_id DESC
-            LIMIT ?
-            """;
-
-  private static final String
-          FIND_TRACE_LIST_AFTER_CURSOR_BY_SERVICE_SQL = """
-            WITH trace_summaries AS (
-                SELECT trace_id,
-                       MIN(start_time)
-                           AS trace_start_time,
-                       COUNT(*)
-                           AS span_count,
-                       COUNT(DISTINCT service_name)
-                           AS service_count,
-                       MAX(duration_nano)
-                           AS longest_span_duration_nano
-                FROM public.spans
-                WHERE tenant_id = ?
-                  AND project_id = ?
-                  AND start_time >= ?
-                  AND start_time < ?
-                GROUP BY trace_id
-                HAVING BOOL_OR(service_name = ?)
+                HAVING (
+                           ? = FALSE
+                           OR BOOL_OR(service_name = ?)
+                       )
+                   AND (
+                           ? = FALSE
+                           OR BOOL_OR(status_code = 2)
+                       )
             )
             SELECT trace_id,
                    trace_start_time,
@@ -159,6 +127,7 @@ public class JdbcTraceQueryRepository {
             to,
             null,
             null,
+            false,
             limit
     );
   }
@@ -178,6 +147,7 @@ public class JdbcTraceQueryRepository {
             to,
             cursor,
             null,
+            false,
             limit
     );
   }
@@ -191,6 +161,28 @@ public class JdbcTraceQueryRepository {
           String serviceName,
           int limit
   ) {
+    return findTraceList(
+            tenantId,
+            projectId,
+            from,
+            to,
+            cursor,
+            serviceName,
+            false,
+            limit
+    );
+  }
+
+  public List<TraceListItem> findTraceList(
+          UUID tenantId,
+          UUID projectId,
+          Instant from,
+          Instant to,
+          TraceListCursor cursor,
+          String serviceName,
+          boolean errorOnly,
+          int limit
+  ) {
     validateQuery(
             tenantId,
             projectId,
@@ -201,44 +193,25 @@ public class JdbcTraceQueryRepository {
     );
 
     if (cursor == null) {
-      if (serviceName == null) {
-        return queryFirstPage(
-                tenantId,
-                projectId,
-                from,
-                to,
-                limit
-        );
-      }
-
-      return queryFirstPageByService(
+      return queryFirstPage(
               tenantId,
               projectId,
               from,
               to,
               serviceName,
+              errorOnly,
               limit
       );
     }
 
-    if (serviceName == null) {
-      return queryAfterCursor(
-              tenantId,
-              projectId,
-              from,
-              to,
-              cursor,
-              limit
-      );
-    }
-
-    return queryAfterCursorByService(
+    return queryAfterCursor(
             tenantId,
             projectId,
             from,
             to,
             cursor,
             serviceName,
+            errorOnly,
             limit
     );
   }
@@ -248,6 +221,8 @@ public class JdbcTraceQueryRepository {
           UUID projectId,
           Instant from,
           Instant to,
+          String serviceName,
+          boolean errorOnly,
           int limit
   ) {
     return jdbcTemplate.query(
@@ -261,41 +236,15 @@ public class JdbcTraceQueryRepository {
                       to
               );
 
-              preparedStatement.setInt(
-                      5,
-                      limit
-              );
-            },
-            JdbcTraceQueryRepository::mapTraceListItem
-    );
-  }
-
-  private List<TraceListItem> queryFirstPageByService(
-          UUID tenantId,
-          UUID projectId,
-          Instant from,
-          Instant to,
-          String serviceName,
-          int limit
-  ) {
-    return jdbcTemplate.query(
-            FIND_TRACE_LIST_BY_SERVICE_SQL,
-            preparedStatement -> {
-              setCommonParameters(
+              setFilterParameters(
                       preparedStatement,
-                      tenantId,
-                      projectId,
-                      from,
-                      to
-              );
-
-              preparedStatement.setString(
                       5,
-                      serviceName
+                      serviceName,
+                      errorOnly
               );
 
               preparedStatement.setInt(
-                      6,
+                      8,
                       limit
               );
             },
@@ -309,6 +258,8 @@ public class JdbcTraceQueryRepository {
           Instant from,
           Instant to,
           TraceListCursor cursor,
+          String serviceName,
+          boolean errorOnly,
           int limit
   ) {
     return jdbcTemplate.query(
@@ -322,59 +273,11 @@ public class JdbcTraceQueryRepository {
                       to
               );
 
-              OffsetDateTime cursorTime =
-                      toOffsetDateTime(
-                              cursor.traceStartTime()
-                      );
-
-              preparedStatement.setObject(
-                      5,
-                      cursorTime
-              );
-
-              preparedStatement.setObject(
-                      6,
-                      cursorTime
-              );
-
-              preparedStatement.setString(
-                      7,
-                      cursor.traceId()
-              );
-
-              preparedStatement.setInt(
-                      8,
-                      limit
-              );
-            },
-            JdbcTraceQueryRepository::mapTraceListItem
-    );
-  }
-
-  private List<TraceListItem>
-  queryAfterCursorByService(
-          UUID tenantId,
-          UUID projectId,
-          Instant from,
-          Instant to,
-          TraceListCursor cursor,
-          String serviceName,
-          int limit
-  ) {
-    return jdbcTemplate.query(
-            FIND_TRACE_LIST_AFTER_CURSOR_BY_SERVICE_SQL,
-            preparedStatement -> {
-              setCommonParameters(
+              setFilterParameters(
                       preparedStatement,
-                      tenantId,
-                      projectId,
-                      from,
-                      to
-              );
-
-              preparedStatement.setString(
                       5,
-                      serviceName
+                      serviceName,
+                      errorOnly
               );
 
               OffsetDateTime cursorTime =
@@ -383,22 +286,22 @@ public class JdbcTraceQueryRepository {
                       );
 
               preparedStatement.setObject(
-                      6,
+                      8,
                       cursorTime
               );
 
               preparedStatement.setObject(
-                      7,
+                      9,
                       cursorTime
               );
 
               preparedStatement.setString(
-                      8,
+                      10,
                       cursor.traceId()
               );
 
               preparedStatement.setInt(
-                      9,
+                      11,
                       limit
               );
             },
@@ -431,6 +334,37 @@ public class JdbcTraceQueryRepository {
     preparedStatement.setObject(
             4,
             toOffsetDateTime(to)
+    );
+  }
+
+  private static void setFilterParameters(
+          PreparedStatement preparedStatement,
+          int startIndex,
+          String serviceName,
+          boolean errorOnly
+  ) throws SQLException {
+    boolean serviceFilterEnabled =
+            serviceName != null;
+
+    preparedStatement.setBoolean(
+            startIndex,
+            serviceFilterEnabled
+    );
+
+    /*
+     * service 필터가 비활성화되어도 PostgreSQL이
+     * parameter 타입을 결정할 수 있도록 빈 문자열을 전달한다.
+     */
+    preparedStatement.setString(
+            startIndex + 1,
+            serviceFilterEnabled
+                    ? serviceName
+                    : ""
+    );
+
+    preparedStatement.setBoolean(
+            startIndex + 2,
+            errorOnly
     );
   }
 

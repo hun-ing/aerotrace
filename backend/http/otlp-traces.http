@@ -1024,3 +1024,28 @@ Authorization: Bearer {{apiKey}}
 GET {{baseUrl}}/api/v1/traces?from=2026-07-05T00:00:00Z&to=2026-08-03T06:00:00Z&limit=1&serviceName=columnstore-policy-verification&cursor=MXwxNzg1NzI0MTgxfDY0MDkzMDAwfDg4NTI0YjM5NTNjOTRmNmI4ODFmNjQ4OWVhNzlhMmIz
 Accept: application/json
 Authorization: Bearer {{apiKey}}
+
+### 오류 Trace 조회
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T06:00:00Z&to=2026-08-03T06:00:00Z&limit=50&errorOnly=true
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 특정 서비스가 포함된 오류 Trace
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T06:00:00Z&to=2026-08-03T06:00:00Z&limit=50&serviceName=orders-service&errorOnly=true
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 잘못된 errorOnly
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T06:00:00Z&to=2026-08-03T06:00:00Z&errorOnly=yes
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 오류 Trace 첫 페이지
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T06:00:00Z&to=2026-08-03T06:00:00Z&limit=1&errorOnly=true
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 오류 Trace 다음 페이지
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T06:00:00Z&to=2026-08-03T06:00:00Z&limit=1&errorOnly=true&cursor=복사한_nextCursor
+Accept: application/json
+Authorization: Bearer {{apiKey}}

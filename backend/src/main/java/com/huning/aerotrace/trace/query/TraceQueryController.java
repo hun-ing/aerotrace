@@ -75,6 +75,9 @@ public class TraceQueryController {
           @RequestParam(
                   required = false
           ) String serviceName,
+          @RequestParam(
+                  defaultValue = "false"
+          ) String errorOnly,
           HttpServletRequest request
   ) {
     AuthenticatedProject authenticatedProject =
@@ -96,6 +99,12 @@ public class TraceQueryController {
     int parsedLimit =
             parseLimit(limit);
 
+    boolean parsedErrorOnly =
+            parseBoolean(
+                    errorOnly,
+                    "errorOnly"
+            );
+
     TraceListCursor parsedCursor =
             cursor == null
                     ? null
@@ -106,16 +115,25 @@ public class TraceQueryController {
     TraceListPage page;
 
     /*
-     * serviceName이 없는 기존 호출은 기존 메서드를 사용해
-     * 이전 테스트와 API 계약을 그대로 유지한다.
+     * 기존 mock 기반 테스트와 호출 계약을 유지한다.
      */
-    if (serviceName == null) {
+    if (!parsedErrorOnly && serviceName == null) {
       page =
               traceQueryService.findTracePage(
                       authenticatedProject,
                       parsedFrom,
                       parsedTo,
                       parsedCursor,
+                      parsedLimit
+              );
+    } else if (!parsedErrorOnly) {
+      page =
+              traceQueryService.findTracePage(
+                      authenticatedProject,
+                      parsedFrom,
+                      parsedTo,
+                      parsedCursor,
+                      serviceName,
                       parsedLimit
               );
     } else {
@@ -126,6 +144,7 @@ public class TraceQueryController {
                       parsedTo,
                       parsedCursor,
                       serviceName,
+                      true,
                       parsedLimit
               );
     }
@@ -219,5 +238,33 @@ public class TraceQueryController {
               exception
       );
     }
+  }
+
+  private static boolean parseBoolean(
+          String value,
+          String parameterName
+  ) {
+    if (value == null) {
+      throw new IllegalArgumentException(
+              parameterName
+                      + " must be true or false"
+      );
+    }
+
+    String normalized =
+            value.strip();
+
+    if ("true".equalsIgnoreCase(normalized)) {
+      return true;
+    }
+
+    if ("false".equalsIgnoreCase(normalized)) {
+      return false;
+    }
+
+    throw new IllegalArgumentException(
+            parameterName
+                    + " must be true or false"
+    );
   }
 }

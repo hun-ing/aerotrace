@@ -313,6 +313,88 @@ class JdbcTraceQueryRepositoryIntegrationTest {
     ).isEqualTo(10_000_000L);
   }
 
+  @Test
+  void filtersErrorTracesWithoutChangingWholeTraceAggregates() {
+    /*
+     * shared trace의 두 번째 Span만 오류 상태로 만든다.
+     *
+     * 첫 번째 Span:
+     * - project-a-service-one
+     * - status_code = 0
+     *
+     * 두 번째 Span:
+     * - project-a-service-two
+     * - status_code = 2
+     */
+    int updatedRows =
+            jdbcTemplate.update(
+                    """
+                    UPDATE public.spans
+                    SET status_code = 2,
+                        status_message = 'integration error'
+                    WHERE tenant_id = ?
+                      AND project_id = ?
+                      AND trace_id = ?
+                      AND span_id = ?
+                    """,
+                    tenantAId,
+                    projectAId,
+                    SHARED_TRACE_ID,
+                    SHARED_SPAN_ID_2
+            );
+
+    assertThat(updatedRows)
+            .isEqualTo(1);
+
+    Instant from =
+            baseTime.minus(Duration.ofHours(1));
+
+    Instant to =
+            baseTime.plus(Duration.ofHours(1));
+
+    List<TraceListItem> result =
+            repository.findTraceList(
+                    tenantAId,
+                    projectAId,
+                    from,
+                    to,
+                    null,
+                    "project-a-service-one",
+                    true,
+                    50
+            );
+
+    /*
+     * project-a-service-one을 포함하면서
+     * 오류 Span도 포함한 Trace는 shared trace뿐이다.
+     *
+     * 서비스 조건과 오류 조건은 서로 다른 Span에서
+     * 충족되지만 같은 Trace 안에 있으므로 반환돼야 한다.
+     */
+    assertThat(result)
+            .extracting(TraceListItem::traceId)
+            .containsExactly(
+                    SHARED_TRACE_ID
+            );
+
+    TraceListItem sharedTrace =
+            result.getFirst();
+
+    /*
+     * 필터에 직접 일치한 Span만 집계하면 1이 되지만,
+     * Trace 전체 기준이므로 2가 유지돼야 한다.
+     */
+    assertThat(sharedTrace.spanCount())
+            .isEqualTo(2);
+
+    assertThat(sharedTrace.serviceCount())
+            .isEqualTo(2);
+
+    assertThat(
+            sharedTrace.longestSpanDurationNano()
+    ).isEqualTo(10_000_000L);
+  }
+
   private void insertProjectATraces() {
     insertSpan(
             tenantAId,
