@@ -501,3 +501,239 @@ pgJDBC가 JDBC batch INSERT를 multi-values INSERT로 재작성할 때 추가 �
 * pgJDBC 버전 변경
 * Batch chunk 크기 변경
 * INSERT SQL 구조 변경
+
+
+# Recovered Architecture Decisions — 2026-08-03
+
+## JDBC Batch 크기를 1000으로 설정
+
+### 해결하려는 문제
+
+Telemetry Span을 단건 INSERT하면 DB round trip과 statement 실행 비용이 커져 처리량이 낮아진다. 반대로 batch가 지나치게 크면 메모리 사용량, transaction 크기, 장애 시 재처리 범위가 커질 수 있다.
+
+### 검토한 대안
+
+* 단건 JDBC INSERT
+* batch 50
+* batch 100
+* batch 250
+* batch 500
+* batch 1000
+* batch 2000
+* batch 5000
+
+### 선택한 방식
+
+```yaml
+aerotrace:
+  ingest:
+    jdbc:
+      batch-size: 1000
+```
+
+### 선택 이유
+
+* 단건 저장보다 JDBC batch가 약 2.9~3.1배 높은 처리량을 보였다.
+* batch 500이 일부 실험에서 가장 빨랐지만 500~5000의 차이가 크지 않았다.
+* batch 1000은 충분한 처리량을 유지하면서 한 번의 JDBC 실행 크기를 제한한다.
+* Collector batch 설정과도 이해하기 쉬운 초기 정렬값이다.
+
+### 단점과 위험
+
+* 현재 로컬 개발 환경에서 측정한 값이다.
+* 실제 Oracle Cloud 또는 홈서버 환경에서는 결과가 달라질 수 있다.
+* Span 크기와 DB connection 수에 따라 재조정이 필요하다.
+
+### 재검토 조건
+
+* 운영 장비에서 처리량 측정
+* 평균 Span 크기 측정
+* DB CPU 또는 connection pool 병목 발생
+* batch 처리 지연 증가
+* transaction 크기 문제 발생
+
+---
+
+## 원문 API Key를 저장하지 않음
+
+### 해결하려는 문제
+
+DB 유출 또는 로그 노출 시 Project API Key 원문이 노출되면 공격자가 즉시 telemetry를 위조하거나 quota를 소모할 수 있다.
+
+### 검토한 대안
+
+* 원문 API Key 저장
+* 암호화된 API Key 저장
+* Secret hash만 저장
+
+### 선택한 방식
+
+* 공개 식별자 `key_id` 저장
+* Secret의 SHA-256 hash만 저장
+* 인증 시 입력 Secret을 hash한 뒤 상수시간 비교
+* 발급 시점에만 원문 Key 반환
+
+### 선택 이유
+
+* 비밀번호 저장 방식과 유사한 최소 노출 구조
+* DB만 유출됐을 때 원문 API Key를 직접 사용할 수 없음
+* `key_id`로 빠르게 행을 찾은 뒤 Secret을 검증할 수 있음
+
+### 단점과 위험
+
+* 원문 Key를 잃으면 복구할 수 없고 재발급해야 함
+* SHA-256 사용은 Secret이 충분히 긴 무작위 값이라는 전제에 의존함
+* Key 발급 화면과 로그에서 원문 노출을 방지해야 함
+
+### 재검토 조건
+
+* 관리 UI 구현
+* Key rotation 구현
+* Key별 권한 범위 도입
+* 감사 로그 도입
+
+---
+
+## Tenant와 Project를 요청 Header가 아닌 API Key 소유권에서 결정
+
+### 해결하려는 문제
+
+클라이언트가 Tenant ID 또는 Project ID Header를 임의로 조작하면 다른 Tenant 데이터로 저장될 수 있다.
+
+### 선택한 방식
+
+* 클라이언트의 Tenant/Project UUID Header를 신뢰하지 않음
+* API Key 인증 결과에서 Tenant와 Project를 결정
+* Controller에는 인증된 Project 정보를 request attribute로 전달
+
+### 선택 이유
+
+* 멀티테넌트 데이터 격리의 신뢰 경계를 서버 DB에 둠
+* 클라이언트가 Tenant/Project ID를 알더라도 다른 영역에 데이터를 저장할 수 없음
+* SaaS와 온프레미스 모두 동일한 인증 구조 사용 가능
+
+### 단점과 위험
+
+* 모든 telemetry 요청에 API Key DB 조회 비용이 발생함
+* DB 장애가 인증 전체 장애로 이어짐
+* 이후 cache 도입 시 폐기 Key의 반영 지연을 고려해야 함
+
+### 재검토 조건
+
+* API Key 인증 조회가 병목으로 측정됨
+* 로컬 cache 또는 분산 cache 도입 검토
+* Key 폐기 전파 요구시간 정의
+
+---
+
+## 일시적인 DB 장애에 HTTP 503 반환
+
+### 해결하려는 문제
+
+DB 장애가 HTTP 500 또는 401로 반환되면 Collector가 영구 오류로 오해하거나 올바른 재시도 정책을 적용하지 못할 수 있다.
+
+### 선택한 방식
+
+* DB 연결 실패와 일시적 자원 오류를 retryable 장애로 분류
+* 인증 DB 장애와 Span 저장 DB 장애에 HTTP 503 반환
+* SQL 문법 오류와 프로그래밍 오류는 503으로 숨기지 않음
+
+### 선택 이유
+
+* Collector retry와 persistent queue를 활용할 수 있음
+* 잘못된 API Key의 401과 서버 장애의 503을 구분 가능
+* 장애 원인을 클라이언트 자격증명 문제로 오인하지 않음
+
+### 단점과 위험
+
+* 잘못된 예외 분류는 영구 오류를 무한 재시도하게 만들 수 있음
+* `max_elapsed_time: 0`과 결합하면 queue가 계속 증가할 수 있음
+* queue 사용률과 디스크 용량 감시가 필요함
+
+### 재검토 조건
+
+* retry storm 발생
+* queue 증가 속도가 복구 속도를 초과
+* DB 장애 유형별 응답 정책 변경 필요
+* circuit breaker 도입 검토
+
+---
+
+## Collector Persistent Queue 사용
+
+### 해결하려는 문제
+
+AeroTrace Backend 또는 TimescaleDB 장애 중 Collector가 받은 telemetry가 메모리에만 있으면 Collector 재시작 시 데이터가 유실될 수 있다.
+
+### 검토한 대안
+
+* memory queue만 사용
+* file storage 기반 persistent queue
+* Kafka 도입
+
+### 선택한 방식
+
+* OpenTelemetry Collector Contrib 사용
+* `file_storage` extension 사용
+* Docker named volume에 queue 저장
+* exporter `sending_queue.storage`에 연결
+* retry 활성화
+* Kafka는 도입하지 않음
+
+### 선택 이유
+
+* 현재 규모에서 Kafka 없이도 재시작 내구성을 제공
+* Docker Compose와 홈서버 환경에서 단순하게 운영 가능
+* 동일 구성을 SaaS MVP와 온프레미스 배포에 사용할 수 있음
+* 100 Span 실험에서 Collector 재시작 후 자동 복구를 확인함
+
+### 단점과 위험
+
+* 호스트 디스크 자체가 손상되면 queue도 손실될 수 있음
+* queue가 가득 차면 신규 데이터 유실 가능
+* 파일 저장소 compaction과 디스크 사용량을 관찰해야 함
+* 다중 Collector에서는 각 인스턴스별 queue가 분리됨
+
+### 재검토 조건
+
+* 단일 Collector가 처리량 병목이 됨
+* 여러 Collector 간 안정적인 버퍼 공유 필요
+* 장시간 장애에서 로컬 디스크 용량이 부족함
+* Kafka 도입을 정당화할 실제 요구가 발생함
+
+---
+
+## Persistent Queue 크기를 50,000 Span으로 시작
+
+### 해결하려는 문제
+
+queue를 무제한으로 두면 홈서버 디스크를 소진할 수 있고, 너무 작게 두면 짧은 장애에도 데이터가 유실될 수 있다.
+
+### 선택한 방식
+
+```yaml
+sending_queue:
+  sizer: items
+  queue_size: 50000
+```
+
+### 선택 이유
+
+* 현재 MVP 장애 실험을 수행하기에 충분한 유한 크기
+* 100 Span과 10,000 Span queue 수용을 확인함
+* 10,000 Span은 현재 queue의 20%에 해당
+* 측정 없이 지나치게 큰 값을 설정하지 않음
+
+### 단점과 위험
+
+* 실제 운영에서 몇 분을 버티는지는 Span 유입률에 따라 달라짐
+* 평균 Span 크기와 디스크 사용량을 아직 측정하지 못함
+* `block_on_overflow: false`이므로 queue가 가득 차면 데이터가 거부될 수 있음
+
+### 재검토 조건
+
+* 실제 서비스의 spans/s 측정
+* 평균 queue 저장 바이트/Span 측정
+* 허용할 DB 장애 지속시간 정의
+* queue 사용률 경보 설계
+* overflow 실험 완료

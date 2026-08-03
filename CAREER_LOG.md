@@ -328,3 +328,107 @@ Collector queue, Backend 응답, retry, 중복, 데이터 유실은
 ```
 
 이 실험까지 완료하면 단순 API 구현을 넘어 실제 관측 시스템 운영 경험으로 발전할 수 있다.
+
+# CAREER_LOG.md 추가 내용
+
+## 실무 경험
+
+* OTLP JSON Trace 수신 API를 직접 구현하고 Trace ID, Span ID, timestamp, attributes, events, links의 검증 경계를 정의함
+* JPA 단건 저장 대신 Spring JDBC batch를 적용하고 batch 크기별 처리량을 직접 측정함
+* 멀티테넌트 환경에서 클라이언트 Header를 신뢰하지 않고 API Key 소유권으로 Tenant와 Project를 결정함
+* API Key 원문을 저장하지 않고 공개 식별자와 Secret hash를 분리한 인증 구조를 구현함
+* DB 장애를 클라이언트 인증 실패와 구분해 HTTP 503으로 처리하고 Collector retry와 연결함
+* OpenTelemetry Collector persistent queue를 구성하고 Collector 재시작을 포함한 장애 복구 실험을 수행함
+* Collector receiver, exporter, queue metric을 통해 수신·전송·대기 상태를 직접 관찰함
+* 잘못된 실험 입력으로 200행이 생성된 문제를 queue metadata와 DB 결과를 비교해 원인을 분석하고 재실험함
+
+## 포트폴리오에서 강조할 부분
+
+### 1. 측정 기반 JDBC Batch 선택
+
+* 단건 저장과 JDBC batch 비교
+* batch가 약 2.9~3.1배 높은 처리량
+* batch 크기 50~5000 비교
+* 가장 빠른 단일 수치가 아니라 안정성과 batch 크기 제한을 함께 고려해 1000 선택
+
+### 2. 멀티테넌트 데이터 격리
+
+* Tenant/Project Header 위조 방지
+* API Key DB 소유권을 신뢰 기준으로 사용
+* Secret hash 저장
+* 만료와 폐기 지원
+* 고카디널리티 인증 정보를 metric tag에서 제외
+
+### 3. 데이터 유실 방지
+
+* DB 장애 시 Backend가 HTTP 503 반환
+* Collector가 retry 수행
+* persistent queue에 telemetry 보관
+* Collector 재시작 후 queue metadata 복구
+* DB 복구 후 별도 수동 전송 없이 자동 저장
+* 100 Span 최종 저장 수 100, 고유 Span ID 100 확인
+
+## 보존해야 할 증거
+
+* JDBC batch 크기별 결과 표
+* 단건 저장과 batch 저장 비교 결과
+* DB 장애 시 HTTP 503 응답
+* 인증 lookup error metric
+* Collector 503 retry 로그
+* Collector 재시작 후 persistent queue metadata 로드 로그
+* DB 최종 100행, 고유 Span ID 100개 결과
+* queue capacity 50,000 출력
+* DB 장애 중 queue size 100 출력
+* DB 장애 중 queue size 10,000 출력
+* DB 복구 후 queue size 0 출력
+* 최초 200행 문제와 재실험 후 100행 결과
+
+## 이력서 문장 초안
+
+* 대량 telemetry 저장의 DB round trip 비용을 줄이기 위해 Spring JDBC batch를 적용하고 batch 크기별 성능을 측정하여, 단건 저장 대비 약 2.9~3.1배 높은 처리량을 확인하고 초기 운영 batch 크기를 1,000으로 결정
+
+* 멀티테넌트 telemetry 수집 과정에서 요청 Header 위조로 인한 데이터 격리 실패를 방지하기 위해 Project API Key의 DB 소유권으로 Tenant와 Project를 결정하고, 원문 Secret 비저장 및 hash 검증 방식의 인증 구조를 구현
+
+* TimescaleDB 장애 시 telemetry 유실을 줄이기 위해 Backend의 retryable 503 응답과 OpenTelemetry Collector persistent queue를 연계하고, Collector 재시작과 DB 복구 이후 100개 Span이 중복 없이 자동 저장되는 장애 복구 시나리오를 검증
+
+* Collector 내부 receiver·exporter·queue 지표를 노출하여 DB 장애 중 queue 증가와 복구 후 소진을 관찰하고, 50,000 Span 용량의 queue에서 10,000 Span 수용 및 enqueue 실패가 발생하지 않음을 확인
+
+## 숫자를 추가하면 안 되는 항목
+
+다음 값은 아직 정확히 측정되지 않았으므로 이력서나 블로그에 숫자로 쓰지 않는다.
+
+* queue drain 처리량
+* DB 복구 완료시간
+* Span당 queue 디스크 사용량
+* 최대 장애 허용시간
+* 10,000 Span 최종 DB 저장 수
+* queue overflow 시 유실 수량
+
+## 블로그 주제
+
+### OpenTelemetry Collector 재시작에도 Trace를 잃지 않도록 만든 과정
+
+구성:
+
+1. 메모리 queue의 한계
+2. Backend DB 장애를 503으로 분류한 이유
+3. file storage와 persistent sending queue 구성
+4. API Key 인증과 Collector exporter 연결
+5. DB 중지 상태에서 100 Span 전송
+6. Collector 재시작
+7. queue metadata 복구 로그
+8. DB 복구 후 자동 재전송
+9. 200행 중복 실험이 발생한 원인
+10. 재실험으로 100행과 고유 Span ID 100개 확인
+11. persistent queue가 보장하지 못하는 장애 범위
+
+## 예상 면접 질문
+
+* Collector가 200을 반환했는데 DB 저장 성공이라고 볼 수 없는 이유는 무엇인가?
+* HTTP 401과 503을 Collector 관점에서 어떻게 구분해야 하는가?
+* Persistent queue가 있어도 데이터가 유실될 수 있는 상황은 무엇인가?
+* API Key 조회 DB가 장애 나면 왜 인증 실패 401이 아니라 503을 반환해야 하는가?
+* Queue capacity 50,000은 어떤 기준으로 다시 산정해야 하는가?
+* Collector 재시도에서 중복 Span이 발생할 가능성은 어떻게 처리했는가?
+* 왜 Kafka를 사용하지 않았는가?
+* Batch size 500이 더 빠른 결과가 있었는데 왜 1000을 선택했는가?

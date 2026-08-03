@@ -614,4 +614,555 @@ JSON 직렬화
 * DB 장애 실험
 * N100 재측정
 * end-to-end 부하 테스트
-* 
+
+
+# Engineering Log Backfill — 2026-08-03
+
+> 이 기록은 AeroTrace 개발 과정에서 실행하고 확인했지만 당시 문서에 저장하지 못한 내용을 대화 기록을 기준으로 복구한 것이다.
+> 실제 수치를 확인하지 못한 항목은 추측하지 않고 `미측정` 또는 `확인 필요`로 표시한다.
+
+---
+
+## 1. Spring Boot 백엔드 기반 구성
+
+### 구현 내용
+
+* Java 21 기반 Spring Boot 4 애플리케이션 구성
+* Virtual Threads 활성화
+* PostgreSQL/TimescaleDB 연결
+* Flyway migration 구성
+* Docker Compose 기반 TimescaleDB와 OpenTelemetry Collector 실행 환경 구성
+
+### 검증 결과
+
+* Spring Boot 애플리케이션 정상 기동
+* Flyway migration 정상 적용
+* TimescaleDB 연결 정상
+* 애플리케이션 종료 시 HikariCP 정상 종료 확인
+
+---
+
+## 2. OTLP JSON Trace 수신 및 저장
+
+### 구현 내용
+
+* `POST /v1/traces` OTLP JSON 수신 API 구현
+* resource, scope, span 구조 파싱
+* `service.name` 추출
+* Trace ID와 Span ID 형식 검증
+* all-zero ID 거부
+* Span 시작·종료 시간 검증
+* enum 값 검증
+* attributes, events, links 파싱
+* uint32 범위 검증
+* 요청 단위 transaction 적용
+* Spring JDBC batch insert 적용
+* 중복 Span에 `ON CONFLICT DO NOTHING` 적용
+
+### 제한 설정
+
+```yaml
+aerotrace:
+  ingest:
+    max-spans-per-request: 5000
+    max-request-body-bytes: 10485760
+    jdbc:
+      batch-size: 1000
+```
+
+### 검증 결과
+
+* 요청당 최대 5,000 Span 제한 확인
+* 최대 요청 본문 크기 10 MiB 제한 확인
+* 제한 초과 시 HTTP 413 반환
+* 제한 초과 요청에서 부분 저장 없음
+* 잘못된 JSON은 HTTP 400
+* 잘못된 Trace ID는 HTTP 400
+* 지원하지 않는 Content-Type은 HTTP 415
+* 정상 성공 응답은 `{}`
+
+---
+
+## 3. JDBC 단건 저장과 Batch 저장 비교
+
+### 목적
+
+Telemetry 수집 경로에서 JPA 단건 저장보다 JDBC batch가 적합한지 실제 처리량으로 확인한다.
+
+### 측정 결과
+
+* JDBC batch가 단건 저장보다 중앙값 기준 약 2.9~3.1배 빠름
+* Batch 저장 처리량은 약 3.1k~3.5k spans/s 범위로 관찰됨
+
+### Batch 크기별 5,000 Span 처리 결과
+
+| Batch 크기 |      총 처리시간 |          처리량 |
+| -------: | ----------: | -----------: |
+|       50 | 2207.706 ms | 2265 spans/s |
+|      100 | 1679.864 ms | 2976 spans/s |
+|      250 | 1950.707 ms | 2563 spans/s |
+|      500 | 1634.554 ms | 3059 spans/s |
+|     1000 | 1712.393 ms | 2920 spans/s |
+|     2000 | 1711.864 ms | 2921 spans/s |
+|     5000 | 1698.537 ms | 2944 spans/s |
+
+### 결론
+
+* 가장 빠른 단일 결과만 보면 batch 500이 우세했다.
+* batch 500, 1000, 2000, 5000 사이의 차이는 크지 않았다.
+* 한 번에 DB로 전달되는 데이터와 메모리 사용량을 제한하면서 안정적인 운영값을 사용하기 위해 batch size 1000을 선택했다.
+* batch size 1000은 절대적인 최적값이 아니라 현재 환경의 초기 운영값이다.
+* `reWriteBatchedInserts=true`는 일관된 개선 효과가 확인되지 않아 적용하지 않았다.
+
+---
+
+## 4. 멀티테넌트 Project API Key
+
+### 데이터 모델
+
+`project_api_keys` 테이블에 다음 정보를 저장한다.
+
+* API Key 행 ID
+* Tenant ID
+* Project ID
+* Key 이름
+* 공개 식별자인 `key_id`
+* SHA-256 `secret_hash`
+* 생성 시각
+* 만료 시각
+* 폐기 시각
+
+### API Key 형식
+
+```text
+atr_<16-character-key-id>.<43-character-secret>
+```
+
+### 보안 설계
+
+* Secret은 32바이트 SecureRandom으로 생성
+* Base64 URL-safe, padding 없이 인코딩
+* DB에는 원문 Secret을 저장하지 않음
+* 인코딩된 Secret 문자열의 SHA-256 hash만 저장
+* hash 비교에 `MessageDigest.isEqual` 사용
+* DTO와 record에서 byte array 방어적 복사
+* `toString()`에서 민감정보 노출 방지
+* 존재하지 않는 Key 조회에도 dummy hash 비교 적용
+* 로그와 metric tag에 원문 API Key와 key ID를 기록하지 않음
+
+### 인증 결과 분류
+
+* success
+* missing_credentials
+* invalid_authorization
+* malformed_key
+* unknown_key
+* secret_mismatch
+* expired
+* revoked
+* lookup_error
+
+### HTTP 인증
+
+* `POST /v1/traces`에만 API Key 인증 Filter 적용
+* `Authorization: Bearer <api-key>` 사용
+* Header가 없거나 잘못된 경우 HTTP 401
+* 인증 실패 응답에 `WWW-Authenticate` 적용
+* Tenant ID와 Project ID를 클라이언트 Header에서 신뢰하지 않음
+* 인증된 API Key의 DB 소유권에서 Tenant와 Project를 결정
+* 클라이언트가 Tenant/Project UUID Header를 위조해도 저장 대상에 영향을 주지 않음
+* 폐기된 Key는 HTTP 401
+
+### 검증 결과
+
+* 정상 API Key 인증 성공
+* Header 누락 401
+* 잘못된 API Key 401
+* 잘못된 Key 형식 401
+* 만료 Key 거부
+* 폐기 Key 거부
+* Tenant/Project 위조 Header 무시
+* 인증된 Project 소속으로 Span 저장
+
+---
+
+## 5. 인증 관측 지표
+
+### Micrometer 지표
+
+```text
+aerotrace.auth.api_key.attempts
+aerotrace.auth.api_key.lookup.duration
+```
+
+### 설계 원칙
+
+* 고정된 outcome과 reason만 tag로 사용
+* tenantId, projectId, keyId, API Key, IP 주소를 tag에 사용하지 않음
+* 인증 Header 단계 실패와 DB 조회 실패를 분리
+* DB 조회를 하지 않은 요청은 lookup timer에 포함하지 않음
+
+### Actuator
+
+* `/actuator/health` 노출
+* `/actuator/metrics` 노출
+* 로컬 개발 환경에서 metric 조회 확인
+
+### 남은 운영 위험
+
+* Actuator endpoint는 현재 인증되지 않은 로컬 개발 구성
+* 공개 배포 전 관리 포트 분리, 방화벽 또는 Spring Security 적용 필요
+* 현재 metric은 애플리케이션 메모리에만 존재해 재시작 시 초기화됨
+
+---
+
+## 6. DB 장애 응답 처리
+
+### 목적
+
+Collector가 일시적인 DB 장애를 영구 실패로 처리하지 않고 재시도할 수 있게 한다.
+
+### 구현 내용
+
+* API Key 조회 DB 장애를 `ProjectApiKeyLookupUnavailableException`으로 변환
+* DB 연결 및 일시적 자원 오류만 retryable 장애로 분류
+* SQL 문법 오류와 프로그래밍 오류를 503으로 숨기지 않음
+* 인증 DB 장애는 HTTP 503 반환
+* Span 저장 DB 장애도 HTTP 503 반환
+* DB 장애 응답에는 `WWW-Authenticate`를 넣지 않음
+* Hikari connection timeout을 3초로 제한
+
+### 테스트
+
+* 가짜 Credential Store에서 DB 장애를 발생시키는 Filter 단위 테스트 작성
+* Filter가 HTTP 503을 반환하는지 검증
+* Filter chain이 호출되지 않는지 검증
+* `WWW-Authenticate`가 없는지 검증
+* 전체 Gradle 테스트 성공
+
+### 실제 장애 검증
+
+* TimescaleDB 중지
+* 동일 API Key로 `/v1/traces` 요청
+* Backend가 HTTP 503 반환
+* 인증 lookup error metric 증가 확인
+* TimescaleDB 복구
+* 같은 API Key로 다시 요청
+* API Key 재발급 없이 HTTP 200 복구 확인
+
+### 미측정
+
+* 실제 HTTP 503 응답시간은 기록하지 못함
+
+---
+
+## 7. Collector에서 AeroTrace로 Trace 전달
+
+### 구성
+
+* OpenTelemetry Collector Contrib `0.157.0`
+* OTLP HTTP exporter 사용
+* JSON encoding 사용
+* 압축은 `none`
+* 환경 변수로 API Key 주입
+* 실제 Secret 파일은 Git에서 제외
+* Backend endpoint는 Docker Desktop의 `host.docker.internal:8080` 사용
+
+### 전달 경로
+
+```text
+OTLP Client
+→ Collector OTLP Receiver
+→ Batch Processor
+→ Persistent Sending Queue
+→ OTLP HTTP JSON Exporter
+→ AeroTrace Backend
+→ TimescaleDB
+```
+
+### 검증 결과
+
+* Collector의 `localhost:4318/v1/traces`가 요청 수신
+* Collector 요청에는 API Key가 없어도 됨
+* Exporter가 Backend 요청에 Bearer API Key 추가
+* Backend 인증 성공
+* TimescaleDB에 검증 Span 1개 저장
+* 저장된 Tenant와 Project가 API Key 소속과 일치
+* `duration_nano = 5,000,000` 확인
+
+### 운영 위험
+
+* Collector receiver 4317/4318은 현재 인증이 없는 로컬 개발 구성
+* 인터넷에 직접 공개하면 안 됨
+
+---
+
+## 8. Collector Persistent Queue 구성
+
+### 구성
+
+* `file_storage/aerotrace` extension
+* Docker named volume `aerotrace-otelcol-data`
+* Collector 비-root UID를 위한 storage init 컨테이너
+* persistent sending queue 적용
+* retry 활성화
+* retry 최대 경과시간 제한 없음
+* queue size 50,000
+* queue sizer는 `items`
+* Trace의 `items`는 Span 수 기준
+* queue consumer 2개
+
+### 설정값
+
+```yaml
+sending_queue:
+  enabled: true
+  num_consumers: 2
+  sizer: items
+  queue_size: 50000
+  block_on_overflow: false
+  storage: file_storage/aerotrace
+```
+
+### 100 Span 장애 복구 실험
+
+실험 절차:
+
+1. 대상 데이터 삭제 및 DB 행 수 0 확인
+2. TimescaleDB 중지
+3. Collector에 100 Span 전송
+4. Collector HTTP 응답 200
+5. Backend가 503 반환
+6. Collector가 retry 수행
+7. TimescaleDB가 중지된 상태에서 Collector 재시작
+8. Collector가 persistent queue metadata를 다시 로드
+9. TimescaleDB 복구
+10. 실행기를 다시 실행하지 않고 DB 결과 확인
+
+최종 결과:
+
+```text
+total_rows        = 100
+distinct_span_ids = 100
+first_span_name   = persistent-queue-span-001
+last_span_name    = persistent-queue-span-100
+```
+
+결론:
+
+* DB 장애 중 100 Span이 Collector에 보관됨
+* Collector 재시작 후 queue 데이터가 복구됨
+* DB 복구 후 100 Span이 자동 재전송됨
+* 최종 DB 결과에서 데이터 유실이 관찰되지 않음
+* 최종 DB 결과에서 중복 행이 관찰되지 않음
+
+### 실험 중 발견한 문제
+
+첫 번째 실행에서는 다음 결과가 발생했다.
+
+```text
+total_rows        = 200
+distinct_span_ids = 100
+```
+
+Collector 재시작 로그에도 총 200 Span, queue item 2개가 표시됐다.
+
+원인:
+
+* 검증 실행기가 두 번 실행됐거나
+* 이전 queue 항목이 남은 상태에서 새로운 100 Span을 추가함
+* 검증 실행기는 실행 때마다 새로운 `start_time`을 생성하므로 동일한 span_id라도 DB unique identity가 달라짐
+
+조치:
+
+* DB와 queue가 비워진 상태에서 재실험
+* 실행기를 정확히 한 번만 실행
+* 최종 100행, 고유 span_id 100개 확인
+
+---
+
+## 9. Collector 내부 지표
+
+### Endpoint
+
+```text
+http://localhost:8888/metrics
+```
+
+Docker port는 로컬에서만 접근하도록 바인딩했다.
+
+```yaml
+127.0.0.1:8888:8888
+```
+
+### 확인한 지표
+
+```text
+otelcol_receiver_accepted_spans
+otelcol_receiver_refused_spans
+otelcol_exporter_sent_spans
+otelcol_exporter_queue_size
+otelcol_exporter_queue_capacity
+```
+
+정상 요청 확인:
+
+```text
+receiver_accepted_spans > 0
+receiver_refused_spans = 0
+exporter_sent_spans > 0
+```
+
+실패가 발생하지 않은 실행에서는 다음 지표가 출력되지 않을 수 있음을 확인했다.
+
+```text
+otelcol_exporter_send_failed_spans
+otelcol_exporter_enqueue_failed_spans
+```
+
+이 경우 metric이 없거나 0이면 정상으로 판단한다.
+
+### 100 Span queue 지표 실험
+
+DB 장애 중:
+
+```text
+queue_capacity = 50000
+queue_size     = 100
+```
+
+DB 복구 후:
+
+```text
+queue_size = 0
+```
+
+결론:
+
+* DB 장애 중 queue가 실제로 증가함
+* DB 복구 후 자동으로 queue가 비워짐
+* enqueue 실패는 관찰되지 않음
+
+---
+
+## 10. 10,000 Span Queue 실험
+
+### 실험 목적
+
+queue capacity 50,000 중 20%에 해당하는 10,000 Span을 장애 중 저장할 수 있는지 확인한다.
+
+### 확인된 결과
+
+```text
+queue_capacity = 50000
+DB 장애 중 queue_size = 10000
+DB 복구 후 queue_size = 0
+enqueue_failed_spans = 없거나 0
+```
+
+### 결론
+
+* Collector가 DB 장애 중 10,000 Span을 queue에 수용함
+* queue capacity 초과 없음
+* enqueue 실패가 관찰되지 않음
+* DB 복구 후 queue가 자동으로 비워짐
+
+### 확인 필요
+
+다음 결과는 대화에 실제 출력값이 남아 있지 않아 완료로 단정하지 않는다.
+
+```text
+최종 DB total_rows
+최종 DB distinct_span_ids
+```
+
+확인 쿼리:
+
+```sql
+SELECT COUNT(*) AS total_rows,
+       COUNT(DISTINCT span_id) AS distinct_span_ids,
+       MIN(name) AS first_span_name,
+       MAX(name) AS last_span_name
+FROM spans
+WHERE service_name =
+      'collector-queue-load-verification';
+```
+
+### 미측정
+
+* Collector 수신 소요시간
+* Collector 수신 처리량
+* persistent queue 저장소 실험 전 크기
+* persistent queue 저장소 실험 후 크기
+* Span당 추정 queue 디스크 크기
+* 정확한 queue drain 시간
+* queue drain 처리량
+
+정확한 drain 시간은 DB 복구 후 첫 metric 조회 시 이미 queue size가 0이어서 측정하지 못했다. 자동 복구는 확인했지만 시간을 추측해서 기록하지 않는다.
+
+---
+
+## 11. 장애 처리 중 발견한 운영 특성
+
+### Backend 미실행
+
+Collector는 정상적으로 Span을 수신했지만 Backend가 실행되지 않았을 때 다음 오류가 발생했다.
+
+```text
+connect: connection refused
+```
+
+동작:
+
+* Collector receiver는 요청을 수신
+* Backend 연결 실패
+* persistent queue에 데이터 유지
+* exporter가 retry 반복
+* Backend 실행 후 자동 전송
+
+### 교훈
+
+* Collector 수신 HTTP 200은 DB 저장 완료를 의미하지 않음
+* receiver metric, exporter metric, queue metric, DB 최종 결과를 함께 확인해야 함
+* `send_failed_spans`가 없다고 retry가 없었던 것은 아님
+* 일시적인 retry 성공은 최종 실패 Counter로 남지 않을 수 있음
+* queue size와 enqueue failure가 데이터 유실 위험 판단에 더 직접적인 지표임
+
+---
+
+## 12. 현재 검증 범위와 남은 위험
+
+### 검증 완료
+
+* JDBC batch 저장
+* 요청 단위 transaction
+* 요청 크기와 Span 개수 제한
+* API Key 기반 멀티테넌트 인증
+* Tenant/Project 위조 Header 방지
+* API Key 폐기와 만료 처리
+* 인증 성공·실패 metric
+* DB 장애의 HTTP 503 변환
+* Collector OTLP HTTP JSON 전달
+* Collector retry
+* persistent queue
+* Collector 재시작 후 queue 복구
+* DB 복구 후 100 Span 자동 저장
+* queue size 100과 10,000 관찰
+* queue 복구 후 size 0 확인
+
+### 아직 검증하지 않음
+
+* queue 50,000 초과 시 동작
+* `block_on_overflow: false`에서 실제 drop 수량
+* 디스크 공간 부족
+* file storage 쓰기 오류
+* Docker 호스트 강제 종료
+* 실제 전원 차단
+* 장시간 DB 장애
+* 장시간 고유입률 상황
+* 정확한 queue drain 처리량
+* 실제 평균 Span 크기
+* queue의 Span당 디스크 사용량
+* retention과 compression
+* 운영 알림
+* Prometheus/Grafana 연동

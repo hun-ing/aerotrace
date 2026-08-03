@@ -369,3 +369,118 @@ Batch 저장: 약 3,283~3,365 spans/sec
 * SaaS와 온프레미스를 하나의 코드베이스로 지원할 수 있는 구조를 유지한다.
 * 기능을 독립적으로 실행하고 검증할 수 있는 작은 단계로 구현한다.
 * 보안, 멀티테넌시, 데이터 유실, 중복 저장 문제를 우선적으로 검토한다.
+
+
+# AEROTRACE_CONTEXT.md 추가 내용
+
+## 현재 Phase
+
+Phase 5 — OpenTelemetry Collector 장애 복구와 데이터 유실 방지
+
+## 현재 완료된 기능
+
+### Backend
+
+* Java 21 / Spring Boot 4 기반 애플리케이션
+* Virtual Threads
+* Flyway 기반 TimescaleDB schema 관리
+* OTLP JSON `POST /v1/traces`
+* Trace ID, Span ID, timestamp, enum, attributes, events, links 검증
+* 요청당 최대 5,000 Span
+* 요청 본문 최대 10 MiB
+* 요청 단위 transaction
+* Spring JDBC batch insert
+* batch size 1000
+* `ON CONFLICT DO NOTHING` 기반 중복 방지
+* OTLP 오류 JSON 응답 통일
+
+### 멀티테넌시 및 인증
+
+* Tenant와 Project schema
+* Project API Key schema
+* API Key 발급
+* 원문 Secret 비저장
+* API Key hash 검증
+* 만료와 폐기 처리
+* OTLP 인증 Filter
+* API Key 소유권 기반 Tenant/Project 결정
+* 클라이언트 Tenant/Project Header 위조 방지
+
+### 관측 가능성
+
+* API Key 인증 결과 Counter
+* API Key DB 조회 Timer
+* Spring Boot Actuator health/metrics
+* Collector 내부 Prometheus metric endpoint
+* receiver, exporter, queue 지표 확인
+
+### 장애 복구
+
+* 인증 DB 장애 HTTP 503
+* Span 저장 DB 장애 HTTP 503
+* Collector retry
+* Collector file storage
+* persistent sending queue
+* Docker named volume
+* Collector 재시작 후 queue 복구
+* DB 복구 후 자동 재전송
+
+## 검증된 결과
+
+* JDBC batch가 단건 저장보다 약 2.9~3.1배 빠름
+* 5,000 Span batch 처리량 약 3.1k~3.5k spans/s 범위
+* batch size 1000을 초기 운영값으로 선택
+* DB 장애 중 100 Span queue 보관
+* Collector 재시작 포함
+* DB 복구 후 최종 100행
+* 고유 Span ID 100개
+* DB 장애 중 queue size 100 확인
+* DB 복구 후 queue size 0 확인
+* 10,000 Span 장애 입력에서 queue size 10,000 확인
+* queue capacity 50,000 확인
+* 10,000 Span 실험에서 DB 복구 후 queue size 0 확인
+* queue enqueue 실패는 관찰되지 않음
+
+## 아직 확인이 필요한 결과
+
+* 10,000 Span 실험 최종 DB 행 수
+* 10,000 Span 실험 고유 Span ID 수
+* persistent queue 디스크 사용량
+* 정확한 queue drain 처리량
+* queue overflow 시 실제 drop 동작
+
+## 현재 기술 부채
+
+* Actuator와 Collector metric endpoint의 운영 보안 미구성
+* API Key DB 조회 cache 없음
+* API Key rotation과 관리 API 없음
+* Collector receiver 인증 없음
+* gzip OTLP 요청 미지원
+* queue capacity가 실제 유입률과 장애 목표시간을 기준으로 산정되지 않음
+* Prometheus/Grafana 및 알림 없음
+* retention과 TimescaleDB compression 미적용
+
+## 운영 전에 반드시 필요한 것
+
+* API rate limit
+* Tenant별 quota
+* API Key 관리 및 rotation
+* 관리 endpoint 보호
+* Collector receiver 네트워크 보호
+* DB backup과 restore 검증
+* TimescaleDB retention 정책
+* queue 사용률과 enqueue failure 알림
+* 디스크 사용률 알림
+* Secret 관리 방식
+* TLS 적용
+* 장애 대응 runbook
+
+## 다음 작업
+
+1. 10,000 Span 실험의 최종 DB 행 수와 고유 Span ID 확인
+2. 현재 queue 검증 결과를 기준으로 queue 용량 산정 방식 정리
+3. queue overflow 실험 여부 결정
+4. 이후 TimescaleDB retention과 compression 단계로 이동
+
+---
+
