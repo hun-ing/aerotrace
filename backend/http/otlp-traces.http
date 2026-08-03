@@ -984,3 +984,18 @@ Authorization: Bearer {{apiKey}}
 ### Trace 상세 인증 누락
 GET {{baseUrl}}/api/v1/traces/ffffffffffffffffffffffffffffffff
 Accept: application/json
+
+### Trace 목록 첫 페이지
+GET {{baseUrl}}/api/v1/traces?from=2026-08-01T00:00:00Z&to=2026-08-03T06:30:00Z&limit=1
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### Trace 목록 두 번째 페이지
+GET {{baseUrl}}/api/v1/traces?from=2026-08-01T00:00:00Z&to=2026-08-03T06:30:00Z&limit=1&cursor=MXwxNzg1NzI0MTgxfDY0MDkzMDAwfDg4NTI0YjM5NTNjOTRmNmI4ODFmNjQ4OWVhNzlhMmIz
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 잘못된 Cursor
+GET {{baseUrl}}/api/v1/traces?from=2026-08-01T00:00:00Z&to=2026-08-03T06:30:00Z&limit=1&cursor=invalid
+Accept: application/json
+Authorization: Bearer {{apiKey}}

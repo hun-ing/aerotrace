@@ -67,6 +67,12 @@ public class TraceQueryService {
             limit
     );
 
+    validateCursor(
+            cursor,
+            from,
+            to
+    );
+
     int internalLimit =
             Math.addExact(
                     limit,
@@ -171,6 +177,34 @@ public class TraceQueryService {
       throw new IllegalArgumentException(
               "limit must be between 1 and "
                       + JdbcTraceQueryRepository.MAX_LIMIT
+      );
+    }
+  }
+
+  private static void validateCursor(
+          TraceListCursor cursor,
+          Instant from,
+          Instant to
+  ) {
+    if (cursor == null) {
+      return;
+    }
+
+    Instant cursorTime =
+            cursor.traceStartTime();
+
+    boolean isBeforeRange =
+            cursorTime.isBefore(from);
+
+    boolean isAtOrAfterRangeEnd =
+            !cursorTime.isBefore(to);
+
+    if (
+            isBeforeRange
+                    || isAtOrAfterRangeEnd
+    ) {
+      throw new IllegalArgumentException(
+              "cursor is outside the requested time range"
       );
     }
   }

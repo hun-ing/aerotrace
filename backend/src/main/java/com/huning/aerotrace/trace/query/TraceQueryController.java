@@ -69,6 +69,9 @@ public class TraceQueryController {
           @RequestParam(
                   defaultValue = DEFAULT_LIMIT
           ) String limit,
+          @RequestParam(
+                  required = false
+          ) String cursor,
           HttpServletRequest request
   ) {
     AuthenticatedProject authenticatedProject =
@@ -90,12 +93,27 @@ public class TraceQueryController {
     int parsedLimit =
             parseLimit(limit);
 
-    List<TraceListItem> items =
-            traceQueryService.findTraceList(
+    TraceListCursor parsedCursor =
+            cursor == null
+                    ? null
+                    : TraceListCursorCodec.decode(
+                    cursor
+            );
+
+    TraceListPage page =
+            traceQueryService.findTracePage(
                     authenticatedProject,
                     parsedFrom,
                     parsedTo,
+                    parsedCursor,
                     parsedLimit
+            );
+
+    String nextCursor =
+            page.nextCursor() == null
+                    ? null
+                    : TraceListCursorCodec.encode(
+                    page.nextCursor()
             );
 
     return ResponseEntity.ok()
@@ -103,7 +121,10 @@ public class TraceQueryController {
                     CacheControl.noStore()
             )
             .body(
-                    TraceListResponse.from(items)
+                    TraceListResponse.from(
+                            page.items(),
+                            nextCursor
+                    )
             );
   }
 

@@ -15,6 +15,8 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 @ExtendWith(MockitoExtension.class)
 class TraceQueryPaginationServiceTest {
@@ -184,6 +186,33 @@ class TraceQueryPaginationServiceTest {
 
     assertThat(page.nextCursor())
             .isNull();
+  }
+
+  @Test
+  void rejectsCursorOutsideRequestedTimeRange() {
+    TraceListCursor cursor =
+            new TraceListCursor(
+                    FROM.minusSeconds(1),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            );
+
+    assertThatThrownBy(
+            () -> service.findTracePage(
+                    authenticatedProject,
+                    FROM,
+                    TO,
+                    cursor,
+                    50
+            )
+    )
+            .isInstanceOf(
+                    IllegalArgumentException.class
+            )
+            .hasMessage(
+                    "cursor is outside the requested time range"
+            );
+
+    verifyNoInteractions(repository);
   }
 
   private static TraceListItem item(
