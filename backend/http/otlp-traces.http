@@ -926,3 +926,37 @@ Authorization: Bearer {{apiKey}}
         );
     });
 %}
+
+### Trace 목록 조회
+GET {{baseUrl}}/api/v1/traces?from=2026-07-27T05:00:00Z&to=2026-08-03T05:00:00Z&limit=50
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### Trace 목록 인증 누락
+GET {{baseUrl}}/api/v1/traces?from=2026-07-27T05:00:00Z&to=2026-08-03T05:00:00Z
+Accept: application/json
+
+### from이 to보다 늦음
+GET {{baseUrl}}/api/v1/traces?from=2026-08-03T05:00:00Z&to=2026-08-02T05:00:00Z
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 최대 조회 기간 초과
+GET {{baseUrl}}/api/v1/traces?from=2026-06-01T00:00:00Z&to=2026-08-03T00:00:00Z
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### Limit 초과
+GET {{baseUrl}}/api/v1/traces?from=2026-07-27T05:00:00Z&to=2026-08-03T05:00:00Z&limit=201
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 기존 OTLP 수신 확인
+POST {{baseUrl}}/v1/traces
+Content-Type: application/json
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+{
+  "resourceSpans": []
+}

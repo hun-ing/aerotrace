@@ -49,6 +49,9 @@ public class OtlpApiKeyAuthenticationFilter extends OncePerRequestFilter {
   private static final String OTLP_TRACES_PATH =
           "/v1/traces";
 
+  private static final String TRACE_QUERY_PATH =
+          "/api/v1/traces";
+
   /**
    * Authorization 헤더에서 허용할 인증 방식이다.
    * <p>
@@ -92,21 +95,32 @@ public class OtlpApiKeyAuthenticationFilter extends OncePerRequestFilter {
   protected boolean shouldNotFilter(
           HttpServletRequest request
   ) {
-    if (
-            !HttpMethod.POST.matches(
+    String requestPath =
+            request.getRequestURI();
+
+    String contextPath =
+            request.getContextPath();
+
+    boolean isOtlpTraceIngest =
+            HttpMethod.POST.matches(
                     request.getMethod()
             )
-    ) {
-      return true;
-    }
+                    && (
+                    contextPath
+                            + OTLP_TRACES_PATH
+            ).equals(requestPath);
 
-    String targetPath =
-            request.getContextPath()
-                    + OTLP_TRACES_PATH;
+    boolean isTraceListQuery =
+            HttpMethod.GET.matches(
+                    request.getMethod()
+            )
+                    && (
+                    contextPath
+                            + TRACE_QUERY_PATH
+            ).equals(requestPath);
 
-    return !targetPath.equals(
-            request.getRequestURI()
-    );
+    return !isOtlpTraceIngest
+            && !isTraceListQuery;
   }
 
   @Override
