@@ -269,6 +269,50 @@ class JdbcTraceQueryRepositoryIntegrationTest {
             );
   }
 
+  @Test
+  void filtersByServiceWithoutChangingWholeTraceAggregates() {
+    Instant from =
+            baseTime.minus(Duration.ofHours(1));
+
+    Instant to =
+            baseTime.plus(Duration.ofHours(1));
+
+    List<TraceListItem> result =
+            repository.findTraceList(
+                    tenantAId,
+                    projectAId,
+                    from,
+                    to,
+                    null,
+                    "project-a-service-two",
+                    50
+            );
+
+    assertThat(result)
+            .extracting(TraceListItem::traceId)
+            .containsExactly(
+                    SHARED_TRACE_ID
+            );
+
+    TraceListItem sharedTrace =
+            result.getFirst();
+
+    /*
+     * project-a-service-two를 포함하는 Trace를 찾았지만,
+     * 집계값은 해당 서비스 Span만이 아니라
+     * Trace 전체 Span을 기준으로 계산돼야 한다.
+     */
+    assertThat(sharedTrace.spanCount())
+            .isEqualTo(2);
+
+    assertThat(sharedTrace.serviceCount())
+            .isEqualTo(2);
+
+    assertThat(
+            sharedTrace.longestSpanDurationNano()
+    ).isEqualTo(10_000_000L);
+  }
+
   private void insertProjectATraces() {
     insertSpan(
             tenantAId,

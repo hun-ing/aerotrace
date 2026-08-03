@@ -72,6 +72,9 @@ public class TraceQueryController {
           @RequestParam(
                   required = false
           ) String cursor,
+          @RequestParam(
+                  required = false
+          ) String serviceName,
           HttpServletRequest request
   ) {
     AuthenticatedProject authenticatedProject =
@@ -100,14 +103,32 @@ public class TraceQueryController {
                     cursor
             );
 
-    TraceListPage page =
-            traceQueryService.findTracePage(
-                    authenticatedProject,
-                    parsedFrom,
-                    parsedTo,
-                    parsedCursor,
-                    parsedLimit
-            );
+    TraceListPage page;
+
+    /*
+     * serviceName이 없는 기존 호출은 기존 메서드를 사용해
+     * 이전 테스트와 API 계약을 그대로 유지한다.
+     */
+    if (serviceName == null) {
+      page =
+              traceQueryService.findTracePage(
+                      authenticatedProject,
+                      parsedFrom,
+                      parsedTo,
+                      parsedCursor,
+                      parsedLimit
+              );
+    } else {
+      page =
+              traceQueryService.findTracePage(
+                      authenticatedProject,
+                      parsedFrom,
+                      parsedTo,
+                      parsedCursor,
+                      serviceName,
+                      parsedLimit
+              );
+    }
 
     String nextCursor =
             page.nextCursor() == null

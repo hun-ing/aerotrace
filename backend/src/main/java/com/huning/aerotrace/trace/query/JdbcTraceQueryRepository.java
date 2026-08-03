@@ -18,12 +18,11 @@ public class JdbcTraceQueryRepository {
 
   public static final int MAX_LIMIT = 200;
 
-  /*
-   * 사용자에게 반환할 최대값보다 한 행 더 조회해
-   * 다음 페이지 존재 여부를 판단한다.
-   */
   static final int INTERNAL_MAX_LIMIT =
           MAX_LIMIT + 1;
+
+  private static final int MAX_SERVICE_NAME_LENGTH =
+          255;
 
   private static final String FIND_TRACE_LIST_SQL = """
             SELECT trace_id,
@@ -38,6 +37,26 @@ public class JdbcTraceQueryRepository {
               AND start_time >= ?
               AND start_time < ?
             GROUP BY trace_id
+            ORDER BY trace_start_time DESC,
+                     trace_id DESC
+            LIMIT ?
+            """;
+
+  private static final String
+          FIND_TRACE_LIST_BY_SERVICE_SQL = """
+            SELECT trace_id,
+                   MIN(start_time) AS trace_start_time,
+                   COUNT(*) AS span_count,
+                   COUNT(DISTINCT service_name) AS service_count,
+                   MAX(duration_nano)
+                       AS longest_span_duration_nano
+            FROM public.spans
+            WHERE tenant_id = ?
+              AND project_id = ?
+              AND start_time >= ?
+              AND start_time < ?
+            GROUP BY trace_id
+            HAVING BOOL_OR(service_name = ?)
             ORDER BY trace_start_time DESC,
                      trace_id DESC
             LIMIT ?
@@ -61,6 +80,42 @@ public class JdbcTraceQueryRepository {
                   AND start_time >= ?
                   AND start_time < ?
                 GROUP BY trace_id
+            )
+            SELECT trace_id,
+                   trace_start_time,
+                   span_count,
+                   service_count,
+                   longest_span_duration_nano
+            FROM trace_summaries
+            WHERE trace_start_time < ?
+               OR (
+                    trace_start_time = ?
+                    AND trace_id < ?
+               )
+            ORDER BY trace_start_time DESC,
+                     trace_id DESC
+            LIMIT ?
+            """;
+
+  private static final String
+          FIND_TRACE_LIST_AFTER_CURSOR_BY_SERVICE_SQL = """
+            WITH trace_summaries AS (
+                SELECT trace_id,
+                       MIN(start_time)
+                           AS trace_start_time,
+                       COUNT(*)
+                           AS span_count,
+                       COUNT(DISTINCT service_name)
+                           AS service_count,
+                       MAX(duration_nano)
+                           AS longest_span_duration_nano
+                FROM public.spans
+                WHERE tenant_id = ?
+                  AND project_id = ?
+                  AND start_time >= ?
+                  AND start_time < ?
+                GROUP BY trace_id
+                HAVING BOOL_OR(service_name = ?)
             )
             SELECT trace_id,
                    trace_start_time,
@@ -103,6 +158,7 @@ public class JdbcTraceQueryRepository {
             from,
             to,
             null,
+            null,
             limit
     );
   }
@@ -115,30 +171,74 @@ public class JdbcTraceQueryRepository {
           TraceListCursor cursor,
           int limit
   ) {
-    validateQuery(
-            tenantId,
-            projectId,
-            from,
-            to,
-            limit
-    );
-
-    if (cursor == null) {
-      return queryFirstPage(
-              tenantId,
-              projectId,
-              from,
-              to,
-              limit
-      );
-    }
-
-    return queryAfterCursor(
+    return findTraceList(
             tenantId,
             projectId,
             from,
             to,
             cursor,
+            null,
+            limit
+    );
+  }
+
+  public List<TraceListItem> findTraceList(
+          UUID tenantId,
+          UUID projectId,
+          Instant from,
+          Instant to,
+          TraceListCursor cursor,
+          String serviceName,
+          int limit
+  ) {
+    validateQuery(
+            tenantId,
+            projectId,
+            from,
+            to,
+            serviceName,
+            limit
+    );
+
+    if (cursor == null) {
+      if (serviceName == null) {
+        return queryFirstPage(
+                tenantId,
+                projectId,
+                from,
+                to,
+                limit
+        );
+      }
+
+      return queryFirstPageByService(
+              tenantId,
+              projectId,
+              from,
+              to,
+              serviceName,
+              limit
+      );
+    }
+
+    if (serviceName == null) {
+      return queryAfterCursor(
+              tenantId,
+              projectId,
+              from,
+              to,
+              cursor,
+              limit
+      );
+    }
+
+    return queryAfterCursorByService(
+            tenantId,
+            projectId,
+            from,
+            to,
+            cursor,
+            serviceName,
             limit
     );
   }
@@ -170,6 +270,39 @@ public class JdbcTraceQueryRepository {
     );
   }
 
+  private List<TraceListItem> queryFirstPageByService(
+          UUID tenantId,
+          UUID projectId,
+          Instant from,
+          Instant to,
+          String serviceName,
+          int limit
+  ) {
+    return jdbcTemplate.query(
+            FIND_TRACE_LIST_BY_SERVICE_SQL,
+            preparedStatement -> {
+              setCommonParameters(
+                      preparedStatement,
+                      tenantId,
+                      projectId,
+                      from,
+                      to
+              );
+
+              preparedStatement.setString(
+                      5,
+                      serviceName
+              );
+
+              preparedStatement.setInt(
+                      6,
+                      limit
+              );
+            },
+            JdbcTraceQueryRepository::mapTraceListItem
+    );
+  }
+
   private List<TraceListItem> queryAfterCursor(
           UUID tenantId,
           UUID projectId,
@@ -190,9 +323,8 @@ public class JdbcTraceQueryRepository {
               );
 
               OffsetDateTime cursorTime =
-                      OffsetDateTime.ofInstant(
-                              cursor.traceStartTime(),
-                              ZoneOffset.UTC
+                      toOffsetDateTime(
+                              cursor.traceStartTime()
                       );
 
               preparedStatement.setObject(
@@ -219,6 +351,61 @@ public class JdbcTraceQueryRepository {
     );
   }
 
+  private List<TraceListItem>
+  queryAfterCursorByService(
+          UUID tenantId,
+          UUID projectId,
+          Instant from,
+          Instant to,
+          TraceListCursor cursor,
+          String serviceName,
+          int limit
+  ) {
+    return jdbcTemplate.query(
+            FIND_TRACE_LIST_AFTER_CURSOR_BY_SERVICE_SQL,
+            preparedStatement -> {
+              setCommonParameters(
+                      preparedStatement,
+                      tenantId,
+                      projectId,
+                      from,
+                      to
+              );
+
+              preparedStatement.setString(
+                      5,
+                      serviceName
+              );
+
+              OffsetDateTime cursorTime =
+                      toOffsetDateTime(
+                              cursor.traceStartTime()
+                      );
+
+              preparedStatement.setObject(
+                      6,
+                      cursorTime
+              );
+
+              preparedStatement.setObject(
+                      7,
+                      cursorTime
+              );
+
+              preparedStatement.setString(
+                      8,
+                      cursor.traceId()
+              );
+
+              preparedStatement.setInt(
+                      9,
+                      limit
+              );
+            },
+            JdbcTraceQueryRepository::mapTraceListItem
+    );
+  }
+
   private static void setCommonParameters(
           PreparedStatement preparedStatement,
           UUID tenantId,
@@ -238,18 +425,21 @@ public class JdbcTraceQueryRepository {
 
     preparedStatement.setObject(
             3,
-            OffsetDateTime.ofInstant(
-                    from,
-                    ZoneOffset.UTC
-            )
+            toOffsetDateTime(from)
     );
 
     preparedStatement.setObject(
             4,
-            OffsetDateTime.ofInstant(
-                    to,
-                    ZoneOffset.UTC
-            )
+            toOffsetDateTime(to)
+    );
+  }
+
+  private static OffsetDateTime toOffsetDateTime(
+          Instant instant
+  ) {
+    return OffsetDateTime.ofInstant(
+            instant,
+            ZoneOffset.UTC
     );
   }
 
@@ -288,6 +478,7 @@ public class JdbcTraceQueryRepository {
           UUID projectId,
           Instant from,
           Instant to,
+          String serviceName,
           int limit
   ) {
     Objects.requireNonNull(
@@ -314,6 +505,25 @@ public class JdbcTraceQueryRepository {
       throw new IllegalArgumentException(
               "from must be earlier than to"
       );
+    }
+
+    if (serviceName != null) {
+      if (serviceName.isBlank()) {
+        throw new IllegalArgumentException(
+                "serviceName must not be blank"
+        );
+      }
+
+      if (
+              serviceName.length()
+                      > MAX_SERVICE_NAME_LENGTH
+      ) {
+        throw new IllegalArgumentException(
+                "serviceName must not exceed "
+                        + MAX_SERVICE_NAME_LENGTH
+                        + " characters"
+        );
+      }
     }
 
     if (

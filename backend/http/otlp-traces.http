@@ -999,3 +999,28 @@ Authorization: Bearer {{apiKey}}
 GET {{baseUrl}}/api/v1/traces?from=2026-08-01T00:00:00Z&to=2026-08-03T06:30:00Z&limit=1&cursor=invalid
 Accept: application/json
 Authorization: Bearer {{apiKey}}
+
+### 서비스가 포함된 Trace 조회
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T00:00:00Z&to=2026-08-03T06:00:00Z&limit=50&serviceName=columnstore-policy-verification
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 존재하지 않는 서비스
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T00:00:00Z&to=2026-08-03T06:00:00Z&limit=50&serviceName=service-that-does-not-exist
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 빈 서비스명
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T00:00:00Z&to=2026-08-03T06:00:00Z&limit=50&serviceName=
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 서비스 필터 첫 페이지
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T00:00:00Z&to=2026-08-03T06:00:00Z&limit=1&serviceName=columnstore-policy-verification
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 서비스 필터 다음 페이지
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T00:00:00Z&to=2026-08-03T06:00:00Z&limit=1&serviceName=columnstore-policy-verification&cursor=MXwxNzg1NzI0MTgxfDY0MDkzMDAwfDg4NTI0YjM5NTNjOTRmNmI4ODFmNjQ4OWVhNzlhMmIz
+Accept: application/json
+Authorization: Bearer {{apiKey}}

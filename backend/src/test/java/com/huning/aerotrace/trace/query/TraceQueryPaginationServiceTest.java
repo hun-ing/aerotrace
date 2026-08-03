@@ -215,6 +215,85 @@ class TraceQueryPaginationServiceTest {
     verifyNoInteractions(repository);
   }
 
+  @Test
+  void normalizesAndPassesServiceNameFilter() {
+    TraceListItem item =
+            item(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "2026-08-02T10:00:00Z"
+            );
+
+    when(
+            authenticatedProject.tenantId()
+    ).thenReturn(TENANT_ID);
+
+    when(
+            authenticatedProject.projectId()
+    ).thenReturn(PROJECT_ID);
+
+    when(
+            repository.findTraceList(
+                    TENANT_ID,
+                    PROJECT_ID,
+                    FROM,
+                    TO,
+                    null,
+                    "orders-service",
+                    3
+            )
+    ).thenReturn(
+            List.of(item)
+    );
+
+    TraceListPage page =
+            service.findTracePage(
+                    authenticatedProject,
+                    FROM,
+                    TO,
+                    null,
+                    "  orders-service  ",
+                    2
+            );
+
+    assertThat(page.items())
+            .containsExactly(item);
+
+    assertThat(page.nextCursor())
+            .isNull();
+
+    verify(repository).findTraceList(
+            TENANT_ID,
+            PROJECT_ID,
+            FROM,
+            TO,
+            null,
+            "orders-service",
+            3
+    );
+  }
+
+  @Test
+  void rejectsBlankServiceNameBeforeDatabaseQuery() {
+    assertThatThrownBy(
+            () -> service.findTracePage(
+                    authenticatedProject,
+                    FROM,
+                    TO,
+                    null,
+                    "   ",
+                    50
+            )
+    )
+            .isInstanceOf(
+                    IllegalArgumentException.class
+            )
+            .hasMessage(
+                    "serviceName must not be blank"
+            );
+
+    verifyNoInteractions(repository);
+  }
+
   private static TraceListItem item(
           String traceId,
           String traceStartTime

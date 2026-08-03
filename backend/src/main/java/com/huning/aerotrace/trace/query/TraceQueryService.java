@@ -15,6 +15,9 @@ public class TraceQueryService {
   private static final Duration MAX_QUERY_RANGE =
           Duration.ofDays(30);
 
+  private static final int MAX_SERVICE_NAME_LENGTH =
+          255;
+
   private final JdbcTraceQueryRepository repository;
 
   public TraceQueryService(
@@ -27,10 +30,6 @@ public class TraceQueryService {
             );
   }
 
-  /*
-   * 현재 HTTP Controller와 기존 테스트의 호환을 위해
-   * 기존 메서드는 유지한다.
-   */
   public List<TraceListItem> findTraceList(
           AuthenticatedProject authenticatedProject,
           Instant from,
@@ -60,6 +59,24 @@ public class TraceQueryService {
           TraceListCursor cursor,
           int limit
   ) {
+    return findTracePage(
+            authenticatedProject,
+            from,
+            to,
+            cursor,
+            null,
+            limit
+    );
+  }
+
+  public TraceListPage findTracePage(
+          AuthenticatedProject authenticatedProject,
+          Instant from,
+          Instant to,
+          TraceListCursor cursor,
+          String serviceName,
+          int limit
+  ) {
     validateQuery(
             authenticatedProject,
             from,
@@ -73,21 +90,39 @@ public class TraceQueryService {
             to
     );
 
+    String normalizedServiceName =
+            normalizeServiceName(serviceName);
+
     int internalLimit =
             Math.addExact(
                     limit,
                     1
             );
 
-    List<TraceListItem> fetchedItems =
-            repository.findTraceList(
-                    authenticatedProject.tenantId(),
-                    authenticatedProject.projectId(),
-                    from,
-                    to,
-                    cursor,
-                    internalLimit
-            );
+    List<TraceListItem> fetchedItems;
+
+    if (normalizedServiceName == null) {
+      fetchedItems =
+              repository.findTraceList(
+                      authenticatedProject.tenantId(),
+                      authenticatedProject.projectId(),
+                      from,
+                      to,
+                      cursor,
+                      internalLimit
+              );
+    } else {
+      fetchedItems =
+              repository.findTraceList(
+                      authenticatedProject.tenantId(),
+                      authenticatedProject.projectId(),
+                      from,
+                      to,
+                      cursor,
+                      normalizedServiceName,
+                      internalLimit
+              );
+    }
 
     boolean hasNext =
             fetchedItems.size() > limit;
@@ -124,6 +159,64 @@ public class TraceQueryService {
             returnedItems,
             nextCursor
     );
+  }
+
+  private static String normalizeServiceName(
+          String serviceName
+  ) {
+    if (serviceName == null) {
+      return null;
+    }
+
+    String normalized =
+            serviceName.strip();
+
+    if (normalized.isEmpty()) {
+      throw new IllegalArgumentException(
+              "serviceName must not be blank"
+      );
+    }
+
+    if (
+            normalized.length()
+                    > MAX_SERVICE_NAME_LENGTH
+    ) {
+      throw new IllegalArgumentException(
+              "serviceName must not exceed "
+                      + MAX_SERVICE_NAME_LENGTH
+                      + " characters"
+      );
+    }
+
+    return normalized;
+  }
+
+  private static void validateCursor(
+          TraceListCursor cursor,
+          Instant from,
+          Instant to
+  ) {
+    if (cursor == null) {
+      return;
+    }
+
+    Instant cursorTime =
+            cursor.traceStartTime();
+
+    boolean isBeforeRange =
+            cursorTime.isBefore(from);
+
+    boolean isAtOrAfterRangeEnd =
+            !cursorTime.isBefore(to);
+
+    if (
+            isBeforeRange
+                    || isAtOrAfterRangeEnd
+    ) {
+      throw new IllegalArgumentException(
+              "cursor is outside the requested time range"
+      );
+    }
   }
 
   private static void validateQuery(
@@ -177,34 +270,6 @@ public class TraceQueryService {
       throw new IllegalArgumentException(
               "limit must be between 1 and "
                       + JdbcTraceQueryRepository.MAX_LIMIT
-      );
-    }
-  }
-
-  private static void validateCursor(
-          TraceListCursor cursor,
-          Instant from,
-          Instant to
-  ) {
-    if (cursor == null) {
-      return;
-    }
-
-    Instant cursorTime =
-            cursor.traceStartTime();
-
-    boolean isBeforeRange =
-            cursorTime.isBefore(from);
-
-    boolean isAtOrAfterRangeEnd =
-            !cursorTime.isBefore(to);
-
-    if (
-            isBeforeRange
-                    || isAtOrAfterRangeEnd
-    ) {
-      throw new IllegalArgumentException(
-              "cursor is outside the requested time range"
       );
     }
   }
