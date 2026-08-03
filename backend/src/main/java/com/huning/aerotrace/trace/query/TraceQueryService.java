@@ -1,6 +1,7 @@
 package com.huning.aerotrace.trace.query;
 
-import com.huning.aerotrace.auth.application.AuthenticatedProject;
+import com.huning.aerotrace.auth.application
+        .AuthenticatedProject;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -26,6 +27,10 @@ public class TraceQueryService {
             );
   }
 
+  /*
+   * 현재 HTTP Controller와 기존 테스트의 호환을 위해
+   * 기존 메서드는 유지한다.
+   */
   public List<TraceListItem> findTraceList(
           AuthenticatedProject authenticatedProject,
           Instant from,
@@ -45,6 +50,73 @@ public class TraceQueryService {
             from,
             to,
             limit
+    );
+  }
+
+  public TraceListPage findTracePage(
+          AuthenticatedProject authenticatedProject,
+          Instant from,
+          Instant to,
+          TraceListCursor cursor,
+          int limit
+  ) {
+    validateQuery(
+            authenticatedProject,
+            from,
+            to,
+            limit
+    );
+
+    int internalLimit =
+            Math.addExact(
+                    limit,
+                    1
+            );
+
+    List<TraceListItem> fetchedItems =
+            repository.findTraceList(
+                    authenticatedProject.tenantId(),
+                    authenticatedProject.projectId(),
+                    from,
+                    to,
+                    cursor,
+                    internalLimit
+            );
+
+    boolean hasNext =
+            fetchedItems.size() > limit;
+
+    int returnedItemCount =
+            Math.min(
+                    fetchedItems.size(),
+                    limit
+            );
+
+    List<TraceListItem> returnedItems =
+            List.copyOf(
+                    fetchedItems.subList(
+                            0,
+                            returnedItemCount
+                    )
+            );
+
+    TraceListCursor nextCursor = null;
+
+    if (hasNext) {
+      TraceListItem lastReturnedItem =
+              returnedItems.getLast();
+
+      nextCursor =
+              new TraceListCursor(
+                      lastReturnedItem
+                              .traceStartTime(),
+                      lastReturnedItem.traceId()
+              );
+    }
+
+    return new TraceListPage(
+            returnedItems,
+            nextCursor
     );
   }
 

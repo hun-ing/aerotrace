@@ -213,6 +213,62 @@ class JdbcTraceQueryRepositoryIntegrationTest {
             .isEqualTo(PROJECT_A_TRACE_ID);
   }
 
+  @Test
+  void continuesAfterCursorWithoutDuplicates() {
+    Instant from =
+            baseTime.minus(Duration.ofHours(1));
+
+    Instant to =
+            baseTime.plus(Duration.ofHours(1));
+
+    List<TraceListItem> firstPage =
+            repository.findTraceList(
+                    tenantAId,
+                    projectAId,
+                    from,
+                    to,
+                    null,
+                    1
+            );
+
+    assertThat(firstPage)
+            .hasSize(1);
+
+    assertThat(firstPage.getFirst().traceId())
+            .isEqualTo(PROJECT_A_TRACE_ID);
+
+    TraceListItem lastItem =
+            firstPage.getFirst();
+
+    TraceListCursor cursor =
+            new TraceListCursor(
+                    lastItem.traceStartTime(),
+                    lastItem.traceId()
+            );
+
+    List<TraceListItem> secondPage =
+            repository.findTraceList(
+                    tenantAId,
+                    projectAId,
+                    from,
+                    to,
+                    cursor,
+                    10
+            );
+
+    assertThat(secondPage)
+            .extracting(TraceListItem::traceId)
+            .containsExactly(
+                    SHARED_TRACE_ID
+            );
+
+    assertThat(secondPage)
+            .extracting(TraceListItem::traceId)
+            .doesNotContain(
+                    PROJECT_A_TRACE_ID
+            );
+  }
+
   private void insertProjectATraces() {
     insertSpan(
             tenantAId,
