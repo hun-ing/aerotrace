@@ -32,9 +32,44 @@ public class JdbcTraceQueryRepository {
    * 필터에 일치한 Span이 아닌 Trace 전체를 기준으로 계산된다.
    */
   private static final String FIND_TRACE_LIST_SQL = """
+        SELECT trace_id,
+               MIN(start_time) AS trace_start_time,
+               COUNT(*) AS span_count,
+               COUNT(DISTINCT service_name)
+                   AS service_count,
+               MAX(duration_nano)
+                   AS longest_span_duration_nano
+        FROM public.spans
+        WHERE tenant_id = ?
+          AND project_id = ?
+          AND start_time >= ?
+          AND start_time < ?
+        GROUP BY trace_id
+        HAVING (
+                   ? = FALSE
+                   OR BOOL_OR(service_name = ?)
+               )
+           AND (
+                   ? = FALSE
+                   OR BOOL_OR(status_code = 2)
+               )
+           AND (
+                   ? = FALSE
+                   OR MAX(duration_nano) >= ?
+               )
+        ORDER BY trace_start_time DESC,
+                 trace_id DESC
+        LIMIT ?
+        """;
+
+  private static final String
+          FIND_TRACE_LIST_AFTER_CURSOR_SQL = """
+        WITH trace_summaries AS (
             SELECT trace_id,
-                   MIN(start_time) AS trace_start_time,
-                   COUNT(*) AS span_count,
+                   MIN(start_time)
+                       AS trace_start_time,
+                   COUNT(*)
+                       AS span_count,
                    COUNT(DISTINCT service_name)
                        AS service_count,
                    MAX(duration_nano)
@@ -53,53 +88,26 @@ public class JdbcTraceQueryRepository {
                        ? = FALSE
                        OR BOOL_OR(status_code = 2)
                    )
-            ORDER BY trace_start_time DESC,
-                     trace_id DESC
-            LIMIT ?
-            """;
-
-  private static final String
-          FIND_TRACE_LIST_AFTER_CURSOR_SQL = """
-            WITH trace_summaries AS (
-                SELECT trace_id,
-                       MIN(start_time)
-                           AS trace_start_time,
-                       COUNT(*)
-                           AS span_count,
-                       COUNT(DISTINCT service_name)
-                           AS service_count,
-                       MAX(duration_nano)
-                           AS longest_span_duration_nano
-                FROM public.spans
-                WHERE tenant_id = ?
-                  AND project_id = ?
-                  AND start_time >= ?
-                  AND start_time < ?
-                GROUP BY trace_id
-                HAVING (
-                           ? = FALSE
-                           OR BOOL_OR(service_name = ?)
-                       )
-                   AND (
-                           ? = FALSE
-                           OR BOOL_OR(status_code = 2)
-                       )
-            )
-            SELECT trace_id,
-                   trace_start_time,
-                   span_count,
-                   service_count,
-                   longest_span_duration_nano
-            FROM trace_summaries
-            WHERE trace_start_time < ?
-               OR (
-                    trace_start_time = ?
-                    AND trace_id < ?
-               )
-            ORDER BY trace_start_time DESC,
-                     trace_id DESC
-            LIMIT ?
-            """;
+               AND (
+                       ? = FALSE
+                       OR MAX(duration_nano) >= ?
+                   )
+        )
+        SELECT trace_id,
+               trace_start_time,
+               span_count,
+               service_count,
+               longest_span_duration_nano
+        FROM trace_summaries
+        WHERE trace_start_time < ?
+           OR (
+                trace_start_time = ?
+                AND trace_id < ?
+           )
+        ORDER BY trace_start_time DESC,
+                 trace_id DESC
+        LIMIT ?
+        """;
 
   private final JdbcTemplate jdbcTemplate;
 
@@ -183,12 +191,37 @@ public class JdbcTraceQueryRepository {
           boolean errorOnly,
           int limit
   ) {
+    return findTraceList(
+            tenantId,
+            projectId,
+            from,
+            to,
+            cursor,
+            serviceName,
+            errorOnly,
+            null,
+            limit
+    );
+  }
+
+  public List<TraceListItem> findTraceList(
+          UUID tenantId,
+          UUID projectId,
+          Instant from,
+          Instant to,
+          TraceListCursor cursor,
+          String serviceName,
+          boolean errorOnly,
+          Long minSpanDurationNano,
+          int limit
+  ) {
     validateQuery(
             tenantId,
             projectId,
             from,
             to,
             serviceName,
+            minSpanDurationNano,
             limit
     );
 
@@ -200,6 +233,7 @@ public class JdbcTraceQueryRepository {
               to,
               serviceName,
               errorOnly,
+              minSpanDurationNano,
               limit
       );
     }
@@ -212,6 +246,7 @@ public class JdbcTraceQueryRepository {
             cursor,
             serviceName,
             errorOnly,
+            minSpanDurationNano,
             limit
     );
   }
@@ -223,6 +258,7 @@ public class JdbcTraceQueryRepository {
           Instant to,
           String serviceName,
           boolean errorOnly,
+          Long minSpanDurationNano,
           int limit
   ) {
     return jdbcTemplate.query(
@@ -240,11 +276,12 @@ public class JdbcTraceQueryRepository {
                       preparedStatement,
                       5,
                       serviceName,
-                      errorOnly
+                      errorOnly,
+                      minSpanDurationNano
               );
 
               preparedStatement.setInt(
-                      8,
+                      10,
                       limit
               );
             },
@@ -260,6 +297,7 @@ public class JdbcTraceQueryRepository {
           TraceListCursor cursor,
           String serviceName,
           boolean errorOnly,
+          Long minSpanDurationNano,
           int limit
   ) {
     return jdbcTemplate.query(
@@ -277,7 +315,8 @@ public class JdbcTraceQueryRepository {
                       preparedStatement,
                       5,
                       serviceName,
-                      errorOnly
+                      errorOnly,
+                      minSpanDurationNano
               );
 
               OffsetDateTime cursorTime =
@@ -286,22 +325,22 @@ public class JdbcTraceQueryRepository {
                       );
 
               preparedStatement.setObject(
-                      8,
+                      10,
                       cursorTime
               );
 
               preparedStatement.setObject(
-                      9,
+                      11,
                       cursorTime
               );
 
               preparedStatement.setString(
-                      10,
+                      12,
                       cursor.traceId()
               );
 
               preparedStatement.setInt(
-                      11,
+                      13,
                       limit
               );
             },
@@ -341,20 +380,20 @@ public class JdbcTraceQueryRepository {
           PreparedStatement preparedStatement,
           int startIndex,
           String serviceName,
-          boolean errorOnly
+          boolean errorOnly,
+          Long minSpanDurationNano
   ) throws SQLException {
     boolean serviceFilterEnabled =
             serviceName != null;
+
+    boolean durationFilterEnabled =
+            minSpanDurationNano != null;
 
     preparedStatement.setBoolean(
             startIndex,
             serviceFilterEnabled
     );
 
-    /*
-     * service 필터가 비활성화되어도 PostgreSQL이
-     * parameter 타입을 결정할 수 있도록 빈 문자열을 전달한다.
-     */
     preparedStatement.setString(
             startIndex + 1,
             serviceFilterEnabled
@@ -365,6 +404,18 @@ public class JdbcTraceQueryRepository {
     preparedStatement.setBoolean(
             startIndex + 2,
             errorOnly
+    );
+
+    preparedStatement.setBoolean(
+            startIndex + 3,
+            durationFilterEnabled
+    );
+
+    preparedStatement.setLong(
+            startIndex + 4,
+            durationFilterEnabled
+                    ? minSpanDurationNano
+                    : 0L
     );
   }
 
@@ -413,6 +464,7 @@ public class JdbcTraceQueryRepository {
           Instant from,
           Instant to,
           String serviceName,
+          Long minSpanDurationNano,
           int limit
   ) {
     Objects.requireNonNull(
@@ -458,6 +510,15 @@ public class JdbcTraceQueryRepository {
                         + " characters"
         );
       }
+    }
+
+    if (
+            minSpanDurationNano != null
+                    && minSpanDurationNano < 0
+    ) {
+      throw new IllegalArgumentException(
+              "minSpanDurationNano must not be negative"
+      );
     }
 
     if (

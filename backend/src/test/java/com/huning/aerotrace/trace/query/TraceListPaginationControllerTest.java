@@ -453,4 +453,115 @@ class TraceListPaginationControllerTest {
                             )
             );
   }
+
+  @Test
+  void passesMinimumSpanDurationFilter()
+          throws Exception {
+    TraceListItem item =
+            new TraceListItem(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    Instant.parse(
+                            "2026-08-02T10:00:00Z"
+                    ),
+                    2,
+                    2,
+                    20_000_000L
+            );
+
+    when(
+            authenticatedProjectRequestResolver.resolve(
+                    any(HttpServletRequest.class)
+            )
+    ).thenReturn(authenticatedProject);
+
+    when(
+            traceQueryService.findTracePage(
+                    authenticatedProject,
+                    FROM,
+                    TO,
+                    null,
+                    "orders-service",
+                    true,
+                    10_000_000L,
+                    50
+            )
+    ).thenReturn(
+            new TraceListPage(
+                    List.of(item),
+                    null
+            )
+    );
+
+    mockMvc.perform(
+                    get("/api/v1/traces")
+                            .queryParam(
+                                    "from",
+                                    "2026-08-01T00:00:00Z"
+                            )
+                            .queryParam(
+                                    "to",
+                                    "2026-08-03T06:00:00Z"
+                            )
+                            .queryParam(
+                                    "serviceName",
+                                    "orders-service"
+                            )
+                            .queryParam(
+                                    "errorOnly",
+                                    "true"
+                            )
+                            .queryParam(
+                                    "minSpanDurationNano",
+                                    "10000000"
+                            )
+            )
+            .andExpect(
+                    status().isOk()
+            )
+            .andExpect(
+                    jsonPath("$.items.length()")
+                            .value(1)
+            )
+            .andExpect(
+                    jsonPath(
+                            "$.items[0].longestSpanDurationNano"
+                    ).value(20_000_000L)
+            );
+  }
+
+  @Test
+  void returnsBadRequestForNegativeMinimumSpanDuration()
+          throws Exception {
+    when(
+            authenticatedProjectRequestResolver.resolve(
+                    any(HttpServletRequest.class)
+            )
+    ).thenReturn(authenticatedProject);
+
+    mockMvc.perform(
+                    get("/api/v1/traces")
+                            .queryParam(
+                                    "from",
+                                    "2026-08-01T00:00:00Z"
+                            )
+                            .queryParam(
+                                    "to",
+                                    "2026-08-03T06:00:00Z"
+                            )
+                            .queryParam(
+                                    "minSpanDurationNano",
+                                    "-1"
+                            )
+            )
+            .andExpect(
+                    status().isBadRequest()
+            )
+            .andExpect(
+                    jsonPath("$.message")
+                            .value(
+                                    "minSpanDurationNano "
+                                            + "must not be negative"
+                            )
+            );
+  }
 }

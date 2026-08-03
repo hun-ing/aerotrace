@@ -122,6 +122,34 @@ class TraceListQueryFingerprintTest {
             .isNotEqualTo(secondProject);
   }
 
+  @Test
+  void changesWhenMinimumSpanDurationChanges() {
+    String tenMilliseconds =
+            TraceListQueryFingerprint.create(
+                    TENANT_ID,
+                    PROJECT_ID,
+                    FROM,
+                    TO,
+                    null,
+                    false,
+                    10_000_000L
+            );
+
+    String twentyMilliseconds =
+            TraceListQueryFingerprint.create(
+                    TENANT_ID,
+                    PROJECT_ID,
+                    FROM,
+                    TO,
+                    null,
+                    false,
+                    20_000_000L
+            );
+
+    assertThat(tenMilliseconds)
+            .isNotEqualTo(twentyMilliseconds);
+  }
+
   private static String fingerprint(
           UUID projectId,
           String serviceName,

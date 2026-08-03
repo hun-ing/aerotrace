@@ -395,6 +395,73 @@ class JdbcTraceQueryRepositoryIntegrationTest {
     ).isEqualTo(10_000_000L);
   }
 
+  @Test
+  void combinesServiceErrorAndDurationFilters() {
+    int updatedRows =
+            jdbcTemplate.update(
+                    """
+                    UPDATE public.spans
+                    SET status_code = 2,
+                        status_message = 'slow trace error'
+                    WHERE tenant_id = ?
+                      AND project_id = ?
+                      AND trace_id = ?
+                      AND span_id = ?
+                    """,
+                    tenantAId,
+                    projectAId,
+                    SHARED_TRACE_ID,
+                    SHARED_SPAN_ID_2
+            );
+
+    assertThat(updatedRows)
+            .isEqualTo(1);
+
+    Instant from =
+            baseTime.minus(Duration.ofHours(1));
+
+    Instant to =
+            baseTime.plus(Duration.ofHours(1));
+
+    List<TraceListItem> result =
+            repository.findTraceList(
+                    tenantAId,
+                    projectAId,
+                    from,
+                    to,
+                    null,
+                    "project-a-service-one",
+                    true,
+                    9_000_000L,
+                    50
+            );
+
+    /*
+     * shared trace:
+     * - service-one Span 포함
+     * - 다른 Span이 ERROR
+     * - 최대 Span duration 10ms
+     */
+    assertThat(result)
+            .extracting(TraceListItem::traceId)
+            .containsExactly(
+                    SHARED_TRACE_ID
+            );
+
+    TraceListItem sharedTrace =
+            result.getFirst();
+
+    assertThat(sharedTrace.spanCount())
+            .isEqualTo(2);
+
+    assertThat(sharedTrace.serviceCount())
+            .isEqualTo(2);
+
+    assertThat(
+            sharedTrace.longestSpanDurationNano()
+    ).isEqualTo(10_000_000L);
+  }
+
   private void insertProjectATraces() {
     insertSpan(
             tenantAId,

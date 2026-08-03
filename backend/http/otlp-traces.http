@@ -1069,3 +1069,18 @@ Authorization: Bearer {{apiKey}}
 GET {{baseUrl}}/api/v1/traces?from=2026-08-03T06:00:00Z&to=2026-08-03T07:00:00Z&limit=1&serviceName=other-service&errorOnly=true&cursor=MnwxNzg1NzM5MjYwfDB8MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjJ8ZVN1RkY5S053MW1KaGdkcjRIUXhMMzlyam5DUjFPbWtyb19nVHVWUFlJdw
 Accept: application/json
 Authorization: Bearer {{apiKey}}
+
+### 10ms 이상 Span 포함 Trace
+GET {{baseUrl}}/api/v1/traces?from=2026-08-03T06:00:00Z&to=2026-08-03T07:00:00Z&serviceName=duration-test-service&errorOnly=true&minSpanDurationNano=10000000
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### Duration 필터 첫 페이지
+GET {{baseUrl}}/api/v1/traces?from=2026-08-03T06:00:00Z&to=2026-08-03T07:00:00Z&limit=1&serviceName=duration-test-service&errorOnly=true&minSpanDurationNano=5000000
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### Cursor 발급 후 duration 조건 변경
+GET {{baseUrl}}/api/v1/traces?from=2026-08-03T06:00:00Z&to=2026-08-03T07:00:00Z&limit=1&serviceName=duration-test-service&errorOnly=true&minSpanDurationNano=10000000&cursor=MnwxNzg1NzM5ODYwfDB8NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDR8TlFYcjd4RWdqdWJYQmxWSDVITDZIUFJFM21fdlhON1NndjdvRU5uTjQ5MA
+Accept: application/json
+Authorization: Bearer {{apiKey}}

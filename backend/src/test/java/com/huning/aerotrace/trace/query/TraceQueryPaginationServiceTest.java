@@ -474,6 +474,90 @@ class TraceQueryPaginationServiceTest {
     verifyNoInteractions(repository);
   }
 
+  @Test
+  void passesMinimumSpanDurationFilter() {
+    TraceListItem item =
+            item(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "2026-08-02T10:00:00Z"
+            );
+
+    when(
+            authenticatedProject.tenantId()
+    ).thenReturn(TENANT_ID);
+
+    when(
+            authenticatedProject.projectId()
+    ).thenReturn(PROJECT_ID);
+
+    when(
+            repository.findTraceList(
+                    TENANT_ID,
+                    PROJECT_ID,
+                    FROM,
+                    TO,
+                    null,
+                    "orders-service",
+                    true,
+                    10_000_000L,
+                    3
+            )
+    ).thenReturn(
+            List.of(item)
+    );
+
+    TraceListPage page =
+            service.findTracePage(
+                    authenticatedProject,
+                    FROM,
+                    TO,
+                    null,
+                    "orders-service",
+                    true,
+                    10_000_000L,
+                    2
+            );
+
+    assertThat(page.items())
+            .containsExactly(item);
+
+    verify(repository).findTraceList(
+            TENANT_ID,
+            PROJECT_ID,
+            FROM,
+            TO,
+            null,
+            "orders-service",
+            true,
+            10_000_000L,
+            3
+    );
+  }
+
+  @Test
+  void rejectsNegativeMinimumSpanDuration() {
+    assertThatThrownBy(
+            () -> service.findTracePage(
+                    authenticatedProject,
+                    FROM,
+                    TO,
+                    null,
+                    null,
+                    false,
+                    -1L,
+                    50
+            )
+    )
+            .isInstanceOf(
+                    IllegalArgumentException.class
+            )
+            .hasMessage(
+                    "minSpanDurationNano must not be negative"
+            );
+
+    verifyNoInteractions(repository);
+  }
+
   private static TraceListItem item(
           String traceId,
           String traceStartTime

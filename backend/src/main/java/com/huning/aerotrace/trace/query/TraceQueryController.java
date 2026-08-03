@@ -78,6 +78,9 @@ public class TraceQueryController {
           @RequestParam(
                   defaultValue = "false"
           ) String errorOnly,
+          @RequestParam(
+                  required = false
+          ) String minSpanDurationNano,
           HttpServletRequest request
   ) {
     AuthenticatedProject authenticatedProject =
@@ -105,6 +108,12 @@ public class TraceQueryController {
                     "errorOnly"
             );
 
+    Long parsedMinSpanDurationNano =
+            parseOptionalNonNegativeLong(
+                    minSpanDurationNano,
+                    "minSpanDurationNano"
+            );
+
     TraceListCursor parsedCursor =
             cursor == null
                     ? null
@@ -114,10 +123,19 @@ public class TraceQueryController {
 
     TraceListPage page;
 
-    /*
-     * 기존 mock 기반 테스트와 호출 계약을 유지한다.
-     */
-    if (!parsedErrorOnly && serviceName == null) {
+    if (parsedMinSpanDurationNano != null) {
+      page =
+              traceQueryService.findTracePage(
+                      authenticatedProject,
+                      parsedFrom,
+                      parsedTo,
+                      parsedCursor,
+                      serviceName,
+                      parsedErrorOnly,
+                      parsedMinSpanDurationNano,
+                      parsedLimit
+              );
+    } else if (!parsedErrorOnly && serviceName == null) {
       page =
               traceQueryService.findTracePage(
                       authenticatedProject,
@@ -266,5 +284,48 @@ public class TraceQueryController {
             parameterName
                     + " must be true or false"
     );
+  }
+
+  private static Long parseOptionalNonNegativeLong(
+          String value,
+          String parameterName
+  ) {
+    if (value == null) {
+      return null;
+    }
+
+    String normalized =
+            value.strip();
+
+    if (normalized.isEmpty()) {
+      throw new IllegalArgumentException(
+              parameterName
+                      + " must not be blank"
+      );
+    }
+
+    long parsedValue;
+
+    try {
+      parsedValue =
+              Long.parseLong(normalized);
+    } catch (
+            NumberFormatException exception
+    ) {
+      throw new IllegalArgumentException(
+              parameterName
+                      + " must be an integer",
+              exception
+      );
+    }
+
+    if (parsedValue < 0) {
+      throw new IllegalArgumentException(
+              parameterName
+                      + " must not be negative"
+      );
+    }
+
+    return parsedValue;
   }
 }

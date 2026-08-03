@@ -17,6 +17,12 @@ public final class TraceListQueryFingerprint {
   private TraceListQueryFingerprint() {
   }
 
+  /*
+   * 기존 호출과 기존 cursor의 호환을 유지한다.
+   *
+   * minSpanDurationNano가 없으면 기존과 동일한
+   * canonical query를 사용한다.
+   */
   public static String create(
           UUID tenantId,
           UUID projectId,
@@ -24,6 +30,26 @@ public final class TraceListQueryFingerprint {
           Instant to,
           String serviceName,
           boolean errorOnly
+  ) {
+    return create(
+            tenantId,
+            projectId,
+            from,
+            to,
+            serviceName,
+            errorOnly,
+            null
+    );
+  }
+
+  public static String create(
+          UUID tenantId,
+          UUID projectId,
+          Instant from,
+          Instant to,
+          String serviceName,
+          boolean errorOnly,
+          Long minSpanDurationNano
   ) {
     Objects.requireNonNull(
             tenantId,
@@ -45,6 +71,15 @@ public final class TraceListQueryFingerprint {
             "to must not be null"
     );
 
+    if (
+            minSpanDurationNano != null
+                    && minSpanDurationNano < 0
+    ) {
+      throw new IllegalArgumentException(
+              "minSpanDurationNano must not be negative"
+      );
+    }
+
     String encodedServiceName =
             serviceName == null
                     ? "-"
@@ -54,12 +89,6 @@ public final class TraceListQueryFingerprint {
                     )
             );
 
-    /*
-     * 각 시간은 epochSecond와 nano를 분리해
-     * Instant의 나노초 정밀도를 보존한다.
-     *
-     * serviceName은 Base64로 변환해 구분자 충돌을 막는다.
-     */
     String canonicalQuery =
             String.join(
                     "\n",
@@ -78,6 +107,17 @@ public final class TraceListQueryFingerprint {
                     "errorOnly="
                             + errorOnly
             );
+
+    /*
+     * duration 필터가 없을 때는 기존 fingerprint와
+     * 동일한 값을 유지한다.
+     */
+    if (minSpanDurationNano != null) {
+      canonicalQuery =
+              canonicalQuery
+                      + "\nminSpanDurationNano="
+                      + minSpanDurationNano;
+    }
 
     byte[] digest =
             sha256(
@@ -104,10 +144,6 @@ public final class TraceListQueryFingerprint {
     } catch (
             NoSuchAlgorithmException exception
     ) {
-      /*
-       * SHA-256은 Java 표준 구현에서 필수 알고리즘이다.
-       * 발생한다면 실행 환경 자체의 심각한 구성 오류다.
-       */
       throw new IllegalStateException(
               "SHA-256 is not available",
               exception

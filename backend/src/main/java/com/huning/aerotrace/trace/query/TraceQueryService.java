@@ -66,6 +66,7 @@ public class TraceQueryService {
             cursor,
             null,
             false,
+            null,
             limit
     );
   }
@@ -85,6 +86,7 @@ public class TraceQueryService {
             cursor,
             serviceName,
             false,
+            null,
             limit
     );
   }
@@ -105,6 +107,29 @@ public class TraceQueryService {
             cursor,
             serviceName,
             errorOnly,
+            null,
+            limit
+    );
+  }
+
+  public TraceListPage findTracePage(
+          AuthenticatedProject authenticatedProject,
+          Instant from,
+          Instant to,
+          TraceListCursor cursor,
+          String serviceName,
+          boolean errorOnly,
+          Long minSpanDurationNano,
+          int limit
+  ) {
+    return findTracePageInternal(
+            authenticatedProject,
+            from,
+            to,
+            cursor,
+            serviceName,
+            errorOnly,
+            minSpanDurationNano,
             limit
     );
   }
@@ -116,6 +141,7 @@ public class TraceQueryService {
           TraceListCursor cursor,
           String serviceName,
           boolean errorOnly,
+          Long minSpanDurationNano,
           int limit
   ) {
     validateQuery(
@@ -127,6 +153,11 @@ public class TraceQueryService {
 
     String normalizedServiceName =
             normalizeServiceName(serviceName);
+
+    Long normalizedMinSpanDurationNano =
+            normalizeMinSpanDurationNano(
+                    minSpanDurationNano
+            );
 
     /*
      * Cursor 시간은 fingerprint 계산 전에 검증한다.
@@ -147,7 +178,8 @@ public class TraceQueryService {
                     from,
                     to,
                     normalizedServiceName,
-                    errorOnly
+                    errorOnly,
+                    normalizedMinSpanDurationNano
             );
 
     validateCursorQueryFingerprint(
@@ -163,7 +195,20 @@ public class TraceQueryService {
 
     List<TraceListItem> fetchedItems;
 
-    if (errorOnly) {
+    if (normalizedMinSpanDurationNano != null) {
+      fetchedItems =
+              repository.findTraceList(
+                      authenticatedProject.tenantId(),
+                      authenticatedProject.projectId(),
+                      from,
+                      to,
+                      cursor,
+                      normalizedServiceName,
+                      errorOnly,
+                      normalizedMinSpanDurationNano,
+                      internalLimit
+              );
+    } else if (errorOnly) {
       fetchedItems =
               repository.findTraceList(
                       authenticatedProject.tenantId(),
@@ -277,6 +322,22 @@ public class TraceQueryService {
     }
 
     return normalized;
+  }
+
+  private static Long normalizeMinSpanDurationNano(
+          Long minSpanDurationNano
+  ) {
+    if (minSpanDurationNano == null) {
+      return null;
+    }
+
+    if (minSpanDurationNano < 0) {
+      throw new IllegalArgumentException(
+              "minSpanDurationNano must not be negative"
+      );
+    }
+
+    return minSpanDurationNano;
   }
 
   private static void validateCursorTimeRange(
