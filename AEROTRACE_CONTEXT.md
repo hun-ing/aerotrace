@@ -370,8 +370,7 @@ Batch 저장: 약 3,283~3,365 spans/sec
 * 기능을 독립적으로 실행하고 검증할 수 있는 작은 단계로 구현한다.
 * 보안, 멀티테넌시, 데이터 유실, 중복 저장 문제를 우선적으로 검토한다.
 
-
-# AEROTRACE_CONTEXT.md 추가 내용
+---
 
 ## 현재 Phase
 
@@ -483,4 +482,3 @@ Phase 5 — OpenTelemetry Collector 장애 복구와 데이터 유실 방지
 4. 이후 TimescaleDB retention과 compression 단계로 이동
 
 ---
-

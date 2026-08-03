@@ -1240,3 +1240,97 @@ Columnstore 전환 전후 크기는 조회했지만 정확한 byte 값은 대화
 * Columnstore 정책 실패 시 운영 경보
 * 장시간 정책 미실행 시 저장 공간 영향
 * Retention 정책과 Columnstore 정책의 연계 동작
+
+---
+
+## 2026-08-03 — TimescaleDB Retention 실제 삭제 검증
+
+### 목적
+
+`start_time` 기준 30일 보존 정책이 만료된 chunk만 삭제하고, 보존기간 내 데이터는 유지하는지 검증한다.
+
+### 환경과 정책
+
+* TimescaleDB: 2.28.3
+* Hypertable: `public.spans`
+* Partition column: `start_time`
+* Chunk interval: 1일
+* Columnstore 전환 기준: 2일
+* Retention 기준: 30일
+* Retention 실행 주기: 1일
+
+### 검증 데이터
+
+* 35일 전 Span: retention 삭제 대상
+* 4일 전 Span: columnstore 상태의 보존 대상
+* 현재 시각 Span: rowstore 상태의 보존 대상
+
+### 안전 검증
+
+Retention은 개별 행이 아닌 chunk 전체를 제거하므로 정책 실행 전에 다음을 확인했다.
+
+* 35일 전 테스트 Span이 별도 chunk에 저장됨
+* 대상 chunk에 테스트 Span만 존재함
+* 대상 chunk의 테스트 외 행 수가 0임
+* `show_chunks(... older_than => INTERVAL '30 days')` 결과가 테스트 chunk 하나뿐임
+* 다른 30일 초과 chunk가 삭제 후보에 포함되지 않음
+
+### 실행 절차
+
+1. Columnstore와 retention background job 일시 중지
+2. 35일 전 테스트 Span 한 개 전송
+3. 테스트 Span의 물리 chunk 확인
+4. 삭제 대상 chunk의 전체 행과 테스트 외 행 확인
+5. 삭제 대상 전체 chunk 미리 보기
+6. 보존 대상 데이터 수량 저장
+7. Retention job 수동 실행
+8. 정책 실행 성공 여부 확인
+9. 삭제 전후 데이터 수량 비교
+10. 두 background job 자동 실행 재활성화
+
+### 결과
+
+* Retention job 수동 실행 성공
+* 35일 전 테스트 Span 삭제 확인
+* 삭제 대상 chunk 제거 확인
+* 4일 전 columnstore Span 보존 확인
+* 현재 시각의 최근 Span 보존 확인
+* 전체 감소 행 수가 삭제 대상 테스트 행 수와 일치
+* 30일 초과 삭제 후보 chunk가 남지 않음
+* Columnstore 정책 자동 실행 복구
+* Retention 정책 자동 실행 복구
+
+### 확인된 수명주기
+
+```text
+0일 이상 2일 미만
+→ rowstore
+→ 최근 수집과 장애 분석
+
+2일 이상 30일 미만
+→ columnstore
+→ 장기 조회와 저장 공간 절감
+
+30일 이상
+→ retention 정책
+→ chunk 단위 삭제
+```
+
+### 중요한 운영 특성
+
+* Retention은 `ingested_at`이 아니라 `start_time` 기준으로 동작한다.
+* 늦게 도착한 오래된 Span은 저장 직후 다음 retention 실행 대상이 될 수 있다.
+* Retention은 행 단위 `DELETE`가 아니라 chunk 단위 제거다.
+* 하나의 오래된 chunk에 여러 Tenant 데이터가 있으면 함께 제거된다.
+* 현재 공유 hypertable 구조에서는 전역 보존기간이 적용된다.
+
+### 미측정 항목
+
+* 대량 데이터에서 columnstore 압축률
+* Columnstore 전환 전후 조회 속도
+* Retention 실행 시간
+* Retention 실행 중 CPU와 디스크 I/O
+* 실제 운영 환경의 일일 저장 증가량
+* 30일 보관에 필요한 예상 디스크 크기
+
+이 값들은 운영과 유사한 데이터가 쌓인 뒤 재측정한다.

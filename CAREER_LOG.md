@@ -432,3 +432,116 @@ Collector queue, Backend 응답, retry, 중복, 데이터 유실은
 * Collector 재시도에서 중복 Span이 발생할 가능성은 어떻게 처리했는가?
 * 왜 Kafka를 사용하지 않았는가?
 * Batch size 500이 더 빠른 결과가 있었는데 왜 1000을 선택했는가?
+
+---
+
+## 현재 Phase
+
+Phase 7 — Trace 조회 API
+
+## 최근 완료
+
+### TimescaleDB 데이터 수명 관리
+
+* `spans` hypertable chunk interval 1일 확인
+* Hypercore columnstore 활성화
+* `tenant_id, project_id` 기준 segment 설정
+* `start_time DESC` 정렬 설정
+* 2일 초과 chunk 자동 columnstore 전환 정책
+* 30일 초과 chunk 자동 retention 정책
+* Columnstore 정책 수동 실행 검증
+* 전환 후 과거 Span 조회 검증
+* 최근 Span rowstore 저장 검증
+* 35일 전 테스트 chunk 삭제 검증
+* 4일 전과 최근 데이터 보존 검증
+* 두 background job 자동 스케줄 복구
+
+## 현재 데이터 수명주기
+
+```text
+0~2일
+→ rowstore
+
+2~30일
+→ columnstore
+
+30일 초과
+→ retention 삭제
+```
+
+## 검증이 필요한 항목
+
+* 운영 데이터 기반 columnstore 압축률
+* 조회 성능 전후 비교
+* 일일 DB 증가량
+* 30일 예상 저장 용량
+* background job 실패 감시
+* Tenant별 보존기간 요구사항
+
+## 현재 기술 부채
+
+* Tenant별 retention 미지원
+* Retention과 columnstore job 실패 알림 없음
+* 운영 환경의 디스크 용량 산정 미완료
+* 조회 API 미구현
+* Trace 상세 화면 미구현
+* Prometheus/Grafana 미연동
+
+## 다음 작업
+
+1. Trace 목록 조회 요구사항과 SQL 정의
+2. 현재 인덱스가 조회 패턴을 지원하는지 확인
+3. 인증된 Project 범위의 Trace 목록 Repository 구현
+4. 최소 Trace 목록 API 구현
+5. Trace ID 기반 상세 조회 구현
+
+# CAREER_LOG.md 추가
+
+## Portfolio Checkpoint — Telemetry 데이터 수명주기
+
+### 직접 경험한 내용
+
+* TimescaleDB hypertable의 chunk interval과 partition column 확인
+* 최신 Hypercore columnstore 설정 적용
+* 최근 데이터와 과거 데이터의 저장 방식을 분리
+* Background job을 중지하고 수동 실행하는 검증 절차 수행
+* Retention 실행 전에 실제 삭제 대상 chunk를 미리 확인
+* Chunk 전체 삭제가 다른 데이터에 미치는 위험 검토
+* 삭제 대상과 보존 대상 데이터를 함께 두고 정합성 검증
+* 정책 검증 후 자동 스케줄 복구
+
+### 포트폴리오에서 평가받을 부분
+
+* 단순히 retention 설정만 추가하지 않고 실제 삭제 시나리오를 검증함
+* Chunk 단위 삭제의 데이터 유실 위험을 사전 검사함
+* Rowstore, columnstore, retention을 하나의 수명주기로 설계함
+* 제한된 저장 장비를 고려해 무기한 저장을 방지함
+* 아직 측정하지 않은 압축률과 성능 수치를 만들어내지 않음
+
+### 보존할 증거
+
+* Columnstore 전환 전후 `is_compressed` 결과
+* Columnstore job 성공 결과
+* 전환 후 과거 Span 조회 결과
+* 최근 Span rowstore 확인 결과
+* Retention 삭제 후보 `show_chunks` 결과
+* 대상 chunk의 `non_test_rows = 0` 결과
+* 삭제 전후 비교 Boolean 결과
+* 35일 전 Span 삭제 결과
+* 4일 전과 최근 Span 보존 결과
+* 두 정책의 `scheduled = true` 복구 결과
+
+### 이력서 문장 초안
+
+* 제한된 저장 자원에서 telemetry의 무기한 증가를 방지하기 위해 TimescaleDB rowstore·columnstore·retention 수명주기를 설계하고, 최근 2일은 rowstore, 2~30일은 columnstore, 30일 초과 데이터는 chunk 단위로 제거하도록 구성
+
+* Retention 정책 적용 과정에서 다른 데이터의 의도치 않은 삭제를 방지하기 위해 대상 chunk의 비테스트 행과 전체 삭제 후보를 사전 검사하고, 35일 전 데이터만 삭제되며 4일 전 및 최근 데이터는 보존되는 장애 시나리오를 검증
+
+### 예상 면접 질문
+
+* TimescaleDB retention이 행 단위 DELETE보다 유리한 이유는 무엇인가?
+* `start_time`과 `ingested_at` 중 어떤 값을 retention 기준으로 사용했는가?
+* 늦게 도착한 Span은 retention 정책에서 어떻게 처리되는가?
+* Tenant별 보존기간을 현재 공유 hypertable에서 구현하기 어려운 이유는 무엇인가?
+* Columnstore 전환 기준을 2일로 선택한 근거는 무엇인가?
+* Retention job 실행 전 어떤 안전 검사를 수행했는가?
