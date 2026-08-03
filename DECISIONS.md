@@ -994,3 +994,72 @@ Fingerprint에는 다음 조건을 포함한다.
 MVP에서는 Keyset Pagination과 원본 Span 집계를 유지한다.
 
 새로운 인덱스, Trace summary 테이블, Continuous Aggregate는 추측으로 추가하지 않고 실제 쿼리 측정 결과를 근거로 검토한다.
+
+---
+
+## Trace 목록 조회 SQL 최적화 전략
+
+### 해결하려는 문제
+
+Trace 목록 API는 raw Span을 `trace_id`로 집계한 뒤 서비스, 오류 여부, 최대 Span duration 조건을 적용한다.
+
+이 구조는 정확한 Trace 집계값을 제공하지만, 결과가 50개뿐이어도 조회 시간 범위의 Span을 모두 읽고 Trace 전체를 집계한다.
+
+### 검토한 대안
+
+1. 현재 raw Span 전체 집계 방식 유지
+2. duration 조건에 맞는 Trace ID를 먼저 찾은 뒤 후보 Trace만 다시 집계
+3. duration 임계값에 따라 두 SQL을 애플리케이션에서 선택
+4. Trace 단위 Summary 테이블 도입
+
+### 측정 조건
+
+* TimescaleDB 2.28.3
+* PostgreSQL 15.18
+* 20,000 Trace
+* 109,998 Span
+* Trace당 3~8 Span
+* warm-cache 로컬 Docker 환경
+
+### 측정 결과
+
+후보 Trace 비율에 따른 후보 우선 방식의 중앙 실행시간:
+
+* 후보 1%, 200 Trace: 19.819ms
+* 후보 5%, 1,000 Trace: 34.795ms
+* 후보 100%, 20,000 Trace: 345.467ms
+
+동일한 100% 후보 조건의 기존 전체 집계 방식은 98.048ms였다.
+
+후보 우선 방식은 후보가 적을 때 유리했지만, 모든 Trace가 후보가 되면 기존 방식보다 약 3.52배 느렸으며 Buffer hit도 약 12배 증가했다.
+
+### 선택한 방식
+
+MVP에서는 현재 raw Span 전체 집계 SQL을 유지한다.
+
+duration 파라미터의 고정값만으로 후보 선택도를 판단할 수 없으므로, 애플리케이션에서 후보 우선 SQL로 분기하지 않는다.
+
+후보 우선 SQL을 위해 새로운 duration 인덱스도 추가하지 않는다.
+
+### 선택 이유
+
+* 현재 SQL은 모든 필터 조합에서 정확하게 동작한다.
+* 현재 측정 규모에서는 반복 실행시간이 대체로 90~110ms 범위다.
+* 후보 우선 방식은 데이터 분포에 따라 20ms에서 345ms까지 성능 편차가 크다.
+* 프로젝트마다 duration 분포가 다르므로 고정 임계값 기반 분기는 안전하지 않다.
+* 추가 인덱스는 telemetry 저장 비용과 저장 공간을 증가시킨다.
+
+### 단점과 위험
+
+* 데이터가 증가하면 조회 시간이 raw Span 수에 비례해 증가할 수 있다.
+* LIMIT과 Cursor가 raw Span 집계량을 줄이지 못한다.
+* 집계 후 필터의 선택도에 대한 PostgreSQL Planner 예상이 부정확하다.
+
+### 재검토 조건
+
+다음 조건이 확인되면 Trace Summary 또는 동적 조회 전략을 재검토한다.
+
+* 실제 사용자 데이터에서 Trace 목록 지연시간이 제품 목표를 지속적으로 초과
+* 30일 조회 범위의 Span 수 증가로 CPU 또는 DB connection 사용량이 문제가 됨
+* 목록 조회 트래픽이 telemetry 저장 성능에 영향을 줌
+* raw Span 집계 비용이 홈서버 또는 Oracle Cloud 운영 한계를 초과
