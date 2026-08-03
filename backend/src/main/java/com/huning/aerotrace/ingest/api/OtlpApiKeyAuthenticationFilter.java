@@ -101,6 +101,10 @@ public class OtlpApiKeyAuthenticationFilter extends OncePerRequestFilter {
     String contextPath =
             request.getContextPath();
 
+    String traceApiPath =
+            contextPath
+                    + TRACE_QUERY_PATH;
+
     boolean isOtlpTraceIngest =
             HttpMethod.POST.matches(
                     request.getMethod()
@@ -110,17 +114,19 @@ public class OtlpApiKeyAuthenticationFilter extends OncePerRequestFilter {
                             + OTLP_TRACES_PATH
             ).equals(requestPath);
 
-    boolean isTraceListQuery =
+    boolean isTraceQuery =
             HttpMethod.GET.matches(
                     request.getMethod()
             )
                     && (
-                    contextPath
-                            + TRACE_QUERY_PATH
-            ).equals(requestPath);
+                    traceApiPath.equals(requestPath)
+                            || requestPath.startsWith(
+                            traceApiPath + "/"
+                    )
+            );
 
     return !isOtlpTraceIngest
-            && !isTraceListQuery;
+            && !isTraceQuery;
   }
 
   @Override

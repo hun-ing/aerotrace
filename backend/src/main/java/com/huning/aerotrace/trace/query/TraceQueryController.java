@@ -1,12 +1,14 @@
 package com.huning.aerotrace.trace.query;
 
-import com.huning.aerotrace.auth.application.AuthenticatedProject;
+import com.huning.aerotrace.auth.application
+        .AuthenticatedProject;
 import com.huning.aerotrace.ingest.api
         .AuthenticatedProjectRequestResolver;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.CacheControl;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -26,11 +28,16 @@ public class TraceQueryController {
 
   private final TraceQueryService traceQueryService;
 
+  private final TraceDetailQueryService
+          traceDetailQueryService;
+
   private final AuthenticatedProjectRequestResolver
           authenticatedProjectRequestResolver;
 
   public TraceQueryController(
           TraceQueryService traceQueryService,
+          TraceDetailQueryService
+                  traceDetailQueryService,
           AuthenticatedProjectRequestResolver
                   authenticatedProjectRequestResolver
   ) {
@@ -38,6 +45,13 @@ public class TraceQueryController {
             Objects.requireNonNull(
                     traceQueryService,
                     "traceQueryService must not be null"
+            );
+
+    this.traceDetailQueryService =
+            Objects.requireNonNull(
+                    traceDetailQueryService,
+                    "traceDetailQueryService "
+                            + "must not be null"
             );
 
     this.authenticatedProjectRequestResolver =
@@ -90,6 +104,34 @@ public class TraceQueryController {
             )
             .body(
                     TraceListResponse.from(items)
+            );
+  }
+
+  @GetMapping("/{traceId}")
+  public ResponseEntity<TraceDetailResponse>
+  findTraceDetail(
+          @PathVariable String traceId,
+          HttpServletRequest request
+  ) {
+    AuthenticatedProject authenticatedProject =
+            authenticatedProjectRequestResolver
+                    .resolve(request);
+
+    List<TraceSpanDetail> spans =
+            traceDetailQueryService.findTraceSpans(
+                    authenticatedProject,
+                    traceId
+            );
+
+    return ResponseEntity.ok()
+            .cacheControl(
+                    CacheControl.noStore()
+            )
+            .body(
+                    TraceDetailResponse.from(
+                            traceId,
+                            spans
+                    )
             );
   }
 

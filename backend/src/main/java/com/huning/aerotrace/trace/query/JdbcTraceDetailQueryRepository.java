@@ -17,6 +17,9 @@ public class JdbcTraceDetailQueryRepository {
 
   public static final int MAX_SPAN_LIMIT = 5_000;
 
+  static final int QUERY_LIMIT_WITH_OVERFLOW_DETECTION =
+          MAX_SPAN_LIMIT + 1;
+
   private static final Pattern TRACE_ID_PATTERN =
           Pattern.compile("^[0-9a-f]{32}$");
 
@@ -167,11 +170,12 @@ public class JdbcTraceDetailQueryRepository {
 
     if (
             limit < 1
-                    || limit > MAX_SPAN_LIMIT
+                    || limit
+                    > QUERY_LIMIT_WITH_OVERFLOW_DETECTION
     ) {
       throw new IllegalArgumentException(
               "limit must be between 1 and "
-                      + MAX_SPAN_LIMIT
+                      + QUERY_LIMIT_WITH_OVERFLOW_DETECTION
       );
     }
   }
