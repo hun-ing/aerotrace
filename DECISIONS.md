@@ -737,3 +737,51 @@ sending_queue:
 * 허용할 DB 장애 지속시간 정의
 * queue 사용률 경보 설계
 * overflow 실험 완료
+
+---
+
+## 최근 2일은 Rowstore, 이후 데이터는 Columnstore로 유지
+
+### 해결하려는 문제
+
+APM telemetry는 최근 데이터에 쓰기와 장애 분석 요청이 집중되지만, 시간이 지난 데이터는 주로 장기 분석과 통계 조회에 사용된다.
+
+모든 데이터를 rowstore로 유지하면 장기 저장 비용이 증가하고, 모든 데이터를 즉시 columnstore로 전환하면 최근 데이터 쓰기와 수정에 불필요한 제약이 생길 수 있다.
+
+### 검토한 대안
+
+1. 모든 데이터를 rowstore로 유지
+2. 수집 직후 바로 columnstore로 전환
+3. 일정 기간 rowstore에 유지한 뒤 자동 columnstore 전환
+
+### 선택한 방식
+
+* Chunk interval: 1일
+* 최근 rowstore 기간: 약 2일
+* 2일보다 오래된 완성 chunk: 자동 columnstore 전환
+* Segment 기준: `tenant_id, project_id`
+* 정렬 기준: `start_time DESC`
+
+### 선택 이유
+
+* 최근 장애 분석 데이터는 rowstore에 유지
+* 쓰기 진행 중인 현재 chunk를 전환 대상에서 제외
+* 과거 telemetry의 저장 비용 절감 가능
+* Tenant와 Project 범위 조회에 맞는 segment 구성
+* 실제 정책 실행을 통해 rowstore에서 columnstore로 전환되는 동작 확인
+* 전환 후에도 기존 hypertable 조회가 유지됨을 확인
+
+### 단점과 위험
+
+* 2일이라는 기준은 아직 운영 부하를 바탕으로 산정된 값이 아님
+* 작은 chunk에서는 columnstore 전환 후 저장 크기가 줄지 않을 수 있음
+* 잘못된 `start_time`을 가진 telemetry가 예상과 다른 chunk에 저장될 수 있음
+* 정책 실패를 감지할 Prometheus 경보가 아직 없음
+
+### 재검토 조건
+
+* 실제 사용자 서비스의 최근 Trace 조회 범위 측정
+* 운영 환경의 Span 유입량 측정
+* 대량 데이터 압축률 측정
+* 최근 데이터 조회가 columnstore 경계를 자주 넘는 경우
+* Columnstore 정책 실행 시간이 운영 부하에 영향을 주는 경우

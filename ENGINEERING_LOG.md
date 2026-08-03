@@ -1166,3 +1166,77 @@ connect: connection refused
 * retention과 compression
 * 운영 알림
 * Prometheus/Grafana 연동
+
+---
+
+## 2026-08-03 — TimescaleDB Columnstore 정책 검증
+
+### 목적
+
+최근 telemetry는 쓰기 성능이 유리한 rowstore에 유지하고, 오래된 telemetry는 columnstore로 자동 전환되는지 검증한다.
+
+### 환경
+
+* TimescaleDB: 2.28.3
+* Hypertable: `public.spans`
+* Partition column: `start_time`
+* Chunk interval: 1일
+* Columnstore 전환 기준: 2일
+* Segment 기준: `tenant_id, project_id`
+* 정렬 기준: `start_time DESC`
+
+### 검증 절차
+
+1. Columnstore 자동 정책을 일시 중지
+2. 현재 시각보다 4일 전인 테스트 Span 전송
+3. 테스트 Span이 과거 1일 chunk에 저장됐는지 확인
+4. 정책 실행 전 `is_compressed = false` 확인
+5. `run_job`으로 columnstore 정책 수동 실행
+6. 정책 실행 성공 여부 확인
+7. 대상 chunk가 `is_compressed = true`로 변경됐는지 확인
+8. 전환된 Span이 기존 hypertable 조회로 계속 검색되는지 확인
+9. 현재 시각의 최근 Span 신규 전송
+10. 최근 Span이 rowstore chunk에 저장되는지 확인
+11. 자동 정책 스케줄 재활성화
+
+### 결과
+
+* 4일 전 테스트 Span 저장 성공
+* 대상 과거 chunk의 전환 전 상태: rowstore
+* Columnstore 정책 수동 실행 성공
+* 대상 과거 chunk의 전환 후 상태: columnstore
+* Columnstore 전환 후 테스트 Span 조회 성공
+* 최근 Span 신규 저장 성공
+* 최근 Span이 저장된 chunk는 rowstore 상태 유지
+* Columnstore 정책 자동 스케줄 재활성화 완료
+
+### 저장 크기 측정
+
+Columnstore 전환 전후 크기는 조회했지만 정확한 byte 값은 대화 기록에 남기지 않았다.
+
+이번 실험은 Span 1개가 들어 있는 작은 chunk를 사용했으므로 압축률 평가가 아니라 정책 동작과 데이터 조회 정합성 검증을 목적으로 한다.
+
+실제 압축률은 운영 환경과 유사한 대량 telemetry를 적재한 뒤 다시 측정한다.
+
+### 확인된 데이터 흐름
+
+```text
+최근 Span
+→ 현재 1일 chunk
+→ rowstore
+
+2일보다 오래된 완성 chunk
+→ columnstore 정책 대상
+→ columnstore 전환
+
+전환된 데이터
+→ public.spans를 통한 기존 조회 방식 유지
+```
+
+### 남은 검증
+
+* 대량 Span이 저장된 chunk의 실제 압축률
+* Columnstore 전환 전후 조회 성능
+* Columnstore 정책 실패 시 운영 경보
+* 장시간 정책 미실행 시 저장 공간 영향
+* Retention 정책과 Columnstore 정책의 연계 동작
