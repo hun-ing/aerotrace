@@ -114,14 +114,24 @@ class TraceQueryPaginationServiceTest {
     assertThat(page.hasNext())
             .isTrue();
 
+    String expectedFingerprint =
+            TraceListQueryFingerprint.create(
+                    TENANT_ID,
+                    PROJECT_ID,
+                    FROM,
+                    TO,
+                    null,
+                    false
+            );
+
     assertThat(page.nextCursor())
             .isEqualTo(
                     new TraceListCursor(
                             second.traceStartTime(),
-                            second.traceId()
+                            second.traceId(),
+                            expectedFingerprint
                     )
             );
-
     verify(repository).findTraceList(
             TENANT_ID,
             PROJECT_ID,
@@ -134,12 +144,23 @@ class TraceQueryPaginationServiceTest {
 
   @Test
   void returnsNullCursorForLastPage() {
+    String queryFingerprint =
+            TraceListQueryFingerprint.create(
+                    TENANT_ID,
+                    PROJECT_ID,
+                    FROM,
+                    TO,
+                    null,
+                    false
+            );
+
     TraceListCursor cursor =
             new TraceListCursor(
                     Instant.parse(
                             "2026-08-02T11:00:00Z"
                     ),
-                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    queryFingerprint
             );
 
     TraceListItem finalItem =
@@ -352,6 +373,105 @@ class TraceQueryPaginationServiceTest {
             true,
             3
     );
+  }
+
+  @Test
+  void rejectsCursorCreatedForDifferentServiceFilter() {
+    String previousQueryFingerprint =
+            TraceListQueryFingerprint.create(
+                    TENANT_ID,
+                    PROJECT_ID,
+                    FROM,
+                    TO,
+                    "orders-service",
+                    false
+            );
+
+    TraceListCursor cursor =
+            new TraceListCursor(
+                    Instant.parse(
+                            "2026-08-02T10:00:00Z"
+                    ),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    previousQueryFingerprint
+            );
+
+    when(
+            authenticatedProject.tenantId()
+    ).thenReturn(TENANT_ID);
+
+    when(
+            authenticatedProject.projectId()
+    ).thenReturn(PROJECT_ID);
+
+    assertThatThrownBy(
+            () -> service.findTracePage(
+                    authenticatedProject,
+                    FROM,
+                    TO,
+                    cursor,
+                    "payment-service",
+                    50
+            )
+    )
+            .isInstanceOf(
+                    IllegalArgumentException.class
+            )
+            .hasMessage(
+                    "cursor does not match the current query"
+            );
+
+    verifyNoInteractions(repository);
+  }
+
+  @Test
+  void rejectsCursorCreatedForDifferentErrorFilter() {
+    String previousQueryFingerprint =
+            TraceListQueryFingerprint.create(
+                    TENANT_ID,
+                    PROJECT_ID,
+                    FROM,
+                    TO,
+                    null,
+                    false
+            );
+
+    TraceListCursor cursor =
+            new TraceListCursor(
+                    Instant.parse(
+                            "2026-08-02T10:00:00Z"
+                    ),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    previousQueryFingerprint
+            );
+
+    when(
+            authenticatedProject.tenantId()
+    ).thenReturn(TENANT_ID);
+
+    when(
+            authenticatedProject.projectId()
+    ).thenReturn(PROJECT_ID);
+
+    assertThatThrownBy(
+            () -> service.findTracePage(
+                    authenticatedProject,
+                    FROM,
+                    TO,
+                    cursor,
+                    null,
+                    true,
+                    50
+            )
+    )
+            .isInstanceOf(
+                    IllegalArgumentException.class
+            )
+            .hasMessage(
+                    "cursor does not match the current query"
+            );
+
+    verifyNoInteractions(repository);
   }
 
   private static TraceListItem item(

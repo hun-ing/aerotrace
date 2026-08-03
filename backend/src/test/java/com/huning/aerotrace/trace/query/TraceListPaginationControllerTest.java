@@ -41,6 +41,9 @@ class TraceListPaginationControllerTest {
                   "2026-08-03T06:00:00Z"
           );
 
+  private static final String QUERY_FINGERPRINT =
+          "a".repeat(43);
+
   @Mock
   private TraceQueryService traceQueryService;
 
@@ -91,7 +94,8 @@ class TraceListPaginationControllerTest {
     TraceListCursor nextCursor =
             new TraceListCursor(
                     item.traceStartTime(),
-                    item.traceId()
+                    item.traceId(),
+                    QUERY_FINGERPRINT
             );
 
     when(
@@ -165,7 +169,8 @@ class TraceListPaginationControllerTest {
                     Instant.parse(
                             "2026-08-02T10:00:00Z"
                     ),
-                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    QUERY_FINGERPRINT
             );
 
     String encodedCursor =

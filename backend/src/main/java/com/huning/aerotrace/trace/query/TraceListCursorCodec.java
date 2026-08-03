@@ -7,15 +7,19 @@ import java.util.Objects;
 
 public final class TraceListCursorCodec {
 
-  private static final String VERSION = "1";
+  /*
+   * Query fingerprint가 추가됐으므로
+   * 기존 version 1 Cursor와 구분한다.
+   */
+  private static final String VERSION = "2";
 
   private static final String DELIMITER = "|";
 
-  private static final int PAYLOAD_PART_COUNT = 4;
+  private static final int PAYLOAD_PART_COUNT = 5;
 
   private static final int MAX_ENCODED_LENGTH = 256;
 
-  private static final int MAX_DECODED_LENGTH = 128;
+  private static final int MAX_DECODED_LENGTH = 160;
 
   private static final Base64.Encoder ENCODER =
           Base64.getUrlEncoder()
@@ -35,6 +39,12 @@ public final class TraceListCursorCodec {
             "cursor must not be null"
     );
 
+    if (cursor.queryFingerprint() == null) {
+      throw new IllegalArgumentException(
+              "cursor query fingerprint is missing"
+      );
+    }
+
     String payload =
             String.join(
                     DELIMITER,
@@ -47,7 +57,8 @@ public final class TraceListCursorCodec {
                             cursor.traceStartTime()
                                     .getNano()
                     ),
-                    cursor.traceId()
+                    cursor.traceId(),
+                    cursor.queryFingerprint()
             );
 
     return ENCODER.encodeToString(
@@ -127,7 +138,8 @@ public final class TraceListCursorCodec {
 
       return new TraceListCursor(
               traceStartTime,
-              parts[3]
+              parts[3],
+              parts[4]
       );
     } catch (RuntimeException exception) {
       throw invalidCursor(exception);

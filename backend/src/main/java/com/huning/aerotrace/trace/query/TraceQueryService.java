@@ -59,37 +59,13 @@ public class TraceQueryService {
           TraceListCursor cursor,
           int limit
   ) {
-    validateQuery(
+    return findTracePageInternal(
             authenticatedProject,
             from,
             to,
-            limit
-    );
-
-    validateCursor(
             cursor,
-            from,
-            to
-    );
-
-    int internalLimit =
-            Math.addExact(
-                    limit,
-                    1
-            );
-
-    List<TraceListItem> fetchedItems =
-            repository.findTraceList(
-                    authenticatedProject.tenantId(),
-                    authenticatedProject.projectId(),
-                    from,
-                    to,
-                    cursor,
-                    internalLimit
-            );
-
-    return createPage(
-            fetchedItems,
+            null,
+            false,
             limit
     );
   }
@@ -102,51 +78,13 @@ public class TraceQueryService {
           String serviceName,
           int limit
   ) {
-    validateQuery(
+    return findTracePageInternal(
             authenticatedProject,
             from,
             to,
-            limit
-    );
-
-    validateCursor(
             cursor,
-            from,
-            to
-    );
-
-    String normalizedServiceName =
-            normalizeServiceName(serviceName);
-
-    if (normalizedServiceName == null) {
-      return findTracePage(
-              authenticatedProject,
-              from,
-              to,
-              cursor,
-              limit
-      );
-    }
-
-    int internalLimit =
-            Math.addExact(
-                    limit,
-                    1
-            );
-
-    List<TraceListItem> fetchedItems =
-            repository.findTraceList(
-                    authenticatedProject.tenantId(),
-                    authenticatedProject.projectId(),
-                    from,
-                    to,
-                    cursor,
-                    normalizedServiceName,
-                    internalLimit
-            );
-
-    return createPage(
-            fetchedItems,
+            serviceName,
+            false,
             limit
     );
   }
@@ -160,31 +98,26 @@ public class TraceQueryService {
           boolean errorOnly,
           int limit
   ) {
-    /*
-     * 기존 테스트와 호출 계약을 유지하기 위해
-     * errorOnly=false는 기존 overload로 위임한다.
-     */
-    if (!errorOnly) {
-      if (serviceName == null) {
-        return findTracePage(
-                authenticatedProject,
-                from,
-                to,
-                cursor,
-                limit
-        );
-      }
+    return findTracePageInternal(
+            authenticatedProject,
+            from,
+            to,
+            cursor,
+            serviceName,
+            errorOnly,
+            limit
+    );
+  }
 
-      return findTracePage(
-              authenticatedProject,
-              from,
-              to,
-              cursor,
-              serviceName,
-              limit
-      );
-    }
-
+  private TraceListPage findTracePageInternal(
+          AuthenticatedProject authenticatedProject,
+          Instant from,
+          Instant to,
+          TraceListCursor cursor,
+          String serviceName,
+          boolean errorOnly,
+          int limit
+  ) {
     validateQuery(
             authenticatedProject,
             from,
@@ -192,14 +125,35 @@ public class TraceQueryService {
             limit
     );
 
-    validateCursor(
+    String normalizedServiceName =
+            normalizeServiceName(serviceName);
+
+    /*
+     * Cursor 시간은 fingerprint 계산 전에 검증한다.
+     *
+     * 범위를 벗어난 Cursor는 Tenant와 Project ID를 읽거나
+     * SHA-256을 계산할 필요 없이 즉시 거부할 수 있다.
+     */
+    validateCursorTimeRange(
             cursor,
             from,
             to
     );
 
-    String normalizedServiceName =
-            normalizeServiceName(serviceName);
+    String queryFingerprint =
+            TraceListQueryFingerprint.create(
+                    authenticatedProject.tenantId(),
+                    authenticatedProject.projectId(),
+                    from,
+                    to,
+                    normalizedServiceName,
+                    errorOnly
+            );
+
+    validateCursorQueryFingerprint(
+            cursor,
+            queryFingerprint
+    );
 
     int internalLimit =
             Math.addExact(
@@ -207,27 +161,54 @@ public class TraceQueryService {
                     1
             );
 
-    List<TraceListItem> fetchedItems =
-            repository.findTraceList(
-                    authenticatedProject.tenantId(),
-                    authenticatedProject.projectId(),
-                    from,
-                    to,
-                    cursor,
-                    normalizedServiceName,
-                    true,
-                    internalLimit
-            );
+    List<TraceListItem> fetchedItems;
+
+    if (errorOnly) {
+      fetchedItems =
+              repository.findTraceList(
+                      authenticatedProject.tenantId(),
+                      authenticatedProject.projectId(),
+                      from,
+                      to,
+                      cursor,
+                      normalizedServiceName,
+                      true,
+                      internalLimit
+              );
+    } else if (normalizedServiceName != null) {
+      fetchedItems =
+              repository.findTraceList(
+                      authenticatedProject.tenantId(),
+                      authenticatedProject.projectId(),
+                      from,
+                      to,
+                      cursor,
+                      normalizedServiceName,
+                      internalLimit
+              );
+    } else {
+      fetchedItems =
+              repository.findTraceList(
+                      authenticatedProject.tenantId(),
+                      authenticatedProject.projectId(),
+                      from,
+                      to,
+                      cursor,
+                      internalLimit
+              );
+    }
 
     return createPage(
             fetchedItems,
-            limit
+            limit,
+            queryFingerprint
     );
   }
 
   private static TraceListPage createPage(
           List<TraceListItem> fetchedItems,
-          int requestedLimit
+          int requestedLimit,
+          String queryFingerprint
   ) {
     boolean hasNext =
             fetchedItems.size()
@@ -257,7 +238,8 @@ public class TraceQueryService {
               new TraceListCursor(
                       lastReturnedItem
                               .traceStartTime(),
-                      lastReturnedItem.traceId()
+                      lastReturnedItem.traceId(),
+                      queryFingerprint
               );
     }
 
@@ -297,7 +279,7 @@ public class TraceQueryService {
     return normalized;
   }
 
-  private static void validateCursor(
+  private static void validateCursorTimeRange(
           TraceListCursor cursor,
           Instant from,
           Instant to
@@ -321,6 +303,26 @@ public class TraceQueryService {
     ) {
       throw new IllegalArgumentException(
               "cursor is outside the requested time range"
+      );
+    }
+  }
+
+  private static void validateCursorQueryFingerprint(
+          TraceListCursor cursor,
+          String expectedQueryFingerprint
+  ) {
+    if (cursor == null) {
+      return;
+    }
+
+    if (
+            !Objects.equals(
+                    cursor.queryFingerprint(),
+                    expectedQueryFingerprint
+            )
+    ) {
+      throw new IllegalArgumentException(
+              "cursor does not match the current query"
       );
     }
   }

@@ -1021,7 +1021,7 @@ Accept: application/json
 Authorization: Bearer {{apiKey}}
 
 ### 서비스 필터 다음 페이지
-GET {{baseUrl}}/api/v1/traces?from=2026-07-05T00:00:00Z&to=2026-08-03T06:00:00Z&limit=1&serviceName=columnstore-policy-verification&cursor=MXwxNzg1NzI0MTgxfDY0MDkzMDAwfDg4NTI0YjM5NTNjOTRmNmI4ODFmNjQ4OWVhNzlhMmIz
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T00:00:00Z&to=2026-08-03T06:00:00Z&limit=1&serviceName=columnstore-policy-verification&cursor=MnwxNzg1NzI0MTgxfDY0MDkzMDAwfDg4NTI0YjM5NTNjOTRmNmI4ODFmNjQ4OWVhNzlhMmIzfGZWTmswQXhzY1J1NWRuRzZVMkNnd0JOUVlMcktIQnhLcDdUdHZHUDh2NlE
 Accept: application/json
 Authorization: Bearer {{apiKey}}
 
@@ -1046,6 +1046,26 @@ Accept: application/json
 Authorization: Bearer {{apiKey}}
 
 ### 오류 Trace 다음 페이지
-GET {{baseUrl}}/api/v1/traces?from=2026-07-05T06:00:00Z&to=2026-08-03T06:00:00Z&limit=1&errorOnly=true&cursor=복사한_nextCursor
+GET {{baseUrl}}/api/v1/traces?from=2026-07-05T06:00:00Z&to=2026-08-03T06:00:00Z&limit=1&errorOnly=true&cursor=MXwxNzg1NzI0MTgxfDY0MDkzMDAwfDg4NTI0YjM5NTNjOTRmNmI4ODFmNjQ4OWVhNzlhMmIz
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### Cursor fixture 첫 페이지
+GET {{baseUrl}}/api/v1/traces?from=2026-08-03T06:00:00Z&to=2026-08-03T07:00:00Z&limit=1&serviceName=cursor-test-service&errorOnly=true
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### 같은 조건의 두 번째 페이지
+GET {{baseUrl}}/api/v1/traces?from=2026-08-03T06:00:00Z&to=2026-08-03T07:00:00Z&limit=1&serviceName=cursor-test-service&errorOnly=true&cursor=MnwxNzg1NzM5MjYwfDB8MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjJ8ZVN1RkY5S053MW1KaGdkcjRIUXhMMzlyam5DUjFPbWtyb19nVHVWUFlJdw
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### Cursor 발급 후 errorOnly 변경
+GET {{baseUrl}}/api/v1/traces?from=2026-08-03T06:00:00Z&to=2026-08-03T07:00:00Z&limit=1&serviceName=cursor-test-service&errorOnly=false&cursor=MnwxNzg1NzM5MjYwfDB8MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjJ8ZVN1RkY5S053MW1KaGdkcjRIUXhMMzlyam5DUjFPbWtyb19nVHVWUFlJdw
+Accept: application/json
+Authorization: Bearer {{apiKey}}
+
+### Cursor 발급 후 serviceName 변경
+GET {{baseUrl}}/api/v1/traces?from=2026-08-03T06:00:00Z&to=2026-08-03T07:00:00Z&limit=1&serviceName=other-service&errorOnly=true&cursor=MnwxNzg1NzM5MjYwfDB8MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjJ8ZVN1RkY5S053MW1KaGdkcjRIUXhMMzlyam5DUjFPbWtyb19nVHVWUFlJdw
 Accept: application/json
 Authorization: Bearer {{apiKey}}
