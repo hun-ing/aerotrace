@@ -43,6 +43,7 @@ services:
     ports:
       - "4317:4317"
       - "4318:4318"
+      - "127.0.0.1:8888:8888"
     depends_on:
       timescaledb:
         condition: service_started
