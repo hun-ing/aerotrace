@@ -545,3 +545,132 @@ Phase 7 — Trace 조회 API
 * Tenant별 보존기간을 현재 공유 hypertable에서 구현하기 어려운 이유는 무엇인가?
 * Columnstore 전환 기준을 2일로 선택한 근거는 무엇인가?
 * Retention job 실행 전 어떤 안전 검사를 수행했는가?
+
+---
+
+## Portfolio Checkpoint — 멀티테넌트 Trace 조회 기능
+
+### 직접 얻은 실무 경험
+
+* API Key 인증 결과를 조회 SQL의 Tenant·Project 경계로 연결
+* 클라이언트가 Tenant 또는 Project 범위를 직접 선택하지 못하도록 API 설계
+* 서로 다른 Project의 동일 Trace ID를 이용한 데이터 격리 통합 테스트 작성
+* 실시간 데이터 목록에 Offset 대신 Keyset Pagination 적용
+* 동일 시각 데이터를 안정적으로 정렬하기 위해 Trace ID를 보조 Cursor로 사용
+* 서비스·오류·duration 조건을 적용하면서 Trace 전체 집계값을 유지하는 SQL 설계
+* Cursor를 조회 조건 fingerprint에 결합해 조건 변경에 따른 페이지 누락과 중복 방지
+* 비정상적으로 큰 Trace가 애플리케이션 메모리를 점유하지 않도록 상세 조회 상한 적용
+* Mock 단위 테스트, HTTP 계약 테스트, 실제 TimescaleDB 통합 테스트의 책임 분리
+* 실제 HTTP 검증에 필요한 통제된 fixture를 구성하고 검증 후 정리
+* 테스트 실패 원인을 검증 순서와 Mock 기본 반환값 관점에서 분석
+
+### 채용 담당자와 면접관이 평가할 부분
+
+* 단순 CRUD가 아니라 멀티테넌트 데이터 격리를 SQL과 테스트에서 강제한 경험
+* 데이터가 계속 추가되는 APM 특성에 맞춰 Pagination 방식을 선택한 근거
+* 필터 검색 결과와 전체 Trace 집계 의미를 분리한 도메인 이해
+* Cursor를 권한 경계로 오해하지 않고 Repository의 Tenant·Project 조건을 실제 보안 경계로 유지한 점
+* 새로운 인덱스를 추측으로 추가하지 않고 실행계획과 측정 후 결정하려는 접근
+* 예외 응답, 최대 조회 범위, 반환 크기 제한 등 운영 위험을 API 계약에 반영한 경험
+
+### 보존해야 할 증거
+
+다음 자료를 삭제하지 않고 보존한다.
+
+* Project 간 동일 Trace ID 격리 통합 테스트 코드
+* Cursor 첫 페이지와 두 번째 페이지 HTTP 응답
+* 조건 변경 Cursor 요청의 `400` 응답
+* Trace 상세 `404`, `422` 응답
+* 서비스·오류·duration 조합 통합 테스트
+* 전체 Gradle 테스트 성공 로그
+* 수동 fixture INSERT와 DELETE 명령
+* 다음 성능 단계에서 생성할 `EXPLAIN (ANALYZE, BUFFERS)` 결과
+* 필터별 API 응답시간 측정 결과
+* 인덱스 적용 전후 비교 결과
+
+### 이력서 성과 문장 초안
+
+* OpenTelemetry Trace 조회 과정에서 API Key 인증 결과를 Tenant·Project 복합 조건으로 강제하고, 서로 다른 Project에 동일한 Trace ID를 구성한 통합 테스트로 멀티테넌트 데이터 격리를 검증
+* 실시간으로 데이터가 추가되는 Trace 목록의 중복과 누락을 줄이기 위해 시작 시각과 Trace ID 기반 Keyset Pagination을 적용하고, 조회 조건 fingerprint로 필터 변경 후 Cursor 재사용을 차단
+* 서비스·오류·Span duration 필터를 적용하면서 Trace 전체 집계값을 유지하도록 집계 SQL을 설계하고 실제 TimescaleDB 통합 테스트와 HTTP fixture로 동작을 검증
+* 과도하게 큰 Trace 상세 응답으로 인한 메모리 사용 위험을 줄이기 위해 Span 조회 상한과 초과 감지 로직을 적용하고 오류 응답 계약을 자동 테스트
+
+성능 측정 후 다음 내용을 추가한다.
+
+```text
+데이터 규모
+필터별 p50/p95 응답시간
+인덱스 적용 전후 실행시간
+읽은 Buffer 수
+DB 크기와 테스트 환경
+```
+
+### 블로그 주제
+
+#### 제목
+
+Offset 없이 실시간 Trace 목록을 조회하는 Cursor Pagination 설계
+
+#### 해결한 문제
+
+APM Trace가 계속 저장되는 상황에서 Offset Pagination을 사용하면 페이지 이동 중 중복과 누락이 발생할 수 있다.
+
+또한 서비스나 오류 필터가 바뀐 상태에서 이전 Cursor를 재사용하면 서로 다른 검색 결과 집합이 연결될 수 있다.
+
+#### 핵심 메시지
+
+* 실시간 데이터 목록에서는 정렬 기준이 안정적이어야 한다.
+* 동일 시각 데이터를 처리하려면 보조 정렬 기준이 필요하다.
+* Cursor 위치뿐 아니라 Cursor가 발급된 조회 조건도 검증해야 한다.
+* Cursor는 권한 경계가 아니며 Tenant 격리는 SQL에서 강제해야 한다.
+* 필터에 일치한 Span과 Trace 전체 집계는 다른 개념이다.
+
+#### 글 구성
+
+1. AeroTrace Trace 목록 요구사항
+2. Offset Pagination의 문제
+3. `traceStartTime + traceId` Keyset 설계
+4. `limit + 1` 조회로 다음 페이지 판단
+5. 서비스·오류·duration 필터 의미
+6. `WHERE`가 아닌 `HAVING`을 사용한 이유
+7. Query fingerprint가 필요한 이유
+8. Project 간 동일 Trace ID 격리 테스트
+9. 실제 fixture를 이용한 HTTP 검증
+10. 아직 남은 성능 측정과 인덱스 검토
+
+#### 필요한 수치와 자료
+
+* Trace 개수와 Span 개수
+* 첫 페이지와 다음 페이지 실행계획
+* Offset과 Cursor 방식 실행시간 비교
+* 서비스 필터 실행계획
+* 오류·duration 조합 실행계획
+* Cursor 조건 변경 `400` 응답
+* 페이지 간 Trace ID 비교 화면
+* Project 격리 통합 테스트 코드
+
+### 예상 면접 질문
+
+* Offset Pagination 대신 Keyset Pagination을 선택한 이유는 무엇인가?
+* 시작 시각만 Cursor로 사용하면 어떤 문제가 발생하는가?
+* 서비스 필터를 `WHERE service_name = ?`로 적용하지 않은 이유는 무엇인가?
+* 서비스 조건과 오류 조건이 서로 다른 Span에서 충족되면 어떻게 동작하는가?
+* Cursor fingerprint에 Tenant ID와 Project ID를 포함한 이유는 무엇인가?
+* Cursor에 HMAC이 없는데 보안상 안전한가?
+* 실제 멀티테넌트 데이터 격리는 어느 계층에서 강제되는가?
+* 5,000개 Span 제한은 어떤 운영 위험을 줄이는가?
+* 데이터가 증가하면 현재 목록 SQL의 첫 번째 병목은 무엇으로 예상하는가?
+* 인덱스를 바로 추가하지 않고 측정하려는 이유는 무엇인가?
+
+### 다음에 경험할 한 단계 높은 과제
+
+대표 데이터 규모를 직접 생성하고 다음을 비교한다.
+
+* 필터별 실행계획
+* Rowstore와 Columnstore 조회
+* 첫 페이지와 Cursor 페이지
+* 기존 인덱스 사용 여부
+* 추가 인덱스 후보의 실제 효과
+* 원본 Span 집계와 Trace summary 구조의 비용
+
+이 측정을 통해 기능 구현 경험을 운영 가능한 조회 성능 설계 경험으로 확장한다.

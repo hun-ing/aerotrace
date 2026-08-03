@@ -1334,3 +1334,200 @@ Retention은 개별 행이 아닌 chunk 전체를 제거하므로 정책 실행 
 * 30일 보관에 필요한 예상 디스크 크기
 
 이 값들은 운영과 유사한 데이터가 쌓인 뒤 재측정한다.
+
+---
+
+## 2026-08-03 — 인증된 Trace 목록·상세 조회 구현
+
+### 구현 범위
+
+인증된 Project의 Trace를 조회하기 위한 다음 API를 구현했다.
+
+```text
+GET /api/v1/traces
+GET /api/v1/traces/{traceId}
+```
+
+목록 API는 다음 조건을 지원한다.
+
+* `from`
+* `to`
+* `limit`
+* `cursor`
+* `serviceName`
+* `errorOnly`
+* `minSpanDurationNano`
+
+상세 API는 Trace ID에 속한 Span을 시작 시각 순서로 반환한다.
+
+### 멀티테넌트 경계
+
+클라이언트가 Tenant ID나 Project ID를 요청 파라미터 또는 Header로 지정하지 않는다.
+
+API Key 인증 결과인 `AuthenticatedProject`에서 다음 값을 가져와 Repository에 전달한다.
+
+```text
+tenantId
+projectId
+```
+
+모든 목록·상세 SQL은 두 값을 함께 조건으로 사용한다.
+
+서로 다른 Project에 동일한 Trace ID와 Span ID를 저장한 통합 테스트를 구성해 다음을 확인했다.
+
+* Project A 조회에 Project B 전용 Trace가 포함되지 않음
+* Project B 조회에 Project A 전용 Trace가 포함되지 않음
+* 동일한 Trace ID의 Span 집계가 Project 간 합쳐지지 않음
+* Trace 상세 Span도 Project 간 섞이지 않음
+
+### Trace 목록 집계
+
+목록에서는 Trace ID 단위로 다음 값을 계산한다.
+
+* 최초 Span 시작 시각
+* 전체 Span 수
+* 고유 서비스 수
+* 가장 긴 Span duration
+
+서비스, 오류, duration 필터는 Trace를 선택하는 조건으로 사용하지만 집계값은 Trace 전체를 기준으로 유지한다.
+
+통합 테스트에서 서비스 조건과 오류 조건이 서로 다른 Span에서 충족되는 Trace도 정상적으로 조회되는 것을 확인했다.
+
+### Cursor Pagination
+
+정렬 기준:
+
+```text
+traceStartTime DESC
+traceId DESC
+```
+
+Cursor에는 다음 값이 포함된다.
+
+```text
+traceStartTime
+traceId
+queryFingerprint
+```
+
+사용자 요청 limit보다 한 건 더 조회한다.
+
+* 조회 결과가 limit 이하이면 마지막 페이지
+* 조회 결과가 limit보다 많으면 마지막 반환 항목으로 다음 Cursor 생성
+
+Cursor fingerprint에는 Tenant, Project, 시간 범위와 모든 목록 필터를 포함한다.
+
+다음 조건을 변경한 뒤 이전 Cursor를 사용하면 요청을 거부한다.
+
+* 시간 범위
+* 서비스명
+* 오류 필터
+* 최소 Span duration
+* 인증 Project
+
+### Trace 상세 제한
+
+Trace 상세 조회는 최대 5,000개 Span을 응답한다.
+
+내부적으로 5,001개까지 조회해 다음을 구분한다.
+
+* 5,000개 이하: 정상 응답
+* 5,001개 조회: 허용 크기를 초과한 Trace로 판단
+
+응답 계약:
+
+* 존재하지 않는 Trace: `404`
+* 잘못된 Trace ID: `400`
+* 5,000개를 초과한 Trace: `422`
+* 인증 누락 또는 실패: `401`
+
+### 입력 제한
+
+* 목록 최대 반환 수: 200
+* 최대 조회 시간 범위: 30일
+* 서비스명: 공백 불가, 최대 255자
+* `errorOnly`: `true` 또는 `false`
+* `minSpanDurationNano`: 0 이상의 정수
+* Trace ID: 0이 아닌 32자리 소문자 16진수
+
+### 수행한 자동 검증
+
+* Service 단위 테스트
+* Controller HTTP 계약 테스트
+* 인증 Filter 경로 테스트
+* Cursor encode/decode 테스트
+* Cursor 조회 조건 fingerprint 테스트
+* 실제 TimescaleDB Repository 통합 테스트
+* Project 간 동일 Trace ID 격리 테스트
+* Cursor 페이지 중복 방지 테스트
+* 서비스·오류·duration 조합 필터 테스트
+* 전체 Gradle 회귀 테스트
+
+### 수행한 실제 HTTP 검증
+
+통제된 fixture Trace를 직접 삽입한 뒤 다음을 확인했다.
+
+* 첫 페이지의 `nextCursor` 생성
+* 두 번째 페이지에서 다른 Trace 반환
+* 페이지 간 Trace 중복 없음
+* 마지막 페이지의 `nextCursor = null`
+* `errorOnly` 변경 후 이전 Cursor 사용 시 `400`
+* `serviceName` 변경 후 이전 Cursor 사용 시 `400`
+* `minSpanDurationNano` 변경 후 이전 Cursor 사용 시 `400`
+* 검증 후 fixture 데이터 삭제
+
+### 구현 중 발생한 문제
+
+#### Cursor 범위 테스트가 예상 예외보다 먼저 실패
+
+Query fingerprint를 계산하면서 Mockito Mock의 Tenant ID와 Project ID를 먼저 읽었다.
+
+테스트에서 두 값을 stub하지 않아 기대했던 Cursor 범위 오류보다 `tenantId must not be null` 오류가 먼저 발생했다.
+
+검증 순서를 다음처럼 변경했다.
+
+```text
+기본 요청 검증
+→ 서비스명·duration 검증
+→ Cursor 시간 범위 검증
+→ Query fingerprint 계산
+→ Cursor fingerprint 비교
+→ Repository 조회
+```
+
+이를 통해 범위를 벗어난 Cursor는 불필요한 fingerprint 계산 전에 차단된다.
+
+#### 실제 Pagination 검증 데이터 부족
+
+기존 데이터에서 검색 조건에 맞는 Trace가 없어서 첫 페이지가 비어 있었고 `nextCursor`가 생성되지 않았다.
+
+원인은 구현이 아니라 수동 검증 절차가 데이터 전제를 명시하지 않은 것이었다.
+
+동일 조건에 맞는 Trace 두 개를 직접 삽입하는 fixture 절차로 수정하고, 검증 완료 후 삭제했다.
+
+### 현재 확인되지 않은 항목
+
+다음 값은 아직 측정하지 않았다.
+
+* Trace 수 증가에 따른 목록 쿼리 실행시간
+* 서비스·오류·duration 필터별 실행계획 차이
+* Rowstore와 Columnstore 구간의 조회 성능 차이
+* Buffer hit와 실제 disk read
+* 동시 조회 시 DB connection 사용량
+* API 응답 p50, p95, p99
+* 추가 인덱스 적용 효과
+* Trace summary 테이블 또는 Continuous Aggregate의 효과
+
+### 다음 작업
+
+대표 데이터셋을 생성하고 다음 쿼리의 성능 기준선을 측정한다.
+
+1. 필터 없는 최근 Trace 목록
+2. 서비스 필터
+3. 오류 필터
+4. 최소 Span duration 필터
+5. 세 필터 조합
+6. 첫 페이지와 Cursor 다음 페이지
+7. Trace 상세 조회
+
+측정 전에는 새로운 인덱스를 추가하지 않는다.

@@ -855,3 +855,142 @@ Tenant별 보존기간이 실제 요구사항이 되면 다음 대안을 재검�
 * 대부분 사용자가 7일 이내 데이터만 조회
 * 장기 보관 요구가 발생
 * 일일 저장량과 compression 비율 측정 완료
+
+---
+
+## 2026-08-03 — Trace 목록 조회에 Keyset Cursor와 Trace 전체 집계 필터 사용
+
+### 해결하려는 문제
+
+Trace 목록 API는 다음 요구사항을 동시에 만족해야 한다.
+
+* 인증된 Tenant와 Project 데이터만 조회
+* 최신 Trace부터 안정적으로 페이지 이동
+* 서비스, 오류 여부, 최소 Span duration 조건 검색
+* 필터에 일치한 일부 Span만이 아니라 Trace 전체의 Span 수와 서비스 수 유지
+* 페이지 사이에서 조회 조건이 변경되어 발생하는 중복과 누락 방지
+* 제한된 서버 자원에서 무제한 조회 방지
+
+### 검토한 대안
+
+#### Offset Pagination
+
+`OFFSET`과 `LIMIT`을 사용하는 방식이다.
+
+장점:
+
+* 구현이 단순하다.
+* 임의의 페이지 번호로 이동하기 쉽다.
+
+단점:
+
+* 뒤쪽 페이지일수록 앞의 행을 건너뛰는 비용이 커질 수 있다.
+* 페이지 이동 중 새로운 Trace가 저장되면 중복 또는 누락이 발생할 수 있다.
+* 실시간으로 계속 데이터가 추가되는 APM 목록에 적합하지 않다.
+
+#### 필터 조건을 WHERE에 적용
+
+예:
+
+```sql
+WHERE service_name = ?
+   OR status_code = 2
+```
+
+장점:
+
+* SQL이 직관적이다.
+* 조건에 일치하는 Span을 빠르게 줄일 가능성이 있다.
+
+단점:
+
+* 필터에 일치하지 않는 같은 Trace의 Span이 집계에서 제외된다.
+* `spanCount`, `serviceCount`, `MAX(duration_nano)`가 Trace 전체 값이 아니게 된다.
+* 사용자가 목록과 상세 화면에서 서로 다른 집계값을 보게 될 수 있다.
+
+#### Keyset Pagination과 HAVING 집계 필터
+
+Trace 시작 시각과 Trace ID를 Cursor 위치로 사용하고, 서비스·오류·duration 조건은 Trace 집계 이후 `HAVING`으로 적용하는 방식이다.
+
+### 선택한 방식
+
+다음 정렬 기준을 사용한 Keyset Pagination을 선택했다.
+
+```sql
+ORDER BY trace_start_time DESC,
+         trace_id DESC
+```
+
+다음 페이지 조건은 마지막으로 반환된 Trace의 시작 시각과 Trace ID를 사용한다.
+
+```sql
+trace_start_time < cursor_time
+OR (
+    trace_start_time = cursor_time
+    AND trace_id < cursor_trace_id
+)
+```
+
+필터는 다음 의미로 적용한다.
+
+* `serviceName`: 해당 서비스를 포함한 Trace
+* `errorOnly=true`: `status_code = 2`인 Span을 포함한 Trace
+* `minSpanDurationNano`: 지정 duration 이상의 Span을 포함한 Trace
+
+서비스와 오류 조건은 서로 다른 Span에서 충족되어도 같은 Trace 안에 있으면 검색 결과에 포함한다.
+
+집계값은 항상 Trace 전체 Span을 기준으로 계산한다.
+
+### Cursor 조회 조건 결합
+
+Cursor에는 다음 정보가 포함된다.
+
+* 마지막 Trace의 시작 시각
+* 마지막 Trace ID
+* 조회 조건의 SHA-256 fingerprint
+
+Fingerprint에는 다음 조건을 포함한다.
+
+* 인증된 Tenant ID
+* 인증된 Project ID
+* 조회 시작 시각
+* 조회 종료 시각
+* 정규화된 서비스명
+* 오류 필터
+* 최소 Span duration
+
+첫 페이지와 다른 조건으로 Cursor를 재사용하면 `400 Bad Request`를 반환한다.
+
+### 선택 이유
+
+* 실시간으로 Trace가 추가되는 환경에서 Offset보다 페이지 중복과 누락 위험이 작다.
+* 같은 시작 시각을 가진 Trace도 Trace ID를 보조 정렬 기준으로 사용해 결정적으로 정렬할 수 있다.
+* 필터를 적용해도 목록의 집계값과 Trace 상세 내용이 일관된다.
+* Cursor를 Tenant와 Project에 결합해 다른 Project 요청에서 잘못 재사용되는 것을 차단한다.
+* 사용자에게 반환할 개수보다 한 건 더 조회해 별도의 COUNT 쿼리 없이 다음 페이지 존재 여부를 판단한다.
+
+### 제한과 위험
+
+* 현재 Cursor fingerprint에는 HMAC 서명이 없다.
+* Base64 Cursor는 암호화가 아니므로 payload를 숨기지 않는다.
+* 권한 경계는 Cursor가 아니라 Repository의 `tenant_id`, `project_id` 조건이 담당한다.
+* 서비스·오류·duration 필터는 Trace 집계가 필요하므로 데이터량이 증가하면 비용이 커질 수 있다.
+* 필터 전용 인덱스의 효과는 아직 측정하지 않았다.
+* Cursor를 발급한 뒤 기존 Span의 시작 시각이나 Trace 구성이 변경되는 경우는 현재 고려하지 않는다. 수집된 Span을 불변 데이터로 취급한다.
+
+### 재검토 조건
+
+다음 조건이 발생하면 설계를 재검토한다.
+
+* Trace 목록 쿼리의 실제 실행 시간이 운영 목표를 만족하지 못할 때
+* `EXPLAIN (ANALYZE, BUFFERS)`에서 집계 또는 Chunk Scan 비용이 주요 병목으로 확인될 때
+* 공개 API에서 Cursor 위조 방지가 요구될 때
+* 사용자에게 임의 페이지 이동 기능이 필요해질 때
+* 필터 종류가 증가해 정적 SQL 관리가 어려워질 때
+* Continuous Aggregate나 별도 Trace summary 테이블이 원본 Span 집계보다 경제적인 규모에 도달할 때
+
+### 현재 결론
+
+MVP에서는 Keyset Pagination과 원본 Span 집계를 유지한다.
+
+새로운 인덱스, Trace summary 테이블, Continuous Aggregate는 추측으로 추가하지 않고 실제 쿼리 측정 결과를 근거로 검토한다.
