@@ -36,6 +36,19 @@ exporters:
       block_on_overflow: false
       storage: file_storage/aerotrace
 
+extensions:
+  file_storage/aerotrace:
+    directory: /var/lib/otelcol/storage
+    create_directory: true
+    directory_permissions: "0750"
+    timeout: 1s
+    max_size: 536870912
+    fsync: true
+    compaction:
+      on_start: true
+      cleanup_on_start: true
+      directory: /var/lib/otelcol/compaction
+
 service:
   extensions:
     - file_storage/aerotrace
@@ -61,16 +74,3 @@ service:
         - batch
       exporters:
         - otlp_http/aerotrace
-
-extensions:
-  file_storage/aerotrace:
-    directory: /var/lib/otelcol/storage
-    create_directory: true
-    directory_permissions: "0750"
-    timeout: 1s
-    max_size: 536870912
-    fsync: true
-    compaction:
-      on_start: true
-      cleanup_on_start: true
-      directory: /var/lib/otelcol/compaction

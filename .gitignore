@@ -25,4 +25,10 @@
 /frontend/.env*.local
 
 http-client.private.env.json
+
+# Local runtime secrets
+/.env
 /otel-collector.env
+
+# Temporary Phase 9 snapshots
+/phase9-*.zip

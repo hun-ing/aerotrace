@@ -12,7 +12,7 @@ spring:
   datasource:
     url: ${AEROTRACE_DB_URL:jdbc:postgresql://localhost:5432/aerotrace}
     username: ${AEROTRACE_DB_USERNAME:postgres}
-    password: ${AEROTRACE_DB_PASSWORD:postgres}
+    password: ${AEROTRACE_DB_PASSWORD}
 
     hikari:
       connection-timeout: 3000
@@ -34,7 +34,6 @@ management:
         include:
           - health
           - metrics
-
 
 aerotrace:
   ingest:

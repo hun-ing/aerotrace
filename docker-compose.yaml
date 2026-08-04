@@ -3,13 +3,12 @@ services:
     image: timescale/timescaledb:latest-pg15
     container_name: aerotrace-timescaledb
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=aerotrace     # 접속할 데이터베이스 이름
+      POSTGRES_USER: ${AEROTRACE_DB_USERNAME}
+      POSTGRES_PASSWORD: ${AEROTRACE_DB_PASSWORD}
+      POSTGRES_DB: ${AEROTRACE_DB_NAME}
     ports:
       - "5432:5432"
     volumes:
-      # 앞서 논의한 '네임드 볼륨' 방식. OS에 상관없이 도커가 안전하게 데이터를 영구 보관합니다.
       - aerotrace-db-data:/var/lib/postgresql/data
     networks:
       - aerotrace-network
@@ -22,10 +21,12 @@ services:
       - sh
       - -c
       - >
-        mkdir -p /var/lib/otelcol/storage
+        mkdir -p
+        /var/lib/otelcol/storage
         /var/lib/otelcol/compaction
         &&
-        chown -R 10001:10001 /var/lib/otelcol
+        chown -R 10001:10001
+        /var/lib/otelcol
     volumes:
       - aerotrace-otelcol-data:/var/lib/otelcol
     restart: "no"
@@ -53,14 +54,12 @@ services:
       - aerotrace-network
     restart: unless-stopped
 
-# 볼륨 선언 (윈도우/우분투 이식성 확보)
 volumes:
   aerotrace-db-data:
 
   aerotrace-otelcol-data:
     name: aerotrace-otelcol-data
 
-# 서비스 간 통신을 격리하고 보호하기 위한 전용 네트워크
 networks:
   aerotrace-network:
     driver: bridge
