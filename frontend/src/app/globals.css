@@ -590,3 +590,150 @@ h1 {
     font-size: 12px;
   }
 }
+
+.topbar-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+}
+
+.refresh-button {
+  min-height: 34px;
+  padding-inline: 13px;
+}
+
+.secondary-button:not(:disabled) {
+  cursor: pointer;
+}
+
+.secondary-button:not(:disabled):hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.status-indicator-loading {
+  background: var(--accent);
+  box-shadow: 0 0 12px rgba(120, 166, 255, 0.5);
+  animation: status-pulse 1.2s ease-in-out infinite;
+}
+
+.status-indicator-success {
+  background: var(--success);
+  box-shadow: 0 0 12px rgba(87, 211, 155, 0.5);
+}
+
+.status-indicator-error {
+  background: var(--danger);
+  box-shadow: 0 0 12px rgba(255, 125, 138, 0.5);
+}
+
+.trace-row {
+  transition: background 120ms ease;
+}
+
+.trace-row:hover {
+  background: var(--surface-hover);
+}
+
+.trace-row td {
+  border-bottom: 1px solid var(--border);
+  padding: 14px 18px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.trace-row:last-child td {
+  border-bottom: 0;
+}
+
+.trace-id {
+  display: inline-block;
+  max-width: 260px;
+  overflow: hidden;
+  color: #c9d9f6;
+  font-family:
+          "SFMono-Regular",
+          Consolas,
+          "Liberation Mono",
+          monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.numeric-cell {
+  font-variant-numeric: tabular-nums;
+}
+
+.duration-cell {
+  color: #dbe6fa;
+  font-weight: 620;
+}
+
+.loading-spinner {
+  width: 34px;
+  height: 34px;
+  border: 3px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 999px;
+  animation: loading-spin 800ms linear infinite;
+}
+
+.error-icon {
+  border-color: rgba(255, 125, 138, 0.38);
+  background: rgba(255, 125, 138, 0.08);
+  color: var(--danger);
+}
+
+.error-message {
+  color: #dca4ab !important;
+}
+
+.retry-button {
+  margin-top: 16px;
+}
+
+@keyframes loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 760px) {
+  .topbar-actions {
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 560px) {
+  .topbar-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .trace-id {
+    max-width: 210px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-spinner,
+  .status-indicator-loading {
+    animation: none;
+  }
+}
