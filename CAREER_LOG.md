@@ -1,716 +1,684 @@
-# CAREER_LOG.md
+# AeroTrace Career Log
 
-> 마지막 업데이트: 2026-07-27
+> 마지막 업데이트: 2026-08-04  
+> 현재 Portfolio 단계: 수집, 저장, 장애 복구, 데이터 수명주기, 멀티테넌트 조회, Trace Explorer까지 End-to-End MVP 검증  
+> 다음 Checkpoint: 로컬 통합 실행과 실제 배포
+
+---
 
 ## 1. 현재까지 직접 확보한 실무 경험
 
-* Spring Boot 4와 Java 21 프로젝트 초기 구성
-* Virtual Threads 실제 요청 적용 검증
-* TimescaleDB hypertable 설계와 Flyway migration
-* 멀티테넌트 Tenant·Project 데이터 모델
-* 복합 외래키를 이용한 데이터 소유 관계 보장
-* Collector retry를 고려한 Span 중복 저장 방지
-* OTLP/HTTP JSON Trace 수신
-* OpenTelemetry AnyValue 파싱
-* Resource와 Span Attributes JSONB 저장
-* Span Event와 Link 구조 이해 및 저장
-* OTLP `uint32`, timestamp, ID 형식 검증
-* JDBC 단건 저장과 batch 저장 비교
-* 재현 가능한 반복 성능 벤치마크 구성
-* 성능 옵션을 무조건 적용하지 않고 측정 후 보류
-* IntelliJ HTTP Client와 Database Tool을 이용한 개발 흐름
-* 테스트 데이터 충돌과 셸 escaping 문제 해결
+### Backend와 Java
 
-## 2. 포트폴리오 핵심 강조점
+- Java 21과 Spring Boot 4.1.0 프로젝트 구성
+- 실제 HTTP 요청에서 Virtual Threads 활성화 검증
+- Virtual Threads와 DB Connection Pool의 역할 차이 이해
+- Gradle, Actuator, 환경변수 기반 설정
 
-### 단순 구현이 아닌 근거 기반 설계
+### OpenTelemetry 수집
 
-AeroTrace는 기술을 많이 사용하는 프로젝트가 아니라 다음 과정을 보여주는 프로젝트다.
+- OTLP/HTTP JSON Trace Receiver 구현
+- Resource, Scope, Span 구조 파싱
+- Trace ID, Span ID, Parent Span ID 검증
+- Timestamp와 Duration 검증
+- Span Kind와 Status Code 검증
+- AnyValue 파싱
+- Resource / Span Attributes
+- Events
+- Links
+- `uint32`
+- 요청 전체 원자성
+
+### TimescaleDB 데이터 모델
+
+- Hypertable과 1일 Chunk
+- Tenant / Project 복합 외래키
+- Unique Index와 Idempotent Insert
+- JSONB와 일반 컬럼 혼합
+- Rowstore / Columnstore / Retention
+- Chunk 삭제 안전 검증
+
+### 성능 측정
+
+- JDBC 단건과 Batch 공정 비교
+- 측정 범위 보정
+- Warm-up과 반복
+- 실행 순서 교차
+- 중앙값
+- Batch 크기별 비교
+- `reWriteBatchedInserts`를 측정 후 보류
+- TimescaleDB 실행계획과 Buffer 분석
+- 데이터 선택도에 따른 SQL 성능 역전 검증
+
+### 멀티테넌시와 보안
+
+- Project API Key 구조
+- 원문 Secret 미저장
+- SecureRandom Secret
+- SHA-256 Hash
+- 상수시간 비교
+- 만료와 폐기
+- Tenant / Project Header 위조 방지
+- API Key 소유권으로 데이터 경계 결정
+- Project 간 동일 Trace ID 격리 Test
+- 고카디널리티와 민감정보를 Metric Tag에서 제외
+
+### 장애 대응과 데이터 유실 방지
+
+- DB 장애와 인증 실패 구분
+- Retryable 장애에 503
+- Collector Retry
+- File Storage Persistent Queue
+- Collector 재시작 후 Queue 복구
+- DB 복구 후 자동 재전송
+- Queue Metric과 DB 최종 결과를 함께 검증
+- 실험 오류로 200행이 생성된 원인 분석과 재실험
+
+### Query API
+
+- Trace 목록과 상세 API
+- Keyset Pagination
+- Query Fingerprint
+- Trace 전체 집계 Filter
+- Service / Error / Duration 조합
+- 최대 조회 범위와 응답 크기 제한
+- Mock, Controller, Integration, 실제 HTTP 검증 분리
+
+### Frontend
+
+- Next.js App Router
+- Server-only BFF
+- API Key Browser 미노출
+- Runtime Response Validation
+- Loading / Empty / Error
+- URL과 Filter 상태 동기화
+- Cursor Load More
+- 추가 페이지 오류 시 기존 목록 유지
+- Trace 상세와 Span Timeline
+- Root / Parent 관계
+- Multi-service Trace
+- Error Span 시각화
+- 실제 3 Span Trace로 End-to-End 검증
+
+## 2. Portfolio 핵심 서사
+
+AeroTrace의 핵심은 기술 목록이 아니라 다음 흐름이다.
 
 ```text
 문제 정의
 → 대안 검토
 → 최소 구현
-→ 직접 실행
-→ 실패 원인 분석
-→ 반복 검증
-→ 성능 측정
-→ 설계 결정 기록
+→ 사용자가 직접 실행
+→ 실패 재현
+→ 원인 분석
+→ 측정
+→ 설계 결정
+→ 운영 위험 기록
 ```
 
-### 멀티테넌트 데이터 정합성
-
-* Tenant와 Project 복합 외래키
-* 모든 Span에 Tenant와 Project 적용
-* 잘못된 소유 관계를 DB에서 차단
-* 향후 API Key에서 Tenant와 Project를 결정할 구조
-
-### Collector retry와 중복 방지
-
-* 유일 인덱스
-* `ON CONFLICT DO NOTHING`
-* 신규와 중복 건수 분리
-* 동일 요청 재전송 검증
-* 중복 저장으로 인한 집계 왜곡 방지
-
-### 성능 측정
-
-* 단건과 batch가 같은 SQL과 바인딩 코드를 사용
-* 워밍업
-* 반복 측정
-* 중앙값 사용
-* 실행 순서 교차
-* 저장 행 수 검증
-* 옵션이 효과가 없다는 결과도 보존
-
-## 3. 이력서 성과 문장 초안
-
-### JDBC batch 성능 개선
-
-OpenTelemetry Span 저장 과정에서 Span별 JDBC 호출 비용을 검증하기 위해 동일 데이터·트랜잭션 조건의 반복 벤치마크를 구성하고 요청 단위 JDBC batch를 적용하여, 100~5,000 Span 구간에서 저장 처리량을 약 2.9~3.1배 개선
-
-### 멀티테넌트 데이터 격리
-
-멀티테넌트 APM의 데이터 소유 관계를 보장하기 위해 Tenant·Project 복합 외래키를 설계하고 모든 Span 저장에 Tenant와 Project 범위를 적용하여 잘못된 테넌트 조합이 DB에 저장되는 문제를 방지
-
-### 중복 Span 방지
-
-OpenTelemetry Collector 재전송 과정에서 발생할 수 있는 중복 Span 저장을 방지하기 위해 Tenant, Project, Trace ID, Span ID, 시작 시각 기반 유일 인덱스와 idempotent insert를 구성하고 동일 요청 재전송 시 데이터가 한 건으로 유지되는 것을 검증
-
-### OTLP 수신 파이프라인
-
-OTLP/HTTP JSON Trace 요청의 Resource, Scope, Span, Attributes, Events, Links를 파싱하고 형식·시간·식별자·uint32 범위를 검증한 뒤 TimescaleDB JSONB와 일반 컬럼에 저장하는 수집 파이프라인 구현
-
-### 근거 기반 최적화
-
-pgJDBC의 `reWriteBatchedInserts` 옵션을 Span 크기별로 반복 측정한 결과 일관된 개선 효과가 없음을 확인하고, 불필요한 설정을 도입하지 않는 결정을 기술 문서에 기록
-
-## 4. 현재 이력서 문장에 넣으면 안 되는 표현
-
-아직 다음 표현을 사용하지 않는다.
-
-* 초당 수만 개 Span 처리
-* 무중단 APM 구축
-* 데이터 유실 0%
-* 대규모 트래픽 처리
-* 상용 서비스 운영
-* 실사용자 확보
-* 장애 예측 시스템 완성
-* Collector부터 DB까지 3배 개선
-* 네트워크 왕복을 1회로 감소
-* N100에서 안정적 운영
-
-현재 측정은 Windows 개발 PC와 Docker Desktop의 persistence-only 조건이다.
-
-## 5. 면접에서 설명할 수 있는 사례
-
-### 사례 1 — 중복 방지 테스트가 Attribute 저장을 막은 문제
-
-상황:
-
-* Attribute 요청은 `200`을 반환했지만 기대한 데이터가 조회되지 않았다.
-
-원인:
-
-* 기존 요청과 trace ID, span ID, start time이 같아 unique index가 중복으로 판단했다.
-
-해결:
-
-* 테스트 목적별로 고유한 식별자를 사용했다.
-* 신규 저장과 중복 재전송 요청을 분리했다.
-* 서버 로그와 DB 행을 함께 검증했다.
-
-면접 포인트:
-
-* 성공 응답만으로 저장 성공을 판단하지 않은 점
-* Idempotency가 테스트에도 영향을 주는 것을 파악한 점
-* 중복 방지 기능 자체가 정상 동작했음을 확인한 점
-
-### 사례 2 — `reWriteBatchedInserts`를 채택하지 않은 결정
-
-상황:
-
-* PostgreSQL batch 성능을 높일 수 있다고 알려진 옵션을 검토했다.
-
-행동:
-
-* OFF와 ON을 같은 조건으로 반복 실행했다.
-* 100, 1,000, 5,000 Span 조건을 비교했다.
-* 단건 측정값을 환경 편차 기준으로 함께 확인했다.
-
-결과:
-
-* 작은 크기에서는 0.5~1% 수준 차이
-* 5,000 Span에서는 약 4.2% 악화
-* 일관된 개선이 없어 채택 보류
-
-면접 포인트:
-
-* 유명한 옵션을 무조건 적용하지 않은 점
-* 성능 최적화에서 실측을 우선한 점
-* 효과가 없는 결과도 투명하게 남긴 점
-
-### 사례 3 — 멀티테넌트 복합 외래키
-
-질문:
-
-“애플리케이션에서 Tenant를 검증하면 되는데 왜 DB 외래키까지 필요했나요?”
-
-답변 방향:
-
-* 애플리케이션 검증 누락 가능성
-* 각각 존재하는 Tenant와 Project가 잘못 조합될 위험
-* DB를 최종 데이터 정합성 방어선으로 사용
-* FK 비용은 이후 부하 테스트로 검증할 계획
-
-## 6. 예상 면접 질문
-
-* OpenTelemetry의 Trace, Span, Resource, Scope 차이는 무엇인가?
-* `service.name`은 왜 Resource Attribute인가?
-* OTLP JSON에서 64비트 정수가 문자열로 전달되는 이유는 무엇인가?
-* Span ID와 Trace ID를 문자열로 저장한 이유는 무엇인가?
-* TimescaleDB를 선택한 이유는 무엇인가?
-* 왜 Elasticsearch나 ClickHouse를 사용하지 않았는가?
-* Hypertable chunk를 1일로 설정한 근거는 무엇인가?
-* Unique index에 `start_time`이 포함된 이유는 무엇인가?
-* Collector retry가 중복 데이터를 만드는 이유는 무엇인가?
-* `ON CONFLICT DO NOTHING`의 장단점은 무엇인가?
-* JPA 대신 JDBC를 사용한 이유는 무엇인가?
-* Batch가 단건보다 빨랐던 이유는 무엇인가?
-* `reWriteBatchedInserts` 효과가 없었던 이유를 어떻게 분석할 것인가?
-* Virtual Threads를 사용해도 DB connection pool이 필요한 이유는 무엇인가?
-* 요청 중 한 Span이 잘못된 경우 전체 요청을 거부할 것인가?
-* DB 장애 시 Collector와 Backend는 어떻게 동작해야 하는가?
-* 멀티테넌트 데이터 유출을 어떻게 테스트할 것인가?
-* Span 저장량을 어떻게 계산할 것인가?
-* Retention과 compression 기준을 어떻게 결정할 것인가?
-
-## 7. 보존해야 할 증거
-
-### 코드
-
-* Flyway V1~V4
-* `spans` hypertable 스키마
-* 복합 외래키
-* 유일 인덱스
-* OTLP parser
-* AnyValue parser
-* Event와 Link parser
-* JDBC 단건과 batch 구현
-* 벤치마크 코드
-* HTTP Client 요청
-* SQL fixture
-
-### 로그
-
-* Virtual Thread `isVirtual=true`
-* Flyway migration 적용 로그
-* Hypertable 확인 결과
-* 동일 Span 재전송 `duplicates=1`
-* Batch 신규 3건 저장
-* Batch 중복 3건
-* Batch 신규·중복 혼합 결과
-* 잘못된 요청 `400`
-* 헤더 누락 `400`
-
-### 성능 자료
-
-* 단건과 batch 원본 콘솔 결과
-* rewrite OFF/ON 원본 콘솔 결과
-* Java 버전
-* PostgreSQL 버전
-* TimescaleDB 버전
-* 테스트 PC 사양
-* Docker Desktop 자원 설정
-* 테스트 날짜
-* 반복 횟수
-* Span 수와 생성 데이터 조건
-
-### 향후 추가할 증거
-
-* Batch chunk 크기 그래프
-* CPU와 메모리 사용량
-* HikariCP connection 사용량
-* N100 결과
-* Collector queue 지표
-* DB 장애 중 retry 로그
-* 일일 DB 증가량
-* retention 전후 저장량
-* compression 전후 DB 크기
-
-## 8. 기술 블로그 주제
-
-### 1. 유명한 PostgreSQL JDBC 옵션을 적용하지 않은 이유
-
-핵심 내용:
-
-* `reWriteBatchedInserts` 개념
-* 기대 효과
-* 실험 조건
-* Span 수별 결과
-* 결과 편차
-* 채택하지 않은 결정
-* 성능 옵션은 환경별로 측정해야 한다는 교훈
-
-필요한 자료:
-
-* OFF/ON 결과표
-* 개별 측정값
-* 벤치마크 코드
-* JDBC URL 설정 방식
-
-### 2. OpenTelemetry Collector 재시도와 중복 Span 문제
-
-핵심 내용:
-
-* Collector retry 시나리오
-* 중복이 대시보드와 저장량에 미치는 영향
-* Unique index 설계
-* TimescaleDB 시간 컬럼 제약
-* `ON CONFLICT DO NOTHING`
-* 재전송 검증 결과
-
-### 3. JPA 대신 JDBC batch를 선택한 과정
-
-핵심 내용:
-
-* Telemetry hot path의 특성
-* 단건 구현부터 시작한 이유
-* 공정한 비교를 위한 공통 SQL
-* 100~5,000 Span 결과
-* 약 2.9~3.1배 개선
-* 향후 COPY 검토 조건
-
-### 4. JSONB와 일반 컬럼을 함께 사용한 Trace 스키마
-
-핵심 내용:
-
-* OpenTelemetry의 동적 Attribute
-* 핵심 필드 컬럼 승격
-* JSONB 원본 보존
-* 인덱스를 미리 추가하지 않은 이유
-* 향후 조회 성능 실험
-
-### 5. 멀티테넌트 APM에서 Project 소유 관계를 DB로 보장하기
-
-핵심 내용:
-
-* 잘못된 Tenant·Project 조합
-* 복합 unique와 foreign key
-* 애플리케이션 검증만으로 부족한 이유
-* FK 비용과 향후 성능 측정
-
-## 9. 다음 Portfolio Checkpoint 조건
-
-다음 중 하나가 완료되면 CAREER_LOG를 갱신한다.
-
-* Batch chunk 크기 결정
-* API Key 기반 멀티테넌시 구현
-* Collector 실제 연동
-* DB 장애와 retry 실험
-* Persistent queue 적용
-* N100 홈서버 성능 측정
-* Retention과 compression 측정
-* 실제 사용자 서비스 연결
-* 사내 PoC
-* 장애 원인 분석 사례 확보
-
-## 10. 다음 한 단계 높은 과제
-
-현재는 저장 기능과 persistence-only 성능을 검증했다.
-
-다음에는 다음 질문에 답할 수 있어야 한다.
+현재 설명할 수 있는 End-to-End 흐름:
 
 ```text
-Collector가 5,000 Span을 전송하는 중 DB가 30초간 중단되면
-Collector queue, Backend 응답, retry, 중복, 데이터 유실은
-각각 어떻게 동작하는가?
+OTLP Client
+→ Collector
+→ Retry / Persistent Queue
+→ API Key 인증
+→ OTLP 검증
+→ JDBC Batch
+→ TimescaleDB
+→ Rowstore / Columnstore / Retention
+→ Multi-tenant Query API
+→ Next.js BFF
+→ Trace List / Filter / Cursor
+→ Span Timeline
 ```
 
-이 실험까지 완료하면 단순 API 구현을 넘어 실제 관측 시스템 운영 경험으로 발전할 수 있다.
+## 3. 측정으로 증명된 성과
 
-# CAREER_LOG.md 추가 내용
+### JDBC Batch
 
-## 실무 경험
+| Span 수 | 단건 중앙값 | Batch 중앙값 | 개선 |
+|---:|---:|---:|---:|
+| 100 | 91.084ms | 30.460ms | 약 2.99배 |
+| 1,000 | 874.985ms | 299.167ms | 약 2.92배 |
+| 5,000 | 4,566.945ms | 1,485.885ms | 약 3.07배 |
 
-* OTLP JSON Trace 수신 API를 직접 구현하고 Trace ID, Span ID, timestamp, attributes, events, links의 검증 경계를 정의함
-* JPA 단건 저장 대신 Spring JDBC batch를 적용하고 batch 크기별 처리량을 직접 측정함
-* 멀티테넌트 환경에서 클라이언트 Header를 신뢰하지 않고 API Key 소유권으로 Tenant와 Project를 결정함
-* API Key 원문을 저장하지 않고 공개 식별자와 Secret hash를 분리한 인증 구조를 구현함
-* DB 장애를 클라이언트 인증 실패와 구분해 HTTP 503으로 처리하고 Collector retry와 연결함
-* OpenTelemetry Collector persistent queue를 구성하고 Collector 재시작을 포함한 장애 복구 실험을 수행함
-* Collector receiver, exporter, queue metric을 통해 수신·전송·대기 상태를 직접 관찰함
-* 잘못된 실험 입력으로 200행이 생성된 문제를 queue metadata와 DB 결과를 비교해 원인을 분석하고 재실험함
+사용 가능한 표현:
 
-## 포트폴리오에서 강조할 부분
+- 100~5,000 Span Persistence-only 환경에서 JDBC Batch가 단건 대비 약 2.9~3.1배 높은 처리량
 
-### 1. 측정 기반 JDBC Batch 선택
+사용하면 안 되는 표현:
 
-* 단건 저장과 JDBC batch 비교
-* batch가 약 2.9~3.1배 높은 처리량
-* batch 크기 50~5000 비교
-* 가장 빠른 단일 수치가 아니라 안정성과 batch 크기 제한을 함께 고려해 1000 선택
+- Collector부터 DB까지 3배 개선
+- Network Round Trip을 1회로 감소
+- 실제 운영 처리량 3배
 
-### 2. 멀티테넌트 데이터 격리
+### Batch 크기
 
-* Tenant/Project Header 위조 방지
-* API Key DB 소유권을 신뢰 기준으로 사용
-* Secret hash 저장
-* 만료와 폐기 지원
-* 고카디널리티 인증 정보를 metric tag에서 제외
+5,000 Span 기준:
 
-### 3. 데이터 유실 방지
+- 500: 1,634.554ms
+- 1,000: 1,712.393ms
+- 5,000: 1,698.537ms
 
-* DB 장애 시 Backend가 HTTP 503 반환
-* Collector가 retry 수행
-* persistent queue에 telemetry 보관
-* Collector 재시작 후 queue metadata 복구
-* DB 복구 후 별도 수동 전송 없이 자동 저장
-* 100 Span 최종 저장 수 100, 고유 Span ID 100 확인
+결정:
 
-## 보존해야 할 증거
+- 가장 빠른 단일값만 선택하지 않고 실행 크기 제한과 안정성을 고려해 1,000 선택
 
-* JDBC batch 크기별 결과 표
-* 단건 저장과 batch 저장 비교 결과
-* DB 장애 시 HTTP 503 응답
-* 인증 lookup error metric
-* Collector 503 retry 로그
-* Collector 재시작 후 persistent queue metadata 로드 로그
-* DB 최종 100행, 고유 Span ID 100개 결과
-* queue capacity 50,000 출력
-* DB 장애 중 queue size 100 출력
-* DB 장애 중 queue size 10,000 출력
-* DB 복구 후 queue size 0 출력
-* 최초 200행 문제와 재실험 후 100행 결과
+### Query SQL
 
-## 이력서 문장 초안
+- Trace 20,000
+- Span 109,998
+- 현재 목록 SQL: 대체로 90~110ms
+- 후보 1%: 19.819ms
+- 후보 100%: 345.467ms
+- 동일 100% 기존 SQL: 98.048ms
 
-* 대량 telemetry 저장의 DB round trip 비용을 줄이기 위해 Spring JDBC batch를 적용하고 batch 크기별 성능을 측정하여, 단건 저장 대비 약 2.9~3.1배 높은 처리량을 확인하고 초기 운영 batch 크기를 1,000으로 결정
+핵심 교훈:
 
-* 멀티테넌트 telemetry 수집 과정에서 요청 Header 위조로 인한 데이터 격리 실패를 방지하기 위해 Project API Key의 DB 소유권으로 Tenant와 Project를 결정하고, 원문 Secret 비저장 및 hash 검증 방식의 인증 구조를 구현
+- 후보를 먼저 줄이는 SQL도 선택도가 높으면 더 느릴 수 있다.
+- 조건값만으로 데이터 선택도를 가정하면 위험하다.
+- 측정 없이 Index와 Summary를 추가하지 않았다.
 
-* TimescaleDB 장애 시 telemetry 유실을 줄이기 위해 Backend의 retryable 503 응답과 OpenTelemetry Collector persistent queue를 연계하고, Collector 재시작과 DB 복구 이후 100개 Span이 중복 없이 자동 저장되는 장애 복구 시나리오를 검증
+## 4. 장애 복구 성과
 
-* Collector 내부 receiver·exporter·queue 지표를 노출하여 DB 장애 중 queue 증가와 복구 후 소진을 관찰하고, 50,000 Span 용량의 queue에서 10,000 Span 수용 및 enqueue 실패가 발생하지 않음을 확인
+### 100 Span
 
-## 숫자를 추가하면 안 되는 항목
-
-다음 값은 아직 정확히 측정되지 않았으므로 이력서나 블로그에 숫자로 쓰지 않는다.
-
-* queue drain 처리량
-* DB 복구 완료시간
-* Span당 queue 디스크 사용량
-* 최대 장애 허용시간
-* 10,000 Span 최종 DB 저장 수
-* queue overflow 시 유실 수량
-
-## 블로그 주제
-
-### OpenTelemetry Collector 재시작에도 Trace를 잃지 않도록 만든 과정
-
-구성:
-
-1. 메모리 queue의 한계
-2. Backend DB 장애를 503으로 분류한 이유
-3. file storage와 persistent sending queue 구성
-4. API Key 인증과 Collector exporter 연결
-5. DB 중지 상태에서 100 Span 전송
-6. Collector 재시작
-7. queue metadata 복구 로그
-8. DB 복구 후 자동 재전송
-9. 200행 중복 실험이 발생한 원인
-10. 재실험으로 100행과 고유 Span ID 100개 확인
-11. persistent queue가 보장하지 못하는 장애 범위
-
-## 예상 면접 질문
-
-* Collector가 200을 반환했는데 DB 저장 성공이라고 볼 수 없는 이유는 무엇인가?
-* HTTP 401과 503을 Collector 관점에서 어떻게 구분해야 하는가?
-* Persistent queue가 있어도 데이터가 유실될 수 있는 상황은 무엇인가?
-* API Key 조회 DB가 장애 나면 왜 인증 실패 401이 아니라 503을 반환해야 하는가?
-* Queue capacity 50,000은 어떤 기준으로 다시 산정해야 하는가?
-* Collector 재시도에서 중복 Span이 발생할 가능성은 어떻게 처리했는가?
-* 왜 Kafka를 사용하지 않았는가?
-* Batch size 500이 더 빠른 결과가 있었는데 왜 1000을 선택했는가?
-
----
-
-## 현재 Phase
-
-Phase 7 — Trace 조회 API
-
-## 최근 완료
-
-### TimescaleDB 데이터 수명 관리
-
-* `spans` hypertable chunk interval 1일 확인
-* Hypercore columnstore 활성화
-* `tenant_id, project_id` 기준 segment 설정
-* `start_time DESC` 정렬 설정
-* 2일 초과 chunk 자동 columnstore 전환 정책
-* 30일 초과 chunk 자동 retention 정책
-* Columnstore 정책 수동 실행 검증
-* 전환 후 과거 Span 조회 검증
-* 최근 Span rowstore 저장 검증
-* 35일 전 테스트 chunk 삭제 검증
-* 4일 전과 최근 데이터 보존 검증
-* 두 background job 자동 스케줄 복구
-
-## 현재 데이터 수명주기
+검증:
 
 ```text
-0~2일
-→ rowstore
-
-2~30일
-→ columnstore
-
-30일 초과
-→ retention 삭제
+DB 장애
+→ Backend 503
+→ Collector Queue 100
+→ Collector 재시작
+→ Queue Metadata 복구
+→ DB 복구
+→ 자동 재전송
+→ DB 100행
+→ 고유 Span ID 100
+→ Queue 0
 ```
 
-## 검증이 필요한 항목
+사용 가능한 표현:
 
-* 운영 데이터 기반 columnstore 압축률
-* 조회 성능 전후 비교
-* 일일 DB 증가량
-* 30일 예상 저장 용량
-* background job 실패 감시
-* Tenant별 보존기간 요구사항
+- Collector 재시작을 포함한 장애 복구 실험에서 100개 Span이 중복 없이 자동 저장되는 것을 확인
 
-## 현재 기술 부채
+주의:
 
-* Tenant별 retention 미지원
-* Retention과 columnstore job 실패 알림 없음
-* 운영 환경의 디스크 용량 산정 미완료
-* 조회 API 미구현
-* Trace 상세 화면 미구현
-* Prometheus/Grafana 미연동
+- 모든 상황에서 데이터 유실 0%를 보장했다고 표현하면 안 된다.
+- Disk 손상, Overflow, 전원 차단은 검증하지 않았다.
 
-## 다음 작업
+### 10,000 Span
 
-1. Trace 목록 조회 요구사항과 SQL 정의
-2. 현재 인덱스가 조회 패턴을 지원하는지 확인
-3. 인증된 Project 범위의 Trace 목록 Repository 구현
-4. 최소 Trace 목록 API 구현
-5. Trace ID 기반 상세 조회 구현
+검증:
 
-# CAREER_LOG.md 추가
+- Queue Capacity 50,000
+- 장애 중 Size 10,000
+- Enqueue Failure 없음 또는 0
+- 복구 후 Queue Size 0
 
-## Portfolio Checkpoint — Telemetry 데이터 수명주기
+문서화되지 않은 값:
+
+- 최종 DB Total Rows
+- 최종 Distinct Span IDs
+
+따라서 “10,000 Span이 중복 없이 최종 저장됐다”라고 쓰면 안 된다.
+
+## 5. 데이터 수명주기 Portfolio Checkpoint
 
 ### 직접 경험한 내용
 
-* TimescaleDB hypertable의 chunk interval과 partition column 확인
-* 최신 Hypercore columnstore 설정 적용
-* 최근 데이터와 과거 데이터의 저장 방식을 분리
-* Background job을 중지하고 수동 실행하는 검증 절차 수행
-* Retention 실행 전에 실제 삭제 대상 chunk를 미리 확인
-* Chunk 전체 삭제가 다른 데이터에 미치는 위험 검토
-* 삭제 대상과 보존 대상 데이터를 함께 두고 정합성 검증
-* 정책 검증 후 자동 스케줄 복구
+- Hypertable Chunk와 Partition Column 확인
+- Hypercore Columnstore 설정
+- 최근과 과거 데이터 저장 방식 분리
+- Background Job 중지와 수동 실행
+- Retention 삭제 후보 사전 검사
+- Chunk 전체 삭제 위험 검토
+- 삭제 대상과 보존 대상 동시 검증
+- 정책 자동 스케줄 복구
 
-### 포트폴리오에서 평가받을 부분
-
-* 단순히 retention 설정만 추가하지 않고 실제 삭제 시나리오를 검증함
-* Chunk 단위 삭제의 데이터 유실 위험을 사전 검사함
-* Rowstore, columnstore, retention을 하나의 수명주기로 설계함
-* 제한된 저장 장비를 고려해 무기한 저장을 방지함
-* 아직 측정하지 않은 압축률과 성능 수치를 만들어내지 않음
-
-### 보존할 증거
-
-* Columnstore 전환 전후 `is_compressed` 결과
-* Columnstore job 성공 결과
-* 전환 후 과거 Span 조회 결과
-* 최근 Span rowstore 확인 결과
-* Retention 삭제 후보 `show_chunks` 결과
-* 대상 chunk의 `non_test_rows = 0` 결과
-* 삭제 전후 비교 Boolean 결과
-* 35일 전 Span 삭제 결과
-* 4일 전과 최근 Span 보존 결과
-* 두 정책의 `scheduled = true` 복구 결과
-
-### 이력서 문장 초안
-
-* 제한된 저장 자원에서 telemetry의 무기한 증가를 방지하기 위해 TimescaleDB rowstore·columnstore·retention 수명주기를 설계하고, 최근 2일은 rowstore, 2~30일은 columnstore, 30일 초과 데이터는 chunk 단위로 제거하도록 구성
-
-* Retention 정책 적용 과정에서 다른 데이터의 의도치 않은 삭제를 방지하기 위해 대상 chunk의 비테스트 행과 전체 삭제 후보를 사전 검사하고, 35일 전 데이터만 삭제되며 4일 전 및 최근 데이터는 보존되는 장애 시나리오를 검증
-
-### 예상 면접 질문
-
-* TimescaleDB retention이 행 단위 DELETE보다 유리한 이유는 무엇인가?
-* `start_time`과 `ingested_at` 중 어떤 값을 retention 기준으로 사용했는가?
-* 늦게 도착한 Span은 retention 정책에서 어떻게 처리되는가?
-* Tenant별 보존기간을 현재 공유 hypertable에서 구현하기 어려운 이유는 무엇인가?
-* Columnstore 전환 기준을 2일로 선택한 근거는 무엇인가?
-* Retention job 실행 전 어떤 안전 검사를 수행했는가?
-
----
-
-## Portfolio Checkpoint — 멀티테넌트 Trace 조회 기능
-
-### 직접 얻은 실무 경험
-
-* API Key 인증 결과를 조회 SQL의 Tenant·Project 경계로 연결
-* 클라이언트가 Tenant 또는 Project 범위를 직접 선택하지 못하도록 API 설계
-* 서로 다른 Project의 동일 Trace ID를 이용한 데이터 격리 통합 테스트 작성
-* 실시간 데이터 목록에 Offset 대신 Keyset Pagination 적용
-* 동일 시각 데이터를 안정적으로 정렬하기 위해 Trace ID를 보조 Cursor로 사용
-* 서비스·오류·duration 조건을 적용하면서 Trace 전체 집계값을 유지하는 SQL 설계
-* Cursor를 조회 조건 fingerprint에 결합해 조건 변경에 따른 페이지 누락과 중복 방지
-* 비정상적으로 큰 Trace가 애플리케이션 메모리를 점유하지 않도록 상세 조회 상한 적용
-* Mock 단위 테스트, HTTP 계약 테스트, 실제 TimescaleDB 통합 테스트의 책임 분리
-* 실제 HTTP 검증에 필요한 통제된 fixture를 구성하고 검증 후 정리
-* 테스트 실패 원인을 검증 순서와 Mock 기본 반환값 관점에서 분석
-
-### 채용 담당자와 면접관이 평가할 부분
-
-* 단순 CRUD가 아니라 멀티테넌트 데이터 격리를 SQL과 테스트에서 강제한 경험
-* 데이터가 계속 추가되는 APM 특성에 맞춰 Pagination 방식을 선택한 근거
-* 필터 검색 결과와 전체 Trace 집계 의미를 분리한 도메인 이해
-* Cursor를 권한 경계로 오해하지 않고 Repository의 Tenant·Project 조건을 실제 보안 경계로 유지한 점
-* 새로운 인덱스를 추측으로 추가하지 않고 실행계획과 측정 후 결정하려는 접근
-* 예외 응답, 최대 조회 범위, 반환 크기 제한 등 운영 위험을 API 계약에 반영한 경험
-
-### 보존해야 할 증거
-
-다음 자료를 삭제하지 않고 보존한다.
-
-* Project 간 동일 Trace ID 격리 통합 테스트 코드
-* Cursor 첫 페이지와 두 번째 페이지 HTTP 응답
-* 조건 변경 Cursor 요청의 `400` 응답
-* Trace 상세 `404`, `422` 응답
-* 서비스·오류·duration 조합 통합 테스트
-* 전체 Gradle 테스트 성공 로그
-* 수동 fixture INSERT와 DELETE 명령
-* 다음 성능 단계에서 생성할 `EXPLAIN (ANALYZE, BUFFERS)` 결과
-* 필터별 API 응답시간 측정 결과
-* 인덱스 적용 전후 비교 결과
-
-### 이력서 성과 문장 초안
-
-* OpenTelemetry Trace 조회 과정에서 API Key 인증 결과를 Tenant·Project 복합 조건으로 강제하고, 서로 다른 Project에 동일한 Trace ID를 구성한 통합 테스트로 멀티테넌트 데이터 격리를 검증
-* 실시간으로 데이터가 추가되는 Trace 목록의 중복과 누락을 줄이기 위해 시작 시각과 Trace ID 기반 Keyset Pagination을 적용하고, 조회 조건 fingerprint로 필터 변경 후 Cursor 재사용을 차단
-* 서비스·오류·Span duration 필터를 적용하면서 Trace 전체 집계값을 유지하도록 집계 SQL을 설계하고 실제 TimescaleDB 통합 테스트와 HTTP fixture로 동작을 검증
-* 과도하게 큰 Trace 상세 응답으로 인한 메모리 사용 위험을 줄이기 위해 Span 조회 상한과 초과 감지 로직을 적용하고 오류 응답 계약을 자동 테스트
-
-성능 측정 후 다음 내용을 추가한다.
+### 검증된 수명주기
 
 ```text
-데이터 규모
-필터별 p50/p95 응답시간
-인덱스 적용 전후 실행시간
-읽은 Buffer 수
-DB 크기와 테스트 환경
+0~2일
+→ Rowstore
+
+2~30일
+→ Columnstore
+
+30일 초과
+→ Retention
 ```
 
-### 블로그 주제
+### 평가 포인트
 
-#### 제목
-
-Offset 없이 실시간 Trace 목록을 조회하는 Cursor Pagination 설계
-
-#### 해결한 문제
-
-APM Trace가 계속 저장되는 상황에서 Offset Pagination을 사용하면 페이지 이동 중 중복과 누락이 발생할 수 있다.
-
-또한 서비스나 오류 필터가 바뀐 상태에서 이전 Cursor를 재사용하면 서로 다른 검색 결과 집합이 연결될 수 있다.
-
-#### 핵심 메시지
-
-* 실시간 데이터 목록에서는 정렬 기준이 안정적이어야 한다.
-* 동일 시각 데이터를 처리하려면 보조 정렬 기준이 필요하다.
-* Cursor 위치뿐 아니라 Cursor가 발급된 조회 조건도 검증해야 한다.
-* Cursor는 권한 경계가 아니며 Tenant 격리는 SQL에서 강제해야 한다.
-* 필터에 일치한 Span과 Trace 전체 집계는 다른 개념이다.
-
-#### 글 구성
-
-1. AeroTrace Trace 목록 요구사항
-2. Offset Pagination의 문제
-3. `traceStartTime + traceId` Keyset 설계
-4. `limit + 1` 조회로 다음 페이지 판단
-5. 서비스·오류·duration 필터 의미
-6. `WHERE`가 아닌 `HAVING`을 사용한 이유
-7. Query fingerprint가 필요한 이유
-8. Project 간 동일 Trace ID 격리 테스트
-9. 실제 fixture를 이용한 HTTP 검증
-10. 아직 남은 성능 측정과 인덱스 검토
-
-#### 필요한 수치와 자료
-
-* Trace 개수와 Span 개수
-* 첫 페이지와 다음 페이지 실행계획
-* Offset과 Cursor 방식 실행시간 비교
-* 서비스 필터 실행계획
-* 오류·duration 조합 실행계획
-* Cursor 조건 변경 `400` 응답
-* 페이지 간 Trace ID 비교 화면
-* Project 격리 통합 테스트 코드
-
-### 예상 면접 질문
-
-* Offset Pagination 대신 Keyset Pagination을 선택한 이유는 무엇인가?
-* 시작 시각만 Cursor로 사용하면 어떤 문제가 발생하는가?
-* 서비스 필터를 `WHERE service_name = ?`로 적용하지 않은 이유는 무엇인가?
-* 서비스 조건과 오류 조건이 서로 다른 Span에서 충족되면 어떻게 동작하는가?
-* Cursor fingerprint에 Tenant ID와 Project ID를 포함한 이유는 무엇인가?
-* Cursor에 HMAC이 없는데 보안상 안전한가?
-* 실제 멀티테넌트 데이터 격리는 어느 계층에서 강제되는가?
-* 5,000개 Span 제한은 어떤 운영 위험을 줄이는가?
-* 데이터가 증가하면 현재 목록 SQL의 첫 번째 병목은 무엇으로 예상하는가?
-* 인덱스를 바로 추가하지 않고 측정하려는 이유는 무엇인가?
-
-### 다음에 경험할 한 단계 높은 과제
-
-대표 데이터 규모를 직접 생성하고 다음을 비교한다.
-
-* 필터별 실행계획
-* Rowstore와 Columnstore 조회
-* 첫 페이지와 Cursor 페이지
-* 기존 인덱스 사용 여부
-* 추가 인덱스 후보의 실제 효과
-* 원본 Span 집계와 Trace summary 구조의 비용
-
-이 측정을 통해 기능 구현 경험을 운영 가능한 조회 성능 설계 경험으로 확장한다.
-
----
-
-## Portfolio Checkpoint — Trace 조회 성능 분석
-
-### 직접 얻은 경험
-
-* TimescaleDB hypertable의 Chunk별 실행계획 분석
-* `EXPLAIN ANALYZE`, Buffer hit, GroupAggregate, Merge Append, Nested Loop, Merge Join 비교
-* 필터 선택도와 실행계획 비용의 관계 검증
-* Keyset Cursor가 기능적 pagination과 DB 작업량 최적화에서 서로 다른 역할을 한다는 점 확인
-* 최적화 SQL이 데이터 분포에 따라 오히려 성능을 악화할 수 있음을 실험으로 검증
-* 측정 결과를 바탕으로 불필요한 인덱스와 조기 사전 집계 구조 도입을 보류
-
-### 보존할 증거
-
-* 벤치마크 데이터 생성 SQL과 결과
-* 필터별 실행계획 결과 파일
-* Cursor 페이지 실행계획
-* 후보 1%, 5%, 100% 비교 결과
-* 동일 조건 기존 방식과 후보 우선 방식 비교표
-* Buffer hit 및 실행시간 수치
+- 정책 설정만 추가하지 않고 실제 전환과 삭제 검증
+- 대상 Chunk의 비테스트 행 확인 후 Retention 실행
+- 늦게 도착한 오래된 Span의 조기 삭제 위험 인식
+- 공유 Hypertable에서 Tenant별 Retention이 어려운 이유 설명 가능
 
 ### 이력서 문장 초안
 
-20,000 Trace와 109,998 Span으로 TimescaleDB 조회 실행계획을 분석하고, 후보 Trace 우선 집계 전략이 선택도 1%에서는 약 19.8ms로 개선되지만 후보 100%에서는 약 345.5ms로 악화되는 것을 검증하여 데이터 분포에 취약한 조기 최적화와 불필요한 인덱스 도입을 방지
+- 제한된 저장 자원에서 Telemetry의 무기한 증가를 방지하기 위해 TimescaleDB Rowstore·Columnstore·Retention 수명주기를 설계하고, 최근 2일은 Rowstore, 2~30일은 Columnstore, 30일 초과 데이터는 Chunk 단위로 제거하도록 구성 및 실제 정책 실행 검증
 
-### 블로그 주제
+- Retention 실행 전 대상 Chunk의 비테스트 행과 전체 삭제 후보를 확인하고, 35일 전 데이터만 제거되며 4일 전과 최근 데이터가 보존되는 것을 검증
 
-**빠른 SQL이 항상 빠르지는 않다: Trace 후보 집계 전략의 선택도별 성능 역전**
+## 6. 멀티테넌트 조회 Portfolio Checkpoint
 
-글의 핵심은 후보를 먼저 줄이는 SQL이 작은 후보 집합에서는 효과적이지만, 후보가 많아지면 원본 데이터를 두 번 처리해 기존 방식보다 느려질 수 있다는 점이다.
+### 직접 경험한 내용
 
-### 예상 면접 질문
+- API Key 인증 결과를 Repository의 Tenant / Project 조건에 연결
+- 클라이언트가 Tenant / Project를 선택하지 못하게 설계
+- 서로 다른 Project에 동일 Trace ID 구성
+- 목록과 상세의 데이터 격리 검증
+- Offset 대신 Keyset Pagination
+- 동일 시작 시각의 보조 정렬 Trace ID
+- Query Fingerprint
+- Trace 포함 Filter와 전체 Trace 집계 분리
+- 최대 5,000 Span 상세 제한
+- 400 / 401 / 404 / 422 계약
+- 자동 Test와 실제 HTTP Fixture 검증
 
-* 후보 우선 방식은 왜 후보가 적을 때 빨랐는가?
-* 후보가 전체 Trace가 되자 실행계획은 어떻게 바뀌었는가?
-* Buffer hit가 많아졌는데 실행시간과 어떤 관계가 있었는가?
-* duration 값만으로 SQL 전략을 선택하면 왜 위험한가?
-* Trace Summary 테이블을 도입한다면 늦게 도착하는 Span은 어떻게 처리할 것인가?
+### 평가 포인트
+
+- 단순 CRUD가 아니라 Multi-tenant 격리를 SQL과 Integration Test로 강제
+- Cursor를 권한 경계로 착각하지 않음
+- 실시간 데이터 특성에 맞는 Pagination 선택
+- Filter에 맞는 Span과 전체 Trace 집계 의미 구분
+- 새로운 Index를 추측으로 추가하지 않음
+
+### 이력서 문장 초안
+
+- API Key 인증 결과를 Tenant·Project 복합 조회 조건으로 강제하고, 서로 다른 Project에 동일한 Trace ID를 구성한 통합 테스트로 Trace 목록과 상세의 멀티테넌트 데이터 격리를 검증
+
+- 실시간으로 Trace가 추가되는 목록의 페이지 중복과 누락 위험을 줄이기 위해 시작 시각과 Trace ID 기반 Keyset Pagination을 적용하고, Query Fingerprint로 Filter 또는 Project 변경 후 Cursor 재사용을 차단
+
+- Service, Error, Span Duration Filter를 적용하면서 목록 집계는 Trace 전체 Span을 기준으로 유지하도록 SQL을 설계하고 실제 TimescaleDB Integration Test와 HTTP Fixture로 검증
+
+## 7. Trace 조회 성능 Portfolio Checkpoint
+
+### 직접 경험한 내용
+
+- TimescaleDB Chunk별 실행계획
+- `EXPLAIN ANALYZE`
+- Buffer Hit
+- GroupAggregate
+- Merge Append
+- Nested Loop
+- Merge Join
+- Filter 선택도
+- Cursor가 기능적 Pagination과 DB 작업량 최적화에서 다른 역할임을 확인
+- 선택도에 따라 최적화 SQL이 역전되는 현상 검증
+- 불필요한 Index와 조기 Summary 도입 보류
+
+### 이력서 문장 초안
+
+- 20,000 Trace와 109,998 Span으로 TimescaleDB 실행계획을 분석하고, 후보 Trace 우선 집계가 선택도 1%에서는 19.819ms지만 후보 100%에서는 345.467ms로 악화되는 것을 검증하여 데이터 분포에 취약한 SQL 분기와 불필요한 Index 도입을 보류
+
+### 면접 포인트
+
+- 왜 후보가 적을 때 빨랐는가?
+- 후보 100%에서 왜 더 느려졌는가?
+- Buffer Hit 증가와 실행시간의 관계는?
+- Duration 값만으로 SQL을 선택하면 왜 위험한가?
+- Trace Summary의 늦게 도착하는 Span은 어떻게 처리할 것인가?
+
+## 8. Trace Explorer Portfolio Checkpoint
+
+### 직접 경험한 내용
+
+- Next.js App Router 기반 Trace Explorer
+- Browser에서 Backend 직접 호출을 피하는 BFF
+- Server-only 환경변수
+- Project API Key Browser 미노출
+- Runtime JSON 검증
+- Filter Draft와 적용 Query 분리
+- URL 상태 복원
+- Cursor Load More
+- 첫 페이지 오류와 추가 페이지 오류 분리
+- 추가 조회 실패 시 기존 데이터 유지
+- 상세 Dynamic Route Handler
+- Span Timeline
+- 실제 Multi-span Fixture 생성
+- Root / Parent, Multi-service, Error 상태 검증
+- 상세 Panel 위치 문제를 DOM Scroll 동기화로 해결
+- React Effect와 Event Handler의 책임 구분
+
+### 실제 검증 Trace
+
+```text
+Span: 3
+Service: 2
+Root: Server / OK / 200ms
+DB Child: Client / OK / 50ms
+Worker Child: Consumer / Error / 80ms
+Error Message: simulated verification failure
+```
+
+### 평가 포인트
+
+- 수집부터 UI까지 End-to-End 연결
+- Fake UI 데이터가 아니라 실제 OTLP 수집 데이터 사용
+- API Key를 Browser에 노출하지 않음
+- Cursor 오류와 중복 감지
+- 추가 페이지 장애에서 기존 사용자 데이터 보존
+- 실제 Backend 응답 확인 후 TypeScript 계약 정의
+- 400 / 404 / 502 실패 경로 검증
+
+### 이력서 문장 초안
+
+- OpenTelemetry Trace 데이터를 조회할 수 있도록 기간·Service·Error·Span Duration Filter와 Cursor 기반 Load More를 갖춘 Next.js Trace Explorer를 구현하고, 부모·자식 Span과 다중 Service 실행 흐름을 상대 Timeline으로 시각화
+
+- Project API Key의 Browser 노출을 방지하기 위해 Next.js Server-only BFF를 구성하고, Backend 장애와 추가 페이지 조회 실패 시 기존 Trace 목록을 유지하도록 오류 상태를 분리
+
+- Root Span 1개와 Child Span 2개, 두 Service와 Error 상태를 포함한 Telemetry를 실제 수집 API로 생성해 수집·저장·집계·상세 조회·Timeline 전체 흐름을 End-to-End로 검증
+
+### 현재 한계
+
+- 사용자 로그인 / 세션 없음
+- 다중 Project UI 없음
+- 공개 SaaS 인증 구조 아님
+- Frontend 자동화 Test 없음
+- 대형 Trace Rendering 미측정
+
+## 9. 통합 이력서 문장 초안
+
+### 수집과 저장
+
+- OpenTelemetry Trace의 Resource, Scope, Span, Attributes, Events, Links를 검증하고 TimescaleDB에 저장하는 OTLP/HTTP JSON 수집 파이프라인을 구현했으며, 요청 단위 Transaction과 Idempotent Insert로 부분 저장과 재전송 중복을 방지
+
+### JDBC Batch
+
+- 동일 데이터·SQL·Transaction 조건의 반복 Benchmark를 구성하고 Spring JDBC Batch를 적용해 100~5,000 Span Persistence-only 구간에서 단건 저장 대비 약 2.9~3.1배 높은 처리량을 확인했으며, Batch 크기별 측정을 통해 초기 운영값 1,000을 결정
+
+### Multi-tenancy
+
+- 클라이언트 Header 위조로 인한 데이터 격리 실패를 방지하기 위해 Project API Key의 DB 소유권으로 Tenant와 Project를 결정하고, 원문 Secret 미저장·Hash 검증·만료·폐기를 지원하는 인증 구조 구현
+
+### 장애 복구
+
+- TimescaleDB 장애를 503으로 분류해 Collector Retry와 File Storage Persistent Queue에 연결하고, Collector 재시작과 DB 복구 이후 100개 Span이 중복 없이 자동 저장되는 장애 복구 시나리오 검증
+
+### 데이터 수명주기
+
+- 최근 2일 Rowstore, 2~30일 Columnstore, 30일 초과 Retention 정책을 구성하고 실제 Chunk 전환과 삭제 대상을 사전 검증하여 제한된 저장 환경의 Telemetry 수명주기 구현
+
+### Query
+
+- API Key 인증 결과를 Tenant·Project 조회 경계로 강제하고, Trace 시작 시각과 ID 기반 Keyset Pagination 및 Query Fingerprint를 적용해 Filter 변경과 Project 간 Cursor 재사용을 차단
+
+### Query Performance
+
+- 20,000 Trace와 109,998 Span의 TimescaleDB 실행계획을 분석해 후보 우선 집계가 선택도에 따라 19.819ms에서 345.467ms까지 역전되는 것을 확인하고, 불필요한 SQL 분기와 Index 도입을 보류
+
+### Frontend
+
+- Next.js Server-only BFF와 Trace Explorer를 구현해 Project API Key 노출 없이 Trace 목록·Filter·Cursor Pagination·Span Timeline을 제공하고, 3 Span·2 Service·Error Trace를 실제 OTLP 경로로 End-to-End 검증
+
+## 10. 현재 사용하면 안 되는 표현
+
+- 초당 수만 Span 처리
+- 무중단 APM
+- 데이터 유실 0%
+- 대규모 트래픽 운영
+- 상용 서비스 운영
+- 실제 사용자 확보
+- 장애 예측 시스템 완성
+- Collector부터 DB까지 3배 개선
+- Network Round Trip 1회
+- N100 안정 운영
+- 10,000 Span 중복 없는 최종 저장
+- 30일 저장 용량 산정 완료
+- Columnstore 압축률 개선
+- Public SaaS 인증 완료
+- Production 배포 완료
+
+## 11. 보존해야 할 증거
+
+### 코드
+
+- Flyway V1~V8
+- `spans` Hypertable
+- 복합 외래키
+- Unique Index
+- OTLP Parser
+- AnyValue Parser
+- Event / Link Parser
+- JDBC Writer
+- Batch Benchmark
+- Project API Key
+- Auth Filter
+- Collector Config
+- Query Repository
+- Cursor Codec
+- Multi-tenant Integration Test
+- Next.js BFF
+- Trace Explorer
+- Span Timeline
+
+### 로그와 출력
+
+- Virtual Thread 확인
+- Flyway 적용
+- Hypertable / Chunk
+- 동일 Span 중복
+- Batch 결과
+- 503
+- Auth Metric
+- Collector Retry
+- Queue 100
+- Collector Restart Metadata
+- DB 100 / Distinct 100
+- Queue 10,000
+- Queue 0
+- Columnstore 전환
+- Retention 삭제
+- Query Cursor
+- Cursor Mismatch 400
+- Trace Detail 404 / 422
+- Frontend Detail 400 / 404 / 502
+
+### 성능 자료
+
+- JDBC Raw Measurement
+- Rewrite ON / OFF
+- Batch Size Table
+- Query Dataset SQL
+- `EXPLAIN ANALYZE`
+- Buffer Count
+- Candidate 1% / 5% / 100%
+- Test Environment
+- Date
+- Repeat Count
+
+### 화면
+
+- Trace List
+- Filter Query
+- Load More
+- Browser Network에 Authorization 없음
+- 3 Span / 2 Service 목록
+- Root / Client / Consumer Timeline
+- Error Span과 Message
+- Backend 장애 상세 오류
+
+## 12. 면접 사례
+
+### 사례 A — 성공 응답인데 Attribute가 저장되지 않음
+
+원인:
+
+- 기존 Test와 동일 Unique Identity
+- `ON CONFLICT DO NOTHING`
+
+해결:
+
+- Test별 고유 식별자
+- HTTP 응답과 DB 결과 함께 검증
+
+평가 포인트:
+
+- Idempotency가 Test에도 영향을 준다는 점
+- 성공 응답만 믿지 않은 점
+
+### 사례 B — `reWriteBatchedInserts` 보류
+
+행동:
+
+- ON / OFF 반복 비교
+- Span 수별 결과 확인
+- 일관된 개선 부재
+
+평가 포인트:
+
+- 유명 옵션을 무조건 적용하지 않음
+- 효과 없는 결과도 문서화
+
+### 사례 C — Queue 실험 200행
+
+증상:
+
+```text
+total_rows = 200
+distinct_span_ids = 100
+```
+
+분석:
+
+- 실행 중복 또는 이전 Queue
+- 새 Start Time으로 Unique Identity 변경
+
+해결:
+
+- DB와 Queue 초기화
+- 한 번만 실행
+- 100 / 100 확인
+
+평가 포인트:
+
+- Queue Metadata와 DB를 함께 분석
+- 실험 입력 조건 통제
+
+### 사례 D — Candidate SQL 성능 역전
+
+증상:
+
+- 1% 후보는 빠름
+- 100% 후보는 기존보다 느림
+
+분석:
+
+- 후보 생성과 원본 재조회
+- Join과 Buffer 증가
+- 선택도 의존
+
+평가 포인트:
+
+- 실제 데이터 분포 검증
+- 조기 최적화 방지
+
+### 사례 E — View를 눌러도 반응이 없어 보임
+
+증상:
+
+- 버튼은 Selected
+- 상세가 안 보임
+
+원인:
+
+- 상세 Panel은 목록 아래에 생성
+- 긴 Table 때문에 Viewport 밖
+
+해결:
+
+- DOM Ref
+- `scrollIntoView`
+- Scroll Margin
+
+평가 포인트:
+
+- 상태 문제와 표시 위치 문제 분리
+- 사용자 관점 오류 분석
+
+## 13. 블로그 주제
+
+### 1. JPA 대신 JDBC Batch를 선택한 과정
+
+- Telemetry Hot Path
+- 공정한 비교
+- 2.9~3.1배
+- Batch Size 1,000
+- Rewrite 보류
+
+### 2. Collector 재시작에도 Trace를 잃지 않도록 만든 과정
+
+- Memory Queue 한계
+- 503
+- File Storage
+- Restart
+- 100 / 100
+- 200행 실험 오류
+- Persistent Queue가 보장하지 못하는 범위
+
+### 3. TimescaleDB Telemetry 수명주기
+
+- Rowstore
+- Columnstore
+- Retention
+- 안전한 Chunk 삭제
+- Late Span
+- Tenant별 Retention의 어려움
+
+### 4. 실시간 Trace 목록의 Cursor Pagination
+
+- Offset 문제
+- Start Time + Trace ID
+- Limit + 1
+- Query Fingerprint
+- Cursor와 권한 경계 구분
+- HAVING과 전체 Trace 집계
+
+### 5. 빠른 SQL이 항상 빠르지는 않다
+
+- Candidate-first
+- 선택도 1%와 100%
+- Buffer
+- Planner
+- Summary 도입 조건
+
+### 6. API Key를 노출하지 않는 Next.js Trace Dashboard
+
+- Browser 직접 호출 위험
+- Server-only BFF
+- 환경변수
+- Filter와 Cursor
+- Multi-span Fixture
+- Local MVP와 Public SaaS 차이
+
+## 14. 다음 Portfolio Checkpoint
+
+Phase 9에서 다음 중 하나를 완료하면 갱신한다.
+
+- Backend / Frontend / Collector / TimescaleDB 통합 Compose
+- Health Check와 시작 순서
+- Reverse Proxy와 HTTPS
+- Backup / Restore 실전 검증
+- Oracle Cloud 배포
+- N100 홈서버 배포
+- AeroTrace 자체 Dogfooding
+- 실제 사용자 서비스 연동
+- 사내 PoC
+- 운영 장애와 복구 사례
+
+### 다음 한 단계 높은 과제
+
+```text
+빈 환경에서 어떤 Secret과 설정을 준비하고,
+어떤 순서로 전체 시스템을 실행하며,
+어떤 Health Check로 준비 상태를 판단하고,
+Trace를 전송한 뒤 Dashboard에서 확인하며,
+서비스 하나가 실패했을 때 어디서 원인을 확인하고,
+데이터와 설정을 어떻게 복구하는가?
+```
+
+이 과정을 완료하면 구현 경험이 실제 배포와 운영 경험으로 확장된다.

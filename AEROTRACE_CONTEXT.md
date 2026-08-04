@@ -1,95 +1,155 @@
 # AeroTrace 프로젝트 컨텍스트
 
-> 마지막 업데이트: 2026-07-27
-> 현재 상태: 개발 진행 중
-> 현재 Phase: Phase 3 — OTLP Trace 수신 및 저장
-> 다음 작업: JDBC batch chunk 크기 비교 및 운영 기본값 결정
+> 마지막 업데이트: 2026-08-04  
+> 현재 상태: Phase 8 웹 대시보드 MVP 완료  
+> 현재 Phase: Phase 9 — 로컬 통합 실행 및 배포 준비  
+> 다음 작업: 현재 Docker Compose와 환경변수 구성을 점검하고 Backend, Frontend, TimescaleDB, OpenTelemetry Collector의 통합 실행 절차를 확정한다.
+
+---
 
 ## 1. 프로젝트 개요
 
 AeroTrace는 OpenTelemetry 기반의 초경량 멀티테넌트 APM 서비스다.
 
-사이드 프로젝트, 개인 서비스, 소규모 개발팀처럼 기존 상용 APM의 비용이나 운영 복잡도가 부담스러운 사용자를 대상으로 한다.
+초기 대상은 상용 APM의 비용이나 운영 복잡도가 부담스러운 다음 사용자다.
 
-초기에는 SaaS 형태로 제공하고, 이후 동일한 코드베이스를 사용한 온프레미스 배포를 지원하는 것을 목표로 한다.
+- 사이드 프로젝트 개발자
+- 개인 서비스 운영자
+- 소규모 서비스 운영자
+- 소규모 개발팀
+- 사내 PoC 대상 서비스
 
-## 2. 프로젝트 목표
+초기에는 SaaS로 제공하고, 이후 동일 코드베이스로 온프레미스 배포를 지원하는 것을 목표로 한다.
+
+성공 기준은 기술을 많이 사용하는 것이 아니라 실제 문제를 해결하고, 직접 실행하고, 측정하고, 장애를 재현하고, 개선 근거를 남기는 것이다.
+
+## 2. 최종 목표
 
 1. 실제 사용자가 사용할 수 있는 안정적인 SaaS MVP 완성
-2. 사이드 프로젝트와 소규모 서비스를 위한 간단한 APM 제공
-3. 추후 온프레미스 배포가 가능한 구조 유지
+2. 소규모 서비스를 위한 단순한 Trace 중심 APM 제공
+3. 동일 코드베이스의 온프레미스 배포 지원
 4. 사내 서비스에 PoC와 도입을 제안할 수 있는 수준 달성
 5. 백엔드 개발자 이직에 활용할 수 있는 포트폴리오 구축
-6. 기술 블로그, GitHub, LinkedIn에 공유할 실무 경험 축적
+6. 기술 블로그, GitHub, LinkedIn에 공유할 근거와 자료 축적
 7. OpenTelemetry, APM, 관측 가능성, 성능 측정, 장애 대응 경험 확보
 
-## 3. 타깃 사용자
+## 3. 현재 기술 스택
 
-* 사이드 프로젝트 개발자
-* 개인 개발자
-* 소규모 서비스 운영자
-* 소규모 개발팀
-* 사내 PoC 대상 서비스
+### Backend
 
-## 4. 기술 및 운영 제약
+- Java 21
+- Spring Boot 4.1.0
+- Spring Web MVC
+- Virtual Threads
+- Spring JDBC
+- Flyway
+- HikariCP
+- Micrometer / Actuator
+- Gradle
 
-### 백엔드
+Telemetry 저장과 조회 hot path는 Spring JDBC를 사용한다. Spring Data JPA는 Tenant, Project, 사용자, API Key 관리 같은 control-plane 기능이 커질 때 검토한다.
 
-* Java 21
-* Spring Boot 4.1.0
-* Virtual Threads
-* Spring JDBC
-* Flyway
-* PostgreSQL JDBC Driver
-* 추후 Spring Data JPA 도입 예정
+### Database
 
-### 데이터베이스
-
-* PostgreSQL 15.18
-* TimescaleDB 2.28.3
-* TimescaleDB hypertable
-* JSONB
+- PostgreSQL 15.18
+- TimescaleDB 2.28.3
+- Hypertable
+- Rowstore / Hypercore Columnstore
+- JSONB
+- TimescaleDB background policy
 
 ### Telemetry
 
-* OpenTelemetry Protocol
-* 현재 OTLP/HTTP JSON Trace 수신 지원
-* OpenTelemetry Collector
-* 추후 OTLP Protobuf와 gzip 지원 예정
+- OTLP/HTTP JSON Trace 수신
+- OpenTelemetry Collector Contrib 0.157.0
+- Collector batch processor
+- OTLP HTTP JSON exporter
+- File storage 기반 persistent sending queue
+- Collector 내부 Prometheus metric endpoint
 
-### 프론트엔드
+Metrics와 Logs 수신은 아직 구현하지 않았다.
 
-* Next.js 예정
-* 아직 구현하지 않음
+### Frontend
+
+- Node.js 24
+- Next.js App Router
+- TypeScript
+- Tailwind CSS
+- ESLint
+- `src` 디렉터리 구조
+- Next.js Route Handler 기반 서버 전용 BFF
 
 ### 실행 환경
 
-* Docker Compose
-* Windows 개발 PC와 Docker Desktop
-* Oracle Cloud 무료 인스턴스 예정
-* N100, RAM 16GB, SSD 512GB 홈서버 예정
+- Windows 개발 PC
+- Docker Desktop
+- Docker Compose
+- 향후 Oracle Cloud 무료 인스턴스
+- 향후 N100, RAM 16GB, SSD 512GB 홈서버
 
-## 5. 현재 시스템 구조
+## 4. 현재 시스템 구조
+
+### Telemetry 수집 경로
 
 ```text
 Instrumented Application
-        │
         │ OTLP
         ▼
 OpenTelemetry Collector
-        │
+        │ batch + retry
+        │ persistent sending queue
         │ OTLP/HTTP JSON
         ▼
 AeroTrace Spring Boot Backend
-        │
+        │ API Key 인증
+        │ OTLP 검증
+        │ 요청 단위 transaction
         │ JDBC batch
         ▼
 TimescaleDB
 ```
 
-현재 Collector와 Backend의 실제 end-to-end 연동은 아직 완료하지 않았다.
+### 사용자 조회 경로
 
-## 6. 백엔드 패키지 방향
+```text
+Browser
+   │ same-origin HTTP
+   ▼
+Next.js App Router
+   │ server-only Route Handler
+   │ Project API Key 주입
+   ▼
+AeroTrace Spring Boot Query API
+   │ tenant_id + project_id 강제
+   ▼
+TimescaleDB
+```
+
+브라우저는 Spring Boot에 직접 API Key를 전달하지 않는다. Next.js 서버가 로컬 환경변수의 Project API Key로 Backend를 호출한다.
+
+현재 Frontend에는 사용자 로그인과 세션이 없으므로 로컬 개발과 접근이 제한된 PoC에만 적합하다. 공개 SaaS 인증 구조로 사용하면 안 된다.
+
+## 5. 데이터 소유 구조와 보안 경계
+
+```text
+Tenant
+└── Project
+    ├── Project API Key
+    └── Service
+        └── Trace
+            └── Span
+```
+
+- Tenant는 개인, 팀, 회사의 데이터 소유 경계다.
+- Project는 Tenant 내부 telemetry 구분 단위다.
+- 하나의 Project에 여러 `service.name`이 포함될 수 있다.
+- 모든 Span은 `tenant_id`, `project_id`에 귀속된다.
+- 클라이언트 Tenant / Project Header를 신뢰하지 않는다.
+- 인증된 API Key의 DB 소유권으로 Tenant와 Project를 결정한다.
+- 목록과 상세 SQL은 항상 `tenant_id`, `project_id`를 함께 조건으로 사용한다.
+- DB 복합 외래키가 잘못된 소유 관계 저장을 최종 차단한다.
+
+## 6. Backend 패키지 방향
 
 ```text
 com.huning.aerotrace
@@ -103,382 +163,519 @@ com.huning.aerotrace
 └── common
 ```
 
-현재는 OTLP 수신과 저장 경로를 `ingest` 모듈 아래에 구성하고 있다.
+하나의 Spring Boot 애플리케이션으로 시작하는 모듈형 모놀리스다. Kafka, Kubernetes, Elasticsearch, 초기 마이크로서비스는 현재 요구사항과 측정 결과로 정당화되지 않아 도입하지 않는다.
 
-마이크로서비스로 분리하지 않고 모듈형 모놀리스로 시작한다.
+## 7. 데이터베이스 Migration 상태
 
-## 7. 데이터 소유 구조
+### V1 — TimescaleDB 확장
 
-```text
-Tenant
-└── Project
-    └── Service
-        └── Trace
-            └── Span
-```
+- TimescaleDB extension
+- Flyway schema history
 
-* Tenant는 개인, 팀 또는 회사의 데이터 소유 경계다.
-* Project는 Tenant 내부의 telemetry 구분 단위다.
-* 하나의 Project에는 여러 `service.name`이 포함될 수 있다.
-* 모든 Span은 `tenant_id`, `project_id`에 귀속된다.
+### V2 — Tenant와 Project
 
-## 8. 현재 데이터베이스 Migration
+- `tenants`
+- `projects`
+- Tenant slug 유일성
+- Tenant 내부 Project slug 유일성
+- Project 존재 시 Tenant 삭제 제한
 
-### V1 — TimescaleDB 확장 활성화
+### V3 — Span hypertable
 
-```text
-V1__enable_timescaledb.sql
-```
+- `spans`
+- `start_time` 기준 Hypertable
+- 1일 Chunk
+- Tenant / Project 복합 외래키
+- Trace ID / Span ID / 시간 / duration / JSONB 제약조건
+- 중복 방지 Unique Index
+- 최근 조회와 Trace 조회 인덱스
 
-* TimescaleDB extension 활성화
-* Flyway schema history 관리 시작
+### V4 — Span dropped count
 
-### V2 — Tenant와 Project 생성
+- `dropped_attributes_count`
+- `dropped_events_count`
+- `dropped_links_count`
+- OTLP `uint32` 범위
 
-```text
-V2__create_tenants_and_projects.sql
-```
+### V5 — Project API Key
 
-* `tenants`
-* `projects`
-* Tenant 내부 Project slug 유일성
-* Project가 있는 Tenant의 삭제 제한
-* Tenant와 Project의 기본 무결성 제약조건
+- `project_api_keys`
+- `key_id`
+- `secret_hash`
+- 만료 시각
+- 폐기 시각
+- Tenant / Project 소유 관계
 
-### V3 — Span hypertable 생성
+### V6 — Columnstore 설정
 
-```text
-V3__create_spans.sql
-```
+- Segment: `tenant_id, project_id`
+- Order: `start_time DESC`
 
-* `spans` hypertable 생성
-* `start_time` 기준 1일 chunk
-* Tenant와 Project 복합 외래키
-* Trace ID와 Span ID 형식 검증
-* 시간 순서와 duration 검증
-* JSONB 자료형 검증
-* 중복 Span 방지 유일 인덱스
-* 최근 Span 조회 인덱스
-* Trace 조회 인덱스
+### V7 — Columnstore 정책
 
-### V4 — Span dropped count 추가
+- 2일보다 오래된 완성 Chunk 자동 전환
+
+### V8 — Retention 정책
+
+- `start_time` 기준 30일 초과 Chunk 자동 삭제
+
+## 8. 수집 API
 
 ```text
-V4__add_span_drop_counts.sql
+POST /v1/traces
+Content-Type: application/json
+Authorization: Bearer <project-api-key>
 ```
 
-* `dropped_attributes_count`
-* `dropped_events_count`
-* `dropped_links_count`
-* OTLP `uint32` 범위에 맞춘 CHECK 제약조건
+### 지원 범위
 
-## 9. 현재 구현 및 검증 완료 항목
+- Resource
+- Instrumentation Scope
+- Span
+- Resource / Span Attributes
+- Events
+- Links
+- AnyValue: string, boolean, integer, double, bytes, array, nested key-value
 
-다음 항목은 사용자가 직접 코드를 적용하고 실행해 정상 동작을 확인했다.
+### 주요 검증
 
-### 백엔드 기반
+- Trace ID 32자리 16진수
+- Span ID 16자리 16진수
+- all-zero ID 거부
+- Parent Span ID 검증
+- `service.name` 필수
+- 시작 / 종료 시각
+- Span kind / Status code
+- OTLP `uint32`
+- Attribute key와 중복 key
+- AnyValue 값 종류
+- Base64 bytes
+- Event / Link 구조
+- 요청 전체 원자성
 
-* Spring Boot 4.1.0 프로젝트 생성
-* Java 21.0.9 실행 확인
-* Actuator health endpoint 확인
-* Virtual Threads 활성화
-* HTTP 요청이 Virtual Thread에서 처리되는 것 확인
-* Gradle test와 애플리케이션 실행 확인
+### 요청 제한
 
-### 데이터베이스
+```yaml
+aerotrace:
+  ingest:
+    max-spans-per-request: 5000
+    max-request-body-bytes: 10485760
+    jdbc:
+      batch-size: 1000
+```
 
-* HikariCP와 TimescaleDB 연결
-* Flyway V1~V4 적용
-* Migration 재실행 방지 확인
-* TimescaleDB hypertable 생성 확인
-* 1일 chunk 설정 확인
-* FK, UNIQUE, CHECK 제약조건 확인
-* Tenant·Project·Span 관계 삽입 확인
+- 요청당 최대 5,000 Span
+- 요청 본문 최대 10 MiB
+- 제한 초과: 413
+- 잘못된 요청: 400
+- 지원하지 않는 Content-Type: 415
+- 인증 실패: 401
+- 일시적 DB 장애: 503
+- 성공: `{}`
 
-### OTLP 수신
-
-* `POST /v1/traces`
-* `application/json` 수신
-* 정상 요청에 `200 OK`, `{}` 반환
-* 빈 OTLP 요청 허용
-* 잘못된 JSON 구조 거부
-* 잘못된 Content-Type 거부
-
-### OTLP 파싱
-
-* `service.name`
-* scope name, version
-* trace ID, span ID, parent span ID
-* Span name과 kind
-* status code와 message
-* start/end timestamp
-* duration 계산
-* trace state와 flags
-* dropped attributes/events/links count
-* Resource Attributes
-* Span Attributes
-* Span Events
-* Span Links
-* AnyValue 문자열, 정수, 실수, 불리언, bytes, 배열, 중첩 key-value
-
-### 데이터 저장
-
-* JDBC 기반 Span 저장
-* Resource와 Span Attributes JSONB 저장
-* Events와 Links JSONB 저장
-* 요청 단위 트랜잭션
-* Tenant와 Project 복합 외래키를 통한 데이터 격리
-* `ON CONFLICT DO NOTHING` 기반 중복 방지
-* 다중 Span JDBC batch 저장
-* 신규·중복·영향 행 수 미확인 결과 분류
-
-### 개발 및 검증 도구
-
-* IntelliJ HTTP Client용 `.http` 요청 파일
-* IntelliJ Database Tool 연결
-* 로컬 개발용 SQL fixture
-* JDBC 단건 저장과 batch 저장 비교 벤치마크
-* pgJDBC `reWriteBatchedInserts` ON/OFF 비교
-
-## 10. 현재 성능 측정 결과
-
-측정 환경:
-
-* Windows 개발 PC
-* Docker Desktop
-* PostgreSQL 15 기반 TimescaleDB
-* HTTP와 OTLP JSON 파싱을 제외한 persistence-only 측정
-* 단건과 batch 모두 요청당 트랜잭션 1개
-* JSON 직렬화, 트랜잭션, JDBC 저장 시간을 동일하게 포함
-* 저장 결과 검증과 테스트 데이터 삭제는 측정에서 제외
-* 워밍업 후 반복 측정
-* 실행 순서를 교차하여 편향 완화
-* 중앙값 기준 비교
-
-### 주요 결과
-
-| Span 수 |      단건 중앙값 | JDBC batch 중앙값 | Batch 개선 |
-| -----: | ----------: | -------------: | -------: |
-|    100 |    91.084ms |       30.460ms |  약 2.99배 |
-|  1,000 |   874.985ms |      299.167ms |  약 2.92배 |
-|  5,000 | 4,566.945ms |    1,485.885ms |  약 3.07배 |
-
-측정된 처리량 범위:
+## 9. 저장 경로
 
 ```text
-단건 저장: 약 1,095~1,143 spans/sec
-Batch 저장: 약 3,283~3,365 spans/sec
+OTLP JSON
+→ Parsing / Validation
+→ ParsedSpan
+→ Request Transaction
+→ JSON Serialization
+→ JDBC Chunk Batch
+→ INSERT ... ON CONFLICT DO NOTHING
+→ TimescaleDB
 ```
 
-`reWriteBatchedInserts=true`는 현재 환경에서 일관된 개선을 보이지 않았다.
+중복 식별 기준:
 
-* 100 Span: 약 7.8% 악화
-* 1,000 Span: 약 3.5% 개선
-* 5,000 Span: 약 7.2% 악화
+```text
+tenant_id
+project_id
+trace_id
+span_id
+start_time
+```
 
-따라서 JDBC batch는 유지하고, `reWriteBatchedInserts`는 현재 활성화하지 않는다.
+일반 컬럼에는 자주 조회하는 식별자, 서비스, Span 이름, Kind, Status, 시간, duration을 저장한다. Resource Attributes, Span Attributes, Events, Links는 JSONB에 저장한다.
 
-## 11. 현재 허용한 기술 부채
+## 10. API Key와 멀티테넌시
 
-* 로컬 DB 비밀번호가 Compose에 직접 작성되어 있음
-* TimescaleDB와 Collector 이미지가 `latest` 태그 사용
-* Docker Compose의 obsolete `version` 속성 존재
-* API Key 인증 미구현
-* 임시 Tenant·Project UUID 헤더 사용
-* 사용자·멤버십·API Key control-plane 미구현
-* 요청 크기 제한 미구현
-* Tenant별 rate limit과 quota 미구현
-* OTLP Protobuf 미지원
-* gzip 미지원
-* 표준 OTLP 오류 응답 미구현
-* Testcontainers 미도입
-* 테스트가 로컬 TimescaleDB 실행 상태에 일부 의존
-* 요청 전체 Span을 하나의 batch로 처리
-* Collector persistent queue 미구성
-* retention과 compression 미적용
-* 백업과 복구 절차 미구현
-* Metrics와 Logs 수신 미구현
-* Query API와 Dashboard 미구현
+API Key 형식:
 
-## 12. 운영 전에 반드시 필요한 항목
+```text
+atr_<16-character-key-id>.<43-character-secret>
+```
 
-* API Key 인증
-* Tenant와 Project 데이터 격리 통합 테스트
-* 요청 본문 크기 제한
-* Tenant별 rate limit과 quota
-* Collector retry와 persistent queue
-* DB 장애 시 응답 정책
-* 중복 및 재시도 시나리오 테스트
-* retention 정책
-* TimescaleDB compression
-* 백업 및 복구 테스트
-* TLS와 안전한 네트워크 연결
-* 비밀번호와 Secret 환경변수 분리
-* 이미지 버전 고정
-* 애플리케이션 자체 Metrics
-* 수집 성공·실패·중복·지연시간 지표
-* 운영 배포용 healthcheck
-* 데이터 유실 시나리오 검증
+- 발급 시에만 원문 반환
+- 원문 Secret 미저장
+- `key_id` 저장
+- Secret SHA-256 hash 저장
+- 상수시간 비교
+- 만료 / 폐기 지원
+- Unknown Key에도 Dummy Hash 비교
+- 민감정보를 로그와 Metric Tag에 사용하지 않음
 
-## 13. 현재 검증이 필요한 항목
+검증 완료:
 
-* 적절한 JDBC batch chunk 크기
-* 요청당 최대 Span 수
-* 요청 크기별 메모리 사용량
-* OTLP HTTP 파싱을 포함한 전체 처리량
-* Collector를 포함한 end-to-end 처리량
-* 동시 요청 처리량
-* HikariCP connection pool 적정 크기
-* Virtual Threads와 DB connection pool의 관계
-* N100 홈서버 성능
-* 일일 DB 증가량
-* 평균 Span 크기
-* 인덱스 크기
-* JSONB Attribute 양에 따른 처리량 변화
-* retention과 compression 효과
-* DB 장애 중 데이터 유실 여부
+- 정상 Key
+- Header 누락
+- 잘못된 Bearer Header
+- 잘못된 Key 형식
+- Unknown Key
+- Secret mismatch
+- 만료 / 폐기
+- Tenant / Project Header 위조 무시
+- 인증 Project에 저장
+- Project 간 동일 Trace ID 조회 격리
 
-## 14. 다음 작업
+## 11. Collector와 장애 복구
 
-### 바로 진행할 작업
+### 구성
 
-1. 총 Span 수를 고정한 batch chunk 크기 비교
-2. 운영 기본 batch 크기 결정
-3. 요청 크기 및 Span 개수 제한 설계
-4. 표준화된 예외 처리와 OTLP 오류 응답
-5. API Key 기반 Tenant·Project 식별
+- OTLP Receiver
+- Batch Processor
+- OTLP HTTP JSON Exporter
+- Bearer API Key
+- Retry
+- `file_storage`
+- Docker Named Volume
+- Queue Consumer 2
+- Queue Capacity 50,000 Span
+- `block_on_overflow: false`
 
-### 이후 작업
+### 100 Span 장애 복구
 
-1. Collector와 Backend 실제 연결
-2. Collector retry와 persistent queue
-3. OTLP Protobuf와 gzip
-4. Trace 조회 API
-5. Trace 상세 조회
-6. Service와 Endpoint 집계
-7. TimescaleDB retention과 compression
-8. Next.js Dashboard
-9. AeroTrace 자체 관측
-10. Oracle Cloud와 N100 홈서버 배포
+- DB 중지
+- Collector에 100 Span 전송
+- Backend 503
+- Queue Size 100
+- Collector 재시작
+- Queue Metadata 복구
+- DB 복구
+- 자동 재전송
+- 최종 DB 100행
+- 고유 Span ID 100
+- Queue Size 0
+- 최종 중복과 유실 관찰되지 않음
 
-## 15. 프로젝트 진행 원칙
+### 10,000 Span Queue 수용
 
-* 측정되지 않은 성능 수치를 만들지 않는다.
-* 실제 병목이 확인되기 전 Kafka, Kubernetes, Elasticsearch 등을 추가하지 않는다.
-* 사용자가 직접 적용하고 실행한 작업만 완료로 기록한다.
-* SaaS와 온프레미스를 하나의 코드베이스로 지원할 수 있는 구조를 유지한다.
-* 기능을 독립적으로 실행하고 검증할 수 있는 작은 단계로 구현한다.
-* 보안, 멀티테넌시, 데이터 유실, 중복 저장 문제를 우선적으로 검토한다.
+- Capacity 50,000
+- 장애 중 Queue Size 10,000
+- Enqueue Failure 없음 또는 0
+- 복구 후 Queue Size 0
 
----
+10,000 Span 실험의 최종 DB 행 수와 고유 Span ID 수는 원본 출력이 남아 있지 않아 완료로 단정하지 않는다.
 
-## 현재 Phase
+### 미검증
 
-Phase 5 — OpenTelemetry Collector 장애 복구와 데이터 유실 방지
+- Queue 50,000 초과
+- Overflow Drop 수량
+- 디스크 공간 부족
+- File Storage 쓰기 오류
+- 호스트 강제 종료 / 전원 차단
+- Queue Drain 처리량
+- Span당 Queue Disk 사용량
 
-## 현재 완료된 기능
+## 12. 데이터 수명주기
 
-### Backend
+```text
+0~2일
+→ Rowstore
 
-* Java 21 / Spring Boot 4 기반 애플리케이션
-* Virtual Threads
-* Flyway 기반 TimescaleDB schema 관리
-* OTLP JSON `POST /v1/traces`
-* Trace ID, Span ID, timestamp, enum, attributes, events, links 검증
-* 요청당 최대 5,000 Span
-* 요청 본문 최대 10 MiB
-* 요청 단위 transaction
-* Spring JDBC batch insert
-* batch size 1000
-* `ON CONFLICT DO NOTHING` 기반 중복 방지
-* OTLP 오류 JSON 응답 통일
+2~30일
+→ Columnstore
 
-### 멀티테넌시 및 인증
+30일 초과
+→ Retention Chunk 삭제
+```
 
-* Tenant와 Project schema
-* Project API Key schema
-* API Key 발급
-* 원문 Secret 비저장
-* API Key hash 검증
-* 만료와 폐기 처리
-* OTLP 인증 Filter
-* API Key 소유권 기반 Tenant/Project 결정
-* 클라이언트 Tenant/Project Header 위조 방지
+검증 완료:
 
-### 관측 가능성
+- 4일 전 Span의 Rowstore → Columnstore 전환
+- 전환 후 기존 Hypertable 조회
+- 최근 Span Rowstore 유지
+- 35일 전 테스트 Chunk 삭제 후보 사전 검사
+- Retention 수동 실행
+- 35일 전 데이터 삭제
+- 4일 전과 최근 데이터 보존
+- 정책 자동 스케줄 복구
 
-* API Key 인증 결과 Counter
-* API Key DB 조회 Timer
-* Spring Boot Actuator health/metrics
-* Collector 내부 Prometheus metric endpoint
-* receiver, exporter, queue 지표 확인
+미측정:
 
-### 장애 복구
+- 대량 데이터 압축률
+- 전환 전후 조회 성능
+- 일일 DB 증가량
+- 30일 예상 저장 크기
+- Policy Job 실행 시간과 경보
 
-* 인증 DB 장애 HTTP 503
-* Span 저장 DB 장애 HTTP 503
-* Collector retry
-* Collector file storage
-* persistent sending queue
-* Docker named volume
-* Collector 재시작 후 queue 복구
-* DB 복구 후 자동 재전송
+## 13. Trace Query API
 
-## 검증된 결과
+### 목록
 
-* JDBC batch가 단건 저장보다 약 2.9~3.1배 빠름
-* 5,000 Span batch 처리량 약 3.1k~3.5k spans/s 범위
-* batch size 1000을 초기 운영값으로 선택
-* DB 장애 중 100 Span queue 보관
-* Collector 재시작 포함
-* DB 복구 후 최종 100행
-* 고유 Span ID 100개
-* DB 장애 중 queue size 100 확인
-* DB 복구 후 queue size 0 확인
-* 10,000 Span 장애 입력에서 queue size 10,000 확인
-* queue capacity 50,000 확인
-* 10,000 Span 실험에서 DB 복구 후 queue size 0 확인
-* queue enqueue 실패는 관찰되지 않음
+```text
+GET /api/v1/traces
+```
 
-## 아직 확인이 필요한 결과
+파라미터:
 
-* 10,000 Span 실험 최종 DB 행 수
-* 10,000 Span 실험 고유 Span ID 수
-* persistent queue 디스크 사용량
-* 정확한 queue drain 처리량
-* queue overflow 시 실제 drop 동작
+- `from`
+- `to`
+- `limit`
+- `cursor`
+- `serviceName`
+- `errorOnly`
+- `minSpanDurationNano`
 
-## 현재 기술 부채
+제한:
 
-* Actuator와 Collector metric endpoint의 운영 보안 미구성
-* API Key DB 조회 cache 없음
-* API Key rotation과 관리 API 없음
-* Collector receiver 인증 없음
-* gzip OTLP 요청 미지원
-* queue capacity가 실제 유입률과 장애 목표시간을 기준으로 산정되지 않음
-* Prometheus/Grafana 및 알림 없음
-* retention과 TimescaleDB compression 미적용
+- 기본 Limit 50
+- 최대 Limit 200
+- 최대 기간 30일
+- Service Exact Match
+- Duration 0 이상
 
-## 운영 전에 반드시 필요한 것
+집계:
 
-* API rate limit
-* Tenant별 quota
-* API Key 관리 및 rotation
-* 관리 endpoint 보호
-* Collector receiver 네트워크 보호
-* DB backup과 restore 검증
-* TimescaleDB retention 정책
-* queue 사용률과 enqueue failure 알림
-* 디스크 사용률 알림
-* Secret 관리 방식
-* TLS 적용
-* 장애 대응 runbook
+- Trace 시작 시각
+- Span 수
+- 고유 Service 수
+- 가장 긴 Span duration
 
-## 다음 작업
+필터는 Trace 포함 여부에 적용하지만 집계값은 Trace 전체 Span을 기준으로 한다.
 
-1. 10,000 Span 실험의 최종 DB 행 수와 고유 Span ID 확인
-2. 현재 queue 검증 결과를 기준으로 queue 용량 산정 방식 정리
-3. queue overflow 실험 여부 결정
-4. 이후 TimescaleDB retention과 compression 단계로 이동
+### 상세
 
----
+```text
+GET /api/v1/traces/{traceId}
+```
+
+- 인증 Project 범위 강제
+- 시작 시각 순서
+- 최대 5,000 Span
+- Invalid ID: 400
+- Not Found: 404
+- Too Large: 422
+
+### Cursor
+
+정렬:
+
+```text
+trace_start_time DESC
+trace_id DESC
+```
+
+Cursor:
+
+- 마지막 Trace 시작 시각
+- 마지막 Trace ID
+- 조회 조건 Fingerprint
+
+Fingerprint에는 Tenant, Project, 기간, Service, Error, Minimum Duration이 포함된다. 조건이 다른 요청에서 재사용하면 400이다.
+
+## 14. Trace 조회 성능
+
+테스트 데이터:
+
+- Trace 20,000
+- Span 109,998
+- Trace당 3~8 Span
+- Service 8
+- Error Trace 2,000
+- 50ms 이상 Trace 1,000
+- 250ms 이상 Trace 200
+
+| 조건 | 중앙 실행시간 |
+|---|---:|
+| 필터 없음 | 94.006ms |
+| Service | 104.686ms |
+| Error | 108.596ms |
+| 250ms Duration | 97.209ms |
+| 복합 필터 | 95.811ms |
+| Cursor 두 번째 페이지 | 106.646ms |
+
+후보 Trace 우선 SQL:
+
+| 후보 | 중앙 실행시간 |
+|---:|---:|
+| 200 / 1% | 19.819ms |
+| 1,000 / 5% | 34.795ms |
+| 20,000 / 100% | 345.467ms |
+
+동일 100% 조건의 기존 SQL은 98.048ms였다.
+
+현재 결정:
+
+- Raw Span 전체 집계 SQL 유지
+- 후보 우선 SQL 자동 분기 보류
+- Duration Index 보류
+- Trace Summary 조기 도입 보류
+
+## 15. Frontend Trace Explorer
+
+구현 완료:
+
+- Next.js App Router Dashboard
+- Trace 목록 / 상세 서버 전용 BFF
+- Backend URL과 API Key 서버 환경변수
+- Browser API Key 미노출
+- Loading / Success / Empty / Error
+- 최근 7일 기본 조회
+- From / To
+- Service Exact Match
+- Error Only
+- Minimum Span Duration
+- ms → ns 변환
+- 30일 초과 차단
+- URL Query 반영과 새로고침 복원
+- Cursor Load More
+- 추가 페이지 실패 시 기존 목록 유지
+- 중복 Trace / 동일 Cursor 감지
+- Trace 상세 Runtime Validation
+- Span Kind / Status / Scope / 시간 / Duration
+- Root / Parent Span
+- 상대 Timeline
+- Error Span 시각적 구분
+- 상세 Panel 자동 이동
+
+실제 다중 Span 검증:
+
+- Span 3
+- Service 2
+- Root 200ms, Server, OK
+- DB Child 50ms, Client, OK
+- Worker Child 80ms, Consumer, Error
+- Error Message: `simulated verification failure`
+
+확인:
+
+- 목록 Span Count 3
+- Service Count 2
+- Longest Span 200ms
+- Root / Parent 관계
+- Error 상태와 색상
+- 상대 위치와 길이
+
+현재 보안 한계:
+
+- 사용자 로그인 / 세션 없음
+- 서버당 하나의 Project API Key
+- 사용자별 Project 선택 없음
+- Frontend 접근자는 설정된 Project 데이터를 조회 가능
+
+## 16. Phase 완료 현황
+
+- Phase 1: Backend 기반 — 완료
+- Phase 2: 데이터 모델 — 완료
+- Phase 3: OTLP Trace 수집 — 완료
+- Phase 4: 수집 성능과 제한 — 완료
+- Phase 5: API Key와 멀티테넌시 — 완료
+- Phase 6: Collector, 장애 복구, 데이터 수명주기 — 완료
+- Phase 7: Trace Query API와 성능 분석 — 완료
+- Phase 8: 웹 대시보드 MVP — 완료
+- Phase 9: 로컬 통합 실행 및 배포 준비 — 시작
+
+## 17. 현재 기술 부채
+
+### 보안
+
+- 사용자 로그인 / 세션
+- 사용자 / 조직 / 멤버십 / 역할
+- API Key 관리 UI와 Rotation
+- Rate Limit
+- Tenant Quota
+- Actuator 보호
+- Collector Receiver 보호
+- 운영 Secret 관리
+
+### 운영
+
+- 통합 Compose 미완성
+- Reverse Proxy / HTTPS / Domain
+- Backup / Restore
+- Runbook
+- Prometheus / Grafana / Alerting
+- Columnstore / Retention Job 경보
+- Disk 경보
+- Image Version 고정
+
+### 기능
+
+- OTLP Protobuf
+- gzip
+- Metrics / Logs
+- Attributes / Events / Links 상세 UI
+- Service / Endpoint 집계
+- 사용자별 Project 전환
+- Frontend 자동화 테스트
+
+### 성능과 용량
+
+- N100 / Oracle Cloud 측정
+- End-to-End p50 / p95 / p99
+- 동시 수집 / 조회
+- HikariCP Sizing
+- 일일 DB 증가량
+- 평균 Span 크기
+- Queue Disk 사용량
+- Columnstore 압축률
+- 대형 Trace UI 렌더링
+
+## 18. 공개 운영 전에 반드시 필요한 것
+
+1. 사용자 인증과 세션
+2. Tenant / Project / Membership / Role
+3. API Key 관리와 Rotation
+4. Rate Limit
+5. Tenant Quota
+6. 관리 Endpoint 보호
+7. Collector Receiver 네트워크 보호
+8. TLS와 안전한 Secret 관리
+9. Backup / Restore 실전 검증
+10. Queue / DB / Disk / Policy Job 알림
+11. 장애 대응 Runbook
+12. 운영 Health Check
+13. 이미지 버전 고정
+
+## 19. Phase 9 다음 작업
+
+### Step 9-1 — 현재 실행 구성 점검
+
+- Root Docker Compose 확인
+- TimescaleDB 서비스와 Volume 확인
+- Collector 서비스와 Persistent Volume 확인
+- Backend / Frontend의 Compose 포함 여부 확인
+- 환경변수와 Secret 위치 확인
+- Image Tag 확인
+- Health Check 확인
+- 서비스 시작 순서와 재시작 정책 확인
+
+### 목표 실행 흐름
+
+```text
+docker compose up
+→ TimescaleDB Ready
+→ Collector Ready
+→ Backend Ready
+→ Frontend Ready
+→ Trace 전송
+→ Dashboard 조회
+```
+
+### 이후
+
+- 운영 환경변수 분리
+- Health Check와 시작 순서
+- Reverse Proxy / HTTPS / Domain
+- Backup / Restore
+- Oracle Cloud 또는 홈서버 배포 구조 결정
+
+## 20. 완료 판단 원칙
+
+- 사용자가 직접 적용하고 실행한 항목만 완료로 기록한다.
+- 원본 출력이 없는 수치는 완료로 단정하지 않는다.
+- 성능 수치를 추측하지 않는다.
+- Collector 수신 성공을 DB 저장 성공으로 간주하지 않는다.
+- 보안 경계는 UI나 Cursor가 아니라 인증 결과와 Repository의 Tenant / Project 조건에서 강제한다.
+- 현재 규모에 필요하지 않은 Kafka, Kubernetes, Elasticsearch를 포트폴리오 목적으로 추가하지 않는다.

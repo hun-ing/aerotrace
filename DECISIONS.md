@@ -1,8 +1,10 @@
 # AeroTrace 설계 결정 기록
 
-> 마지막 업데이트: 2026-07-27
+> 마지막 업데이트: 2026-08-04  
+> 현재 결정 수: 20  
+> 상태: 채택 / 보류 / 재검토 필요
 
-이 문서는 AeroTrace의 주요 설계 결정과 선택 이유, 단점, 재검토 조건을 기록한다.
+이 문서는 AeroTrace의 주요 설계 결정, 검토한 대안, 선택 이유, 위험, 재검토 조건을 기록한다.
 
 ---
 
@@ -14,7 +16,7 @@
 
 ### 해결하려는 문제
 
-장기적으로 유지 가능한 Java 기반 백엔드를 구성하고, 높은 동시성의 OTLP 요청을 비교적 적은 플랫폼 스레드로 처리할 기반이 필요했다.
+장기적으로 유지 가능한 Java 백엔드를 구성하고, 높은 동시성의 OTLP I/O 요청을 비교적 적은 플랫폼 Thread로 처리할 기반이 필요했다.
 
 ### 검토한 대안
 
@@ -26,29 +28,29 @@
 
 ### 선택
 
-* Java 21
-* Spring Boot 4.1.0
-* Virtual Threads 활성화
+- Java 21
+- Spring Boot 4.1.0
+- Virtual Threads 활성화
 
 ### 선택 이유
 
-* Java 21은 LTS 버전이다.
-* Virtual Threads를 안정적으로 사용할 수 있다.
-* Spring Boot 4에서 Java 21이 공식 지원된다.
-* 최신 Java 생태계를 사용하면서도 초기 프로젝트 위험을 제한할 수 있다.
-* OTLP 수신처럼 다수의 I/O 요청을 처리하는 서비스에서 Virtual Threads를 직접 검증할 수 있다.
+- Java 21은 LTS다.
+- Virtual Threads를 안정적으로 사용할 수 있다.
+- Spring Boot 4의 최소 Java 요구사항을 만족한다.
+- OTLP 수신처럼 I/O 중심 요청에서 Virtual Threads를 직접 검증할 수 있다.
+- 초기 프로젝트에서 더 높은 Java 버전으로 생태계 호환성 위험을 늘릴 필요가 없다.
 
 ### 단점과 위험
 
-* Spring Boot 4와 Jackson 3의 변경점을 학습해야 한다.
-* 일부 서드파티 라이브러리의 Boot 4 호환성을 확인해야 한다.
-* Virtual Threads가 DB connection 수 자체를 증가시키는 것은 아니므로 HikariCP 병목은 별도로 관리해야 한다.
+- Spring Boot 4와 Jackson 3 변경점을 학습해야 한다.
+- 서드파티 라이브러리 호환성을 확인해야 한다.
+- Virtual Threads는 DB Connection 수를 늘리지 않으므로 HikariCP 병목은 별도로 관리해야 한다.
 
 ### 재검토 조건
 
-* Java 25 LTS 마이그레이션 검토 시점
-* Spring Boot 또는 사용 라이브러리의 지원 정책 변화
-* Virtual Threads 관련 운영 문제가 확인될 때
+- Java LTS 마이그레이션 시점
+- 라이브러리 지원 정책 변화
+- Virtual Threads 관련 운영 문제가 측정될 때
 
 ---
 
@@ -60,14 +62,14 @@
 
 ### 해결하려는 문제
 
-초기 MVP에서 배포와 운영 복잡도를 낮추면서도 수집, Tenant 관리, 조회 기능의 책임을 구분해야 했다.
+초기 MVP에서 배포와 운영 복잡도를 낮추면서 수집, Tenant 관리, 조회 기능의 책임을 구분해야 했다.
 
 ### 검토한 대안
 
 1. 단일 패키지 구조
 2. 모듈형 모놀리스
 3. 초기 마이크로서비스
-4. 메시지 브로커 기반 수집 파이프라인
+4. 메시지 브로커 기반 분산 파이프라인
 
 ### 선택
 
@@ -82,22 +84,22 @@ common
 
 ### 선택 이유
 
-* 현재 규모에서 서비스 분리는 운영 부담이 더 크다.
-* 트랜잭션과 로컬 호출을 단순하게 유지할 수 있다.
-* 추후 실제 병목이 확인되면 모듈 경계를 기준으로 분리할 수 있다.
-* N100 홈서버와 Oracle Cloud 무료 환경에 적합하다.
+- 현재 규모에서 서비스 분리는 운영 부담이 더 크다.
+- Transaction과 로컬 호출을 단순하게 유지할 수 있다.
+- 실제 병목이 생기면 모듈 경계를 기준으로 분리할 수 있다.
+- N100 홈서버와 Oracle Cloud 무료 환경에 적합하다.
 
 ### 단점과 위험
 
-* 기능이 증가하면 모듈 간 의존성 관리가 필요하다.
-* 한 프로세스 장애가 전체 기능에 영향을 줄 수 있다.
-* 수집과 조회 부하가 경쟁할 수 있다.
+- 기능이 증가하면 모듈 간 의존성 관리가 필요하다.
+- 한 프로세스 장애가 전체 기능에 영향을 준다.
+- 수집과 조회 부하가 같은 프로세스와 DB에서 경쟁한다.
 
 ### 재검토 조건
 
-* 수집과 조회가 서로 다른 확장 요구를 가질 때
-* 배포 독립성이 실제로 필요해질 때
-* 단일 프로세스 자원 경합이 측정될 때
+- 수집과 조회가 서로 다른 확장 요구를 가질 때
+- 배포 독립성이 실제로 필요할 때
+- 단일 프로세스 자원 경합이 측정될 때
 
 ---
 
@@ -109,7 +111,7 @@ common
 
 ### 해결하려는 문제
 
-시간 범위 기반으로 대량의 Span을 저장하고 조회하면서 PostgreSQL 생태계를 유지할 저장소가 필요했다.
+시간 범위 기반 대량 Span을 저장하고 조회하면서 PostgreSQL 생태계와 단순한 운영 구성을 유지해야 했다.
 
 ### 검토한 대안
 
@@ -117,35 +119,35 @@ common
 2. TimescaleDB
 3. Elasticsearch
 4. ClickHouse
-5. 별도 시계열 데이터베이스
+5. 별도 시계열 DB
 
 ### 선택
 
-PostgreSQL 15 기반 TimescaleDB hypertable을 사용한다.
+PostgreSQL 15 기반 TimescaleDB Hypertable을 사용한다.
 
-* 시간 컬럼: `start_time`
-* 초기 chunk interval: 1일
+- 시간 컬럼: `start_time`
+- Chunk Interval: 1일
 
 ### 선택 이유
 
-* PostgreSQL SQL, JSONB, FK, transaction을 그대로 사용할 수 있다.
-* 시계열 chunk, retention, compression을 추후 사용할 수 있다.
-* MVP에서 별도 검색 클러스터를 운영하지 않아도 된다.
-* Tenant와 Project 같은 control-plane 데이터와 같은 DB에서 시작할 수 있다.
-* 제한된 홈서버 환경에서 운영 구성이 단순하다.
+- PostgreSQL SQL, JSONB, 외래키, Transaction을 사용할 수 있다.
+- Chunk, Columnstore, Retention을 사용할 수 있다.
+- 별도 검색 Cluster를 운영하지 않아도 된다.
+- Tenant와 Project Control Plane을 같은 DB에서 시작할 수 있다.
+- 제한된 홈서버 환경에 적합하다.
 
 ### 단점과 위험
 
-* Trace 전문 검색 엔진보다 자유로운 검색 성능이 낮을 수 있다.
-* JSONB 검색이 증가하면 인덱스 비용이 커질 수 있다.
-* 수집량이 커지면 단일 DB의 CPU, 디스크, WAL이 병목이 될 수 있다.
+- Trace 전문 검색 엔진보다 자유로운 검색 성능이 낮을 수 있다.
+- JSONB 검색 요구가 커지면 Index 비용이 증가한다.
+- 수집량이 커지면 CPU, Disk, WAL, Connection이 병목이 될 수 있다.
 
 ### 재검토 조건
 
-* TimescaleDB 단일 노드 저장 처리량 한계 도달
-* Attribute 검색 요구가 크게 증가
-* 장기 저장 비용이 감당하기 어려워질 때
-* 실제 조회 패턴에서 다른 저장소가 명확히 유리할 때
+- 단일 노드 처리량 한계 도달
+- Attribute 검색 요구 급증
+- 30일 저장 비용이 운영 한계를 초과
+- 다른 저장소의 이점이 측정으로 확인될 때
 
 ---
 
@@ -157,13 +159,13 @@ PostgreSQL 15 기반 TimescaleDB hypertable을 사용한다.
 
 ### 해결하려는 문제
 
-존재하는 Tenant ID와 Project ID를 각각 전달하더라도 서로 다른 Tenant와 Project가 잘못 조합될 수 있다.
+존재하는 Tenant ID와 Project ID가 서로 다른 소유 관계로 잘못 조합될 수 있다.
 
 ### 검토한 대안
 
-1. 애플리케이션 코드에서만 검증
-2. `project_id`만 외래키로 검증
-3. `tenant_id`, `project_id` 각각 별도 외래키
+1. 애플리케이션에서만 검증
+2. `project_id`만 외래키
+3. Tenant와 Project 각각 별도 외래키
 4. `(tenant_id, project_id)` 복합 외래키
 
 ### 선택
@@ -175,23 +177,23 @@ REFERENCES projects (tenant_id, id)
 
 ### 선택 이유
 
-* DB가 Tenant와 Project 소유 관계를 최종적으로 보장한다.
-* 애플리케이션 버그가 발생해도 잘못된 멀티테넌트 조합 저장을 차단한다.
-* 조회와 저장 모두 Tenant 범위를 명확히 유지할 수 있다.
+- DB가 Project 소유 관계를 최종 보장한다.
+- 애플리케이션 버그가 있어도 잘못된 멀티테넌트 조합을 차단한다.
+- 저장과 조회에서 Tenant 범위를 명확히 유지한다.
 
 ### 단점과 위험
 
-* 인덱스와 외래키 유지 비용이 발생한다.
-* 대량 수집 시 FK 검증 비용을 측정해야 한다.
+- 외래키와 Index 유지 비용이 발생한다.
+- 대량 수집에서 FK 검증 비용을 측정해야 한다.
 
 ### 재검토 조건
 
-* FK 검증이 실제 수집 병목으로 측정될 때
-* Tenant별 물리적 DB 분리 구조로 변경할 때
+- FK가 실제 수집 병목으로 측정될 때
+- Tenant별 물리 DB 분리 구조로 변경할 때
 
 ---
 
-## D-005. Collector 재전송 중복을 유일 인덱스로 방지
+## D-005. Collector 재전송 중복을 Unique Index로 방지
 
 ### 상태
 
@@ -199,14 +201,14 @@ REFERENCES projects (tenant_id, id)
 
 ### 해결하려는 문제
 
-Collector는 네트워크나 서버 오류 시 같은 Span을 다시 전송할 수 있다. 중복 저장이 발생하면 Trace 조회, 집계, 저장량이 왜곡된다.
+Collector Retry로 같은 Span이 재전송되면 Trace 집계와 저장량이 왜곡된다.
 
 ### 검토한 대안
 
 1. 중복 허용
-2. 애플리케이션에서 선조회 후 INSERT
-3. Redis 등 외부 deduplication 저장소
-4. DB unique index와 `ON CONFLICT DO NOTHING`
+2. INSERT 전 선조회
+3. Redis Deduplication
+4. DB Unique Index와 `ON CONFLICT DO NOTHING`
 
 ### 선택
 
@@ -220,7 +222,7 @@ UNIQUE (
 )
 ```
 
-저장 시:
+저장:
 
 ```sql
 ON CONFLICT DO NOTHING
@@ -228,22 +230,23 @@ ON CONFLICT DO NOTHING
 
 ### 선택 이유
 
-* 선조회와 INSERT 사이의 경쟁 조건을 피할 수 있다.
-* 별도 저장소 없이 DB가 원자적으로 중복을 차단한다.
-* Collector 재전송 시 오류 대신 idempotent 성공 처리가 가능하다.
-* TimescaleDB unique index 규칙상 시간 파티션 컬럼을 포함해야 한다.
+- 선조회와 INSERT 사이 경쟁 조건을 피한다.
+- 별도 저장소가 필요 없다.
+- DB가 원자적으로 중복을 차단한다.
+- Collector 재전송을 Idempotent 성공으로 처리할 수 있다.
+- TimescaleDB Unique Index 규칙에 따라 시간 파티션 컬럼을 포함한다.
 
 ### 단점과 위험
 
-* Unique index 저장 공간과 쓰기 비용이 발생한다.
-* `start_time`까지 동일해야 중복으로 판단된다.
-* 잘못된 timestamp 변환이 발생하면 같은 Span이 다른 행으로 저장될 수 있다.
+- Unique Index 쓰기 비용과 저장 공간이 발생한다.
+- `start_time`까지 동일해야 중복으로 판단된다.
+- Timestamp가 다르면 같은 Span ID가 별도 행으로 저장될 수 있다.
 
 ### 재검토 조건
 
-* Collector retry 실험에서 다른 중복 형태가 발견될 때
-* 인덱스 비용이 실제 병목으로 측정될 때
-* Protobuf 원본 식별자 보존 방식을 변경할 때
+- 다른 중복 형태가 실험에서 발견될 때
+- Index 비용이 병목으로 측정될 때
+- 식별자 저장 방식을 변경할 때
 
 ---
 
@@ -255,56 +258,57 @@ ON CONFLICT DO NOTHING
 
 ### 해결하려는 문제
 
-OpenTelemetry Attributes는 구조와 키가 동적으로 변하지만, 모든 조회를 JSONB 기반으로 수행하면 반복 파싱과 인덱스 비용이 발생할 수 있다.
+OpenTelemetry Attribute는 동적이지만 모든 조회를 JSONB에 의존하면 반복 파싱과 Index 비용이 커질 수 있다.
 
 ### 검토한 대안
 
-1. 모든 데이터를 일반 컬럼으로 저장
-2. 모든 데이터를 JSONB로 저장
-3. 핵심 필드는 일반 컬럼, 동적 데이터는 JSONB
-4. EAV 형태의 Attribute 별도 테이블
+1. 모든 값을 일반 컬럼
+2. 모든 값을 JSONB
+3. 핵심 필드는 컬럼, 동적 데이터는 JSONB
+4. EAV Attribute 테이블
 
 ### 선택
 
 일반 컬럼:
 
-* `service_name`
-* `trace_id`
-* `span_id`
-* `name`
-* `span_kind`
-* `status_code`
-* `start_time`
-* `end_time`
-* `duration_nano`
-* Tenant와 Project 식별자
+- `service_name`
+- `trace_id`
+- `span_id`
+- `parent_span_id`
+- `name`
+- `span_kind`
+- `status_code`
+- `start_time`
+- `end_time`
+- `duration_nano`
+- Tenant / Project 식별자
 
 JSONB:
 
-* Resource Attributes
-* Span Attributes
-* Events
-* Links
+- Resource Attributes
+- Span Attributes
+- Events
+- Links
 
 ### 선택 이유
 
-* 주요 대시보드와 Trace 조회 필드를 빠르게 필터링할 수 있다.
-* OpenTelemetry의 동적 Attribute 구조를 보존할 수 있다.
-* 신규 Attribute가 추가될 때 migration이 필요하지 않다.
-* EAV 구조보다 저장과 조회 구현이 단순하다.
+- 주요 목록과 상세 필드를 빠르게 사용할 수 있다.
+- 동적 Attribute 구조를 보존할 수 있다.
+- 신규 Attribute에 Migration이 필요 없다.
+- EAV보다 저장과 조회 구현이 단순하다.
 
 ### 단점과 위험
 
-* 일부 값이 일반 컬럼과 JSONB에 중복 저장된다.
-* 임의 Attribute 검색은 GIN 인덱스 없이는 느릴 수 있다.
-* JSONB 크기가 증가하면 저장량과 WAL이 증가한다.
+- 일부 값이 컬럼과 JSONB에 중복될 수 있다.
+- 임의 Attribute 검색은 Index 없이 느릴 수 있다.
+- JSONB 크기가 커지면 저장량과 WAL이 증가한다.
 
 ### 재검토 조건
 
-* 실제 Attribute 검색 API 구현
-* JSONB 조회 성능 측정
-* GIN 인덱스 적용 전후 비교
-* 평균 Span 크기와 저장량 측정
+- Attribute 검색 API 구현
+- JSONB 실행계획과 크기 측정
+- GIN Index 비교
+- 평균 Span 크기 측정
 
 ---
 
@@ -316,45 +320,45 @@ JSONB:
 
 ### 해결하려는 문제
 
-잘못된 식별자, 시간, AnyValue, Event, Link 데이터가 DB까지 전달되면 저장 실패, Trace 손상, 조회 오류가 발생할 수 있다.
+잘못된 ID, 시간, AnyValue, Event, Link가 저장되면 Trace 손상과 조회 오류가 발생할 수 있다.
 
 ### 선택
 
-다음 항목을 애플리케이션 파서에서 검증한다.
+Parser에서 다음을 검증한다.
 
-* Trace ID와 Span ID 길이 및 16진수 형식
-* 전부 0인 ID 거부
-* `service.name` 필수
-* 시작 시각과 종료 시각 순서
-* Span kind와 status code 범위
-* OTLP `uint32` 범위
-* AnyValue 자료형
-* 중복 Attribute key
-* Event와 Link 구조
-* Link 식별자
+- Trace ID / Span ID
+- all-zero ID
+- `service.name`
+- 시작 / 종료 시각
+- Span Kind / Status Code
+- `uint32`
+- AnyValue
+- 중복 Attribute Key
+- Event / Link 구조
+- Link 식별자
 
 ### 선택 이유
 
-* 영구적으로 잘못된 요청은 DB 저장 전에 거부할 수 있다.
-* 오류 위치를 JSON path로 표현할 수 있다.
-* 일부만 저장되는 상황을 피할 수 있다.
-* DB 제약조건은 최종 방어선으로 유지한다.
+- 영구적으로 잘못된 요청을 DB 전에 거부한다.
+- 오류 위치를 구체적으로 표현할 수 있다.
+- 요청 일부만 저장되는 상황을 피한다.
+- DB 제약조건을 최종 방어선으로 유지한다.
 
 ### 단점과 위험
 
-* OTLP 표준보다 엄격한 AeroTrace 정책이 포함될 수 있다.
-* `service.name` 누락 요청을 거부하는 정책은 호환성에 영향을 줄 수 있다.
-* 하나의 잘못된 Span 때문에 요청 전체가 거부된다.
+- OTLP 표준보다 엄격한 AeroTrace 정책이 포함될 수 있다.
+- `service.name` 필수 정책은 호환성에 영향을 준다.
+- 한 Span 오류로 요청 전체가 거부된다.
 
 ### 재검토 조건
 
-* Partial Success 응답 도입
-* 실제 사용자 서비스에서 호환성 문제가 발생
-* Collector에서 이미 보완 가능한 필드가 확인될 때
+- Partial Success 도입
+- 실제 사용자 호환성 문제
+- Collector에서 보완 가능한 필드가 확인될 때
 
 ---
 
-## D-008. Telemetry 저장 경로는 JDBC를 사용
+## D-008. Telemetry 저장 경로는 Spring JDBC를 사용
 
 ### 상태
 
@@ -362,43 +366,43 @@ JSONB:
 
 ### 해결하려는 문제
 
-Span은 요청당 다량으로 저장되며, ORM Entity 관리와 개별 INSERT 비용은 telemetry hot path에 불필요할 수 있다.
+대량 Span 저장에서 ORM Entity 관리와 개별 INSERT 비용을 피하고 SQL과 Batch를 직접 제어해야 했다.
 
 ### 검토한 대안
 
 1. Spring Data JPA
-2. `JdbcTemplate`
+2. Spring JDBC
 3. R2DBC
-4. COPY protocol
+4. PostgreSQL COPY
 5. 외부 메시지 브로커
 
 ### 선택
 
-* Telemetry 저장: Spring JDBC
-* Tenant, Project, API Key 등 control-plane: 추후 JPA 검토
+- Telemetry 저장과 현재 Query Repository: Spring JDBC
+- Control Plane: 필요할 때 JPA 검토
 
 ### 선택 이유
 
-* SQL과 batch 동작을 직접 제어할 수 있다.
-* `ON CONFLICT DO NOTHING`을 명시적으로 사용할 수 있다.
-* JSONB와 TimescaleDB SQL을 직접 다루기 쉽다.
-* 현재 규모에서 R2DBC나 메시지 브로커가 필요하지 않다.
+- SQL과 Batch를 직접 제어한다.
+- `ON CONFLICT DO NOTHING`을 명시적으로 사용한다.
+- JSONB와 TimescaleDB SQL을 다루기 쉽다.
+- 현재 규모에서 R2DBC와 메시지 브로커가 필요하지 않다.
 
 ### 단점과 위험
 
-* SQL과 파라미터 순서를 직접 관리해야 한다.
-* Column 추가 시 INSERT SQL과 바인딩 코드 수정이 필요하다.
-* 큰 batch의 메모리와 JDBC 한계를 직접 관리해야 한다.
+- SQL과 Parameter 순서를 직접 관리한다.
+- Schema 변경 시 SQL과 Binding을 함께 수정해야 한다.
+- 대형 Batch의 메모리와 JDBC 한계를 직접 관리해야 한다.
 
 ### 재검토 조건
 
-* JDBC가 측정된 병목이 될 때
-* PostgreSQL COPY 방식 비교가 필요할 때
-* 데이터 수집과 DB 장애를 분리할 필요가 생길 때
+- JDBC가 병목으로 측정될 때
+- COPY 비교가 필요할 때
+- 수집과 DB 장애를 더 강하게 분리해야 할 때
 
 ---
 
-## D-009. Span 요청 단위 JDBC batch 사용
+## D-009. Span 저장에 JDBC Batch 사용
 
 ### 상태
 
@@ -406,57 +410,54 @@ Span은 요청당 다량으로 저장되며, ORM Entity 관리와 개별 INSERT 
 
 ### 해결하려는 문제
 
-Span마다 `JdbcTemplate.update()`를 호출하면 JDBC 호출과 PreparedStatement 실행 비용이 반복된다.
+Span별 `JdbcTemplate.update()`는 JDBC 호출과 Statement 실행 비용을 반복한다.
 
 ### 검토한 대안
 
 1. Span별 단건 INSERT
-2. 요청 전체 JDBC batch
-3. 고정 크기 chunk batch
+2. 요청 전체 Batch
+3. 고정 크기 Chunk Batch
 4. PostgreSQL COPY
-5. 메시지 큐 기반 비동기 저장
-
-### 선택
-
-현재는 하나의 OTLP 요청에 포함된 Span을 `JdbcTemplate.batchUpdate()`로 저장한다.
+5. 비동기 Message Queue
 
 ### 측정 조건
 
-* 단건과 batch 모두 요청당 트랜잭션 1개
-* JSON 직렬화, 트랜잭션, JDBC 저장 시간을 동일하게 포함
-* 저장 결과 검증과 데이터 삭제는 측정에서 제외
-* 워밍업 후 반복 측정
-* 중앙값 기준 비교
+- 단건과 Batch 모두 요청당 Transaction 1개
+- JSON 직렬화, Transaction, JDBC 저장 포함
+- 저장 검증과 데이터 삭제 제외
+- Warm-up 후 반복
+- 중앙값 비교
 
 ### 측정 결과
 
-| Span 수 |      단건 중앙값 |   Batch 중앙값 |      개선 |
-| -----: | ----------: | ----------: | ------: |
-|    100 |    91.084ms |    30.460ms | 약 2.99배 |
-|  1,000 |   874.985ms |   299.167ms | 약 2.92배 |
-|  5,000 | 4,566.945ms | 1,485.885ms | 약 3.07배 |
+| Span 수 | 단건 중앙값 | Batch 중앙값 | 개선 |
+|---:|---:|---:|---:|
+| 100 | 91.084ms | 30.460ms | 약 2.99배 |
+| 1,000 | 874.985ms | 299.167ms | 약 2.92배 |
+| 5,000 | 4,566.945ms | 1,485.885ms | 약 3.07배 |
+
+### 선택
+
+JDBC Batch를 유지한다.
 
 ### 선택 이유
 
-* 모든 측정 구간에서 batch가 약 2.9~3.1배 높은 처리량을 보였다.
-* 단건 저장은 약 1,095~1,143 spans/sec였다.
-* Batch 저장은 약 3,283~3,365 spans/sec였다.
-* 동일한 SQL, 데이터, 트랜잭션, JSON 직렬화 범위에서 반복 검증했다.
+- 모든 구간에서 약 2.9~3.1배 높은 처리량을 확인했다.
+- 단건 저장은 약 1,095~1,143 spans/s였다.
+- Batch 저장은 약 3,283~3,365 spans/s였다.
 
 ### 단점과 위험
 
-* 요청에 포함된 모든 Span을 한 번에 준비해 메모리에 보관한다.
-* 비정상적으로 큰 요청은 메모리와 JDBC batch에 부담이 된다.
-* 현재 테스트는 HTTP 파싱과 Collector를 포함하지 않았다.
-* `JdbcTemplate.batchUpdate()` 호출 수와 실제 DB 네트워크 왕복 수는 동일한 개념이 아니다.
+- 요청 Span을 메모리에 준비해야 한다.
+- 큰 요청은 메모리와 Transaction에 부담이 된다.
+- HTTP와 Collector를 포함하지 않은 Persistence-only 결과다.
 
 ### 재검토 조건
 
-* Batch chunk 크기 측정 완료
-* 요청 최대 크기 설계
-* N100 홈서버 측정
-* End-to-end 부하 테스트
-* 메모리 사용량 측정
+- 운영 장비 측정
+- End-to-End 부하 테스트
+- 메모리 사용량 측정
+- COPY 비교
 
 ---
 
@@ -468,61 +469,65 @@ Span마다 `JdbcTemplate.update()`를 호출하면 JDBC 호출과 PreparedStatem
 
 ### 해결하려는 문제
 
-pgJDBC가 JDBC batch INSERT를 multi-values INSERT로 재작성할 때 추가 성능 개선이 가능한지 확인해야 했다.
+pgJDBC가 Batch INSERT를 Multi-values INSERT로 재작성할 때 추가 성능 개선이 있는지 확인해야 했다.
 
 ### 검토한 대안
 
-1. 기본값 `false`
+1. 기본값 OFF
 2. `reWriteBatchedInserts=true`
 
 ### 측정 결과
 
-| Span 수 |   OFF Batch |    ON Batch |     ON 변화 |
-| -----: | ----------: | ----------: | --------: |
-|    100 |    30.460ms |    32.836ms | 약 7.8% 악화 |
-|  1,000 |   299.167ms |   288.642ms | 약 3.5% 개선 |
-|  5,000 | 1,485.885ms | 1,593.576ms | 약 7.2% 악화 |
+| Span 수 | OFF Batch | ON Batch | 변화 |
+|---:|---:|---:|---:|
+| 100 | 30.460ms | 32.836ms | 약 7.8% 악화 |
+| 1,000 | 299.167ms | 288.642ms | 약 3.5% 개선 |
+| 5,000 | 1,485.885ms | 1,593.576ms | 약 7.2% 악화 |
 
 ### 결정
 
-현재 애플리케이션 설정에는 `reWriteBatchedInserts=true`를 적용하지 않는다.
+현재 설정에는 적용하지 않는다.
 
 ### 결정 이유
 
-* Span 수에 따라 결과 방향이 달라졌다.
-* 100 Span과 5,000 Span에서는 오히려 느려졌다.
-* 1,000 Span의 개선 결과도 개별 측정 범위와 겹쳤다.
-* 일관된 효과가 확인되지 않은 옵션을 운영 설정에 추가할 근거가 부족하다.
+- Span 수에 따라 결과 방향이 달랐다.
+- 일관된 개선 효과가 없다.
+- 운영 복잡도를 늘릴 근거가 부족하다.
 
 ### 재검토 조건
 
-* N100 홈서버에서 재측정
-* DB가 별도 원격 서버로 분리될 때
-* pgJDBC 버전 변경
-* Batch chunk 크기 변경
-* INSERT SQL 구조 변경
+- N100 재측정
+- 원격 DB
+- pgJDBC 버전 변경
+- INSERT SQL 또는 Batch 크기 변경
 
+---
 
-# Recovered Architecture Decisions — 2026-08-03
+## D-011. JDBC Batch 크기를 1,000으로 설정
 
-## JDBC Batch 크기를 1000으로 설정
+### 상태
+
+채택
 
 ### 해결하려는 문제
 
-Telemetry Span을 단건 INSERT하면 DB round trip과 statement 실행 비용이 커져 처리량이 낮아진다. 반대로 batch가 지나치게 크면 메모리 사용량, transaction 크기, 장애 시 재처리 범위가 커질 수 있다.
+Batch가 너무 작으면 JDBC 실행 비용이 증가하고, 너무 크면 메모리, Transaction, 장애 재처리 범위가 커진다.
 
-### 검토한 대안
+### 측정 결과
 
-* 단건 JDBC INSERT
-* batch 50
-* batch 100
-* batch 250
-* batch 500
-* batch 1000
-* batch 2000
-* batch 5000
+5,000 Span 처리:
 
-### 선택한 방식
+| Batch 크기 | 총 처리시간 | 처리량 |
+|---:|---:|---:|
+| 50 | 2,207.706ms | 2,265 spans/s |
+| 100 | 1,679.864ms | 2,976 spans/s |
+| 250 | 1,950.707ms | 2,563 spans/s |
+| 500 | 1,634.554ms | 3,059 spans/s |
+| 1,000 | 1,712.393ms | 2,920 spans/s |
+| 2,000 | 1,711.864ms | 2,921 spans/s |
+| 5,000 | 1,698.537ms | 2,944 spans/s |
+
+### 선택
 
 ```yaml
 aerotrace:
@@ -533,395 +538,314 @@ aerotrace:
 
 ### 선택 이유
 
-* 단건 저장보다 JDBC batch가 약 2.9~3.1배 높은 처리량을 보였다.
-* batch 500이 일부 실험에서 가장 빨랐지만 500~5000의 차이가 크지 않았다.
-* batch 1000은 충분한 처리량을 유지하면서 한 번의 JDBC 실행 크기를 제한한다.
-* Collector batch 설정과도 이해하기 쉬운 초기 정렬값이다.
-
-### 단점과 위험
-
-* 현재 로컬 개발 환경에서 측정한 값이다.
-* 실제 Oracle Cloud 또는 홈서버 환경에서는 결과가 달라질 수 있다.
-* Span 크기와 DB connection 수에 따라 재조정이 필요하다.
+- 500이 가장 빠른 단일 결과였지만 500~5,000 차이가 크지 않았다.
+- 1,000은 충분한 처리량을 유지한다.
+- 한 번의 JDBC 실행 크기와 메모리를 제한한다.
+- 절대 최적값이 아니라 초기 운영값이다.
 
 ### 재검토 조건
 
-* 운영 장비에서 처리량 측정
-* 평균 Span 크기 측정
-* DB CPU 또는 connection pool 병목 발생
-* batch 처리 지연 증가
-* transaction 크기 문제 발생
+- 운영 장비 측정
+- 평균 Span 크기
+- DB CPU / Connection 병목
+- Batch 지연 증가
 
 ---
 
-## 원문 API Key를 저장하지 않음
+## D-012. Project API Key 원문을 저장하지 않음
+
+### 상태
+
+채택
 
 ### 해결하려는 문제
 
-DB 유출 또는 로그 노출 시 Project API Key 원문이 노출되면 공격자가 즉시 telemetry를 위조하거나 quota를 소모할 수 있다.
+DB 유출 시 원문 API Key가 노출되면 Telemetry 위조와 Quota 소모에 즉시 악용될 수 있다.
 
 ### 검토한 대안
 
-* 원문 API Key 저장
-* 암호화된 API Key 저장
-* Secret hash만 저장
+1. 원문 저장
+2. 암호화 저장
+3. Secret Hash만 저장
 
-### 선택한 방식
+### 선택
 
-* 공개 식별자 `key_id` 저장
-* Secret의 SHA-256 hash만 저장
-* 인증 시 입력 Secret을 hash한 뒤 상수시간 비교
-* 발급 시점에만 원문 Key 반환
-
-### 선택 이유
-
-* 비밀번호 저장 방식과 유사한 최소 노출 구조
-* DB만 유출됐을 때 원문 API Key를 직접 사용할 수 없음
-* `key_id`로 빠르게 행을 찾은 뒤 Secret을 검증할 수 있음
-
-### 단점과 위험
-
-* 원문 Key를 잃으면 복구할 수 없고 재발급해야 함
-* SHA-256 사용은 Secret이 충분히 긴 무작위 값이라는 전제에 의존함
-* Key 발급 화면과 로그에서 원문 노출을 방지해야 함
-
-### 재검토 조건
-
-* 관리 UI 구현
-* Key rotation 구현
-* Key별 권한 범위 도입
-* 감사 로그 도입
-
----
-
-## Tenant와 Project를 요청 Header가 아닌 API Key 소유권에서 결정
-
-### 해결하려는 문제
-
-클라이언트가 Tenant ID 또는 Project ID Header를 임의로 조작하면 다른 Tenant 데이터로 저장될 수 있다.
-
-### 선택한 방식
-
-* 클라이언트의 Tenant/Project UUID Header를 신뢰하지 않음
-* API Key 인증 결과에서 Tenant와 Project를 결정
-* Controller에는 인증된 Project 정보를 request attribute로 전달
+- 공개 식별자 `key_id`
+- Secret SHA-256 Hash
+- 입력 Secret Hash 후 상수시간 비교
+- 원문은 발급 시에만 반환
 
 ### 선택 이유
 
-* 멀티테넌트 데이터 격리의 신뢰 경계를 서버 DB에 둠
-* 클라이언트가 Tenant/Project ID를 알더라도 다른 영역에 데이터를 저장할 수 없음
-* SaaS와 온프레미스 모두 동일한 인증 구조 사용 가능
+- DB만 유출됐을 때 원문 Key를 직접 사용할 수 없다.
+- `key_id`로 빠르게 행을 조회할 수 있다.
+- 긴 무작위 Secret이라는 전제에서 단순하고 현실적이다.
 
 ### 단점과 위험
 
-* 모든 telemetry 요청에 API Key DB 조회 비용이 발생함
-* DB 장애가 인증 전체 장애로 이어짐
-* 이후 cache 도입 시 폐기 Key의 반영 지연을 고려해야 함
+- 원문 Key를 잃으면 복구할 수 없다.
+- 재발급과 Rotation 기능이 필요하다.
+- 발급 응답, 로그, 화면에서 원문 노출을 방지해야 한다.
 
 ### 재검토 조건
 
-* API Key 인증 조회가 병목으로 측정됨
-* 로컬 cache 또는 분산 cache 도입 검토
-* Key 폐기 전파 요구시간 정의
+- 관리 UI
+- Rotation
+- Key Scope
+- Audit Log
 
 ---
 
-## 일시적인 DB 장애에 HTTP 503 반환
+## D-013. Tenant와 Project는 API Key 소유권에서 결정
+
+### 상태
+
+채택
 
 ### 해결하려는 문제
 
-DB 장애가 HTTP 500 또는 401로 반환되면 Collector가 영구 오류로 오해하거나 올바른 재시도 정책을 적용하지 못할 수 있다.
+클라이언트가 Tenant / Project Header를 조작해 다른 데이터 영역에 저장하거나 조회할 위험이 있다.
 
-### 선택한 방식
+### 선택
 
-* DB 연결 실패와 일시적 자원 오류를 retryable 장애로 분류
-* 인증 DB 장애와 Span 저장 DB 장애에 HTTP 503 반환
-* SQL 문법 오류와 프로그래밍 오류는 503으로 숨기지 않음
+- 클라이언트 Tenant / Project UUID Header를 신뢰하지 않는다.
+- API Key DB 소유권에서 Tenant와 Project를 결정한다.
+- 인증 결과를 저장과 조회 Repository에 전달한다.
 
 ### 선택 이유
 
-* Collector retry와 persistent queue를 활용할 수 있음
-* 잘못된 API Key의 401과 서버 장애의 503을 구분 가능
-* 장애 원인을 클라이언트 자격증명 문제로 오인하지 않음
+- 멀티테넌트 신뢰 경계를 서버 DB에 둔다.
+- UUID를 알아도 다른 Project에 저장하거나 조회할 수 없다.
+- SaaS와 On-premise가 같은 구조를 사용할 수 있다.
 
 ### 단점과 위험
 
-* 잘못된 예외 분류는 영구 오류를 무한 재시도하게 만들 수 있음
-* `max_elapsed_time: 0`과 결합하면 queue가 계속 증가할 수 있음
-* queue 사용률과 디스크 용량 감시가 필요함
+- 매 요청 API Key DB 조회 비용이 발생한다.
+- DB 장애가 인증 장애로 이어진다.
+- Cache 도입 시 폐기 Key 반영 지연을 관리해야 한다.
 
 ### 재검토 조건
 
-* retry storm 발생
-* queue 증가 속도가 복구 속도를 초과
-* DB 장애 유형별 응답 정책 변경 필요
-* circuit breaker 도입 검토
+- API Key 조회가 병목으로 측정될 때
+- Cache 도입
+- Key 폐기 전파 SLA 정의
 
 ---
 
-## Collector Persistent Queue 사용
+## D-014. 일시적인 DB 장애에 HTTP 503 반환
+
+### 상태
+
+채택
 
 ### 해결하려는 문제
 
-AeroTrace Backend 또는 TimescaleDB 장애 중 Collector가 받은 telemetry가 메모리에만 있으면 Collector 재시작 시 데이터가 유실될 수 있다.
+DB 장애를 401 또는 일반 500으로 반환하면 Collector가 자격증명 오류 또는 영구 실패로 오해할 수 있다.
+
+### 선택
+
+- DB 연결 실패와 일시적 자원 오류를 Retryable로 분류
+- 인증 DB 장애와 Span 저장 DB 장애에 503
+- SQL 문법 오류와 프로그래밍 오류는 503으로 숨기지 않음
+- Hikari Connection Timeout 3초
+
+### 선택 이유
+
+- Collector Retry와 Persistent Queue를 활용할 수 있다.
+- 잘못된 API Key의 401과 서버 장애의 503을 구분한다.
+- 자격증명 문제로 오인하지 않는다.
+
+### 단점과 위험
+
+- 예외 오분류는 영구 오류의 무한 Retry를 만들 수 있다.
+- 무제한 Retry와 결합하면 Queue가 계속 증가한다.
+- Queue와 Disk 감시가 필요하다.
+
+### 재검토 조건
+
+- Retry Storm
+- Queue 증가 속도가 복구 속도 초과
+- Circuit Breaker 필요
+- 장애 유형별 응답 정책 변경
+
+---
+
+## D-015. Collector File Storage Persistent Queue 사용
+
+### 상태
+
+채택
+
+### 해결하려는 문제
+
+Backend나 DB 장애 중 Telemetry가 Memory Queue에만 있으면 Collector 재시작 시 유실될 수 있다.
 
 ### 검토한 대안
 
-* memory queue만 사용
-* file storage 기반 persistent queue
-* Kafka 도입
+1. Memory Queue
+2. File Storage Persistent Queue
+3. Kafka
 
-### 선택한 방식
+### 선택
 
-* OpenTelemetry Collector Contrib 사용
-* `file_storage` extension 사용
-* Docker named volume에 queue 저장
-* exporter `sending_queue.storage`에 연결
-* retry 활성화
-* Kafka는 도입하지 않음
+- OpenTelemetry Collector Contrib
+- `file_storage`
+- Docker Named Volume
+- Exporter Persistent Sending Queue
+- Retry
+- Kafka 미도입
 
 ### 선택 이유
 
-* 현재 규모에서 Kafka 없이도 재시작 내구성을 제공
-* Docker Compose와 홈서버 환경에서 단순하게 운영 가능
-* 동일 구성을 SaaS MVP와 온프레미스 배포에 사용할 수 있음
-* 100 Span 실험에서 Collector 재시작 후 자동 복구를 확인함
+- 현재 규모에서 Kafka 없이 재시작 내구성을 제공한다.
+- Docker Compose와 홈서버에서 단순하다.
+- SaaS MVP와 On-premise에 같은 구성을 적용할 수 있다.
+- 100 Span 실험에서 Collector 재시작 후 복구를 확인했다.
 
 ### 단점과 위험
 
-* 호스트 디스크 자체가 손상되면 queue도 손실될 수 있음
-* queue가 가득 차면 신규 데이터 유실 가능
-* 파일 저장소 compaction과 디스크 사용량을 관찰해야 함
-* 다중 Collector에서는 각 인스턴스별 queue가 분리됨
+- Host Disk 손상 시 Queue도 손실될 수 있다.
+- Queue가 가득 차면 신규 데이터가 거부될 수 있다.
+- 다중 Collector Queue는 Instance별로 분리된다.
+- File Storage와 Disk를 관찰해야 한다.
 
 ### 재검토 조건
 
-* 단일 Collector가 처리량 병목이 됨
-* 여러 Collector 간 안정적인 버퍼 공유 필요
-* 장시간 장애에서 로컬 디스크 용량이 부족함
-* Kafka 도입을 정당화할 실제 요구가 발생함
+- 단일 Collector 병목
+- 여러 Collector의 공유 Buffer 필요
+- 장시간 장애에서 Disk 부족
+- Kafka를 정당화할 실제 요구
 
 ---
 
-## Persistent Queue 크기를 50,000 Span으로 시작
+## D-016. Persistent Queue 크기를 50,000 Span으로 시작
+
+### 상태
+
+채택
 
 ### 해결하려는 문제
 
-queue를 무제한으로 두면 홈서버 디스크를 소진할 수 있고, 너무 작게 두면 짧은 장애에도 데이터가 유실될 수 있다.
+무제한 Queue는 Disk를 소진하고, 너무 작은 Queue는 짧은 장애에도 데이터를 잃는다.
 
-### 선택한 방식
+### 선택
 
 ```yaml
 sending_queue:
   sizer: items
   queue_size: 50000
+  block_on_overflow: false
 ```
 
 ### 선택 이유
 
-* 현재 MVP 장애 실험을 수행하기에 충분한 유한 크기
-* 100 Span과 10,000 Span queue 수용을 확인함
-* 10,000 Span은 현재 queue의 20%에 해당
-* 측정 없이 지나치게 큰 값을 설정하지 않음
+- MVP 장애 실험에 충분한 유한 크기다.
+- 100 Span과 10,000 Span 수용을 확인했다.
+- 10,000 Span은 용량의 20%다.
+- 측정 없이 과도하게 큰 값을 설정하지 않는다.
 
 ### 단점과 위험
 
-* 실제 운영에서 몇 분을 버티는지는 Span 유입률에 따라 달라짐
-* 평균 Span 크기와 디스크 사용량을 아직 측정하지 못함
-* `block_on_overflow: false`이므로 queue가 가득 차면 데이터가 거부될 수 있음
+- 실제 몇 분을 버티는지는 유입률에 따라 다르다.
+- 평균 Span 크기와 Disk 사용량이 미측정이다.
+- Overflow 시 신규 데이터가 거부될 수 있다.
+- 10,000 Span 최종 DB 정합성 출력은 문서에 남아 있지 않다.
 
 ### 재검토 조건
 
-* 실제 서비스의 spans/s 측정
-* 평균 queue 저장 바이트/Span 측정
-* 허용할 DB 장애 지속시간 정의
-* queue 사용률 경보 설계
-* overflow 실험 완료
+- 실제 spans/s
+- Span당 Queue Bytes
+- 허용 DB 장애 시간
+- Queue 사용률 경보
+- Overflow 실험
 
 ---
 
-## 최근 2일은 Rowstore, 이후 데이터는 Columnstore로 유지
+## D-017. 0~2일 Rowstore, 2~30일 Columnstore, 30일 초과 Retention
+
+### 상태
+
+채택
 
 ### 해결하려는 문제
 
-APM telemetry는 최근 데이터에 쓰기와 장애 분석 요청이 집중되지만, 시간이 지난 데이터는 주로 장기 분석과 통계 조회에 사용된다.
-
-모든 데이터를 rowstore로 유지하면 장기 저장 비용이 증가하고, 모든 데이터를 즉시 columnstore로 전환하면 최근 데이터 쓰기와 수정에 불필요한 제약이 생길 수 있다.
+최근 Telemetry의 쓰기와 장애 분석 성능을 유지하면서 제한된 저장 공간의 무기한 증가를 막아야 한다.
 
 ### 검토한 대안
 
-1. 모든 데이터를 rowstore로 유지
-2. 수집 직후 바로 columnstore로 전환
-3. 일정 기간 rowstore에 유지한 뒤 자동 columnstore 전환
+1. 모든 데이터 Rowstore
+2. 수집 직후 Columnstore
+3. 일정 기간 후 Columnstore
+4. Retention 없음
+5. 7일 보존
+6. 30일 보존
+7. Tenant별 보존
 
-### 선택한 방식
+### 선택
 
-* Chunk interval: 1일
-* 최근 rowstore 기간: 약 2일
-* 2일보다 오래된 완성 chunk: 자동 columnstore 전환
-* Segment 기준: `tenant_id, project_id`
-* 정렬 기준: `start_time DESC`
+- Chunk Interval 1일
+- 0~2일 Rowstore
+- 2~30일 Columnstore
+- 30일 초과 Retention
+- Segment: `tenant_id, project_id`
+- Order: `start_time DESC`
 
 ### 선택 이유
 
-* 최근 장애 분석 데이터는 rowstore에 유지
-* 쓰기 진행 중인 현재 chunk를 전환 대상에서 제외
-* 과거 telemetry의 저장 비용 절감 가능
-* Tenant와 Project 범위 조회에 맞는 segment 구성
-* 실제 정책 실행을 통해 rowstore에서 columnstore로 전환되는 동작 확인
-* 전환 후에도 기존 hypertable 조회가 유지됨을 확인
+- 최근 쓰기와 조회는 Rowstore에 둔다.
+- 과거 데이터는 Columnstore로 전환한다.
+- 무기한 저장을 막는다.
+- 행 DELETE가 아니라 Chunk 제거를 사용한다.
+- 실제 정책 실행과 데이터 보존 / 삭제를 검증했다.
 
 ### 단점과 위험
 
-* 2일이라는 기준은 아직 운영 부하를 바탕으로 산정된 값이 아님
-* 작은 chunk에서는 columnstore 전환 후 저장 크기가 줄지 않을 수 있음
-* 잘못된 `start_time`을 가진 telemetry가 예상과 다른 chunk에 저장될 수 있음
-* 정책 실패를 감지할 Prometheus 경보가 아직 없음
+- 2일과 30일은 실제 운영 트래픽으로 산정한 값이 아니다.
+- 작은 Chunk에서는 압축률을 평가할 수 없다.
+- 잘못된 `start_time`은 예상과 다른 생명주기를 만든다.
+- 모든 Tenant에 동일한 보존기간이 적용된다.
+- 정책 실패 경보가 없다.
+
+### Tenant별 Retention을 지금 구현하지 않는 이유
+
+공유 Hypertable의 같은 시간 Chunk에 여러 Tenant 데이터가 포함될 수 있다. TimescaleDB Retention은 Chunk 전체를 제거하므로 Tenant별 기간을 직접 적용할 수 없다.
 
 ### 재검토 조건
 
-* 실제 사용자 서비스의 최근 Trace 조회 범위 측정
-* 운영 환경의 Span 유입량 측정
-* 대량 데이터 압축률 측정
-* 최근 데이터 조회가 columnstore 경계를 자주 넘는 경우
-* Columnstore 정책 실행 시간이 운영 부하에 영향을 주는 경우
+- 요금제별 보존기간 요구
+- 30일 데이터가 Disk 한도 초과
+- 실제 조회가 7일 이하에 집중
+- 장기 보관 요구
+- 압축률과 일일 저장량 측정 완료
 
 ---
 
-## spans 보존기간을 전역 30일로 시작
+## D-018. Trace 목록에 Keyset Cursor와 Trace 전체 집계 필터 사용
+
+### 상태
+
+채택
 
 ### 해결하려는 문제
 
-Telemetry를 무기한 저장하면 제한된 홈서버와 무료 인스턴스의 디스크가 지속해서 증가한다.
-
-AeroTrace MVP에서는 장기 저장 비용을 제한하면서도 최근 장애 분석에 필요한 기간을 제공해야 한다.
+실시간으로 데이터가 추가되는 Trace 목록에서 안정적인 페이지 이동, 멀티테넌트 격리, 필터와 전체 Trace 집계의 일관성을 함께 보장해야 했다.
 
 ### 검토한 대안
 
-1. 보존기간 없이 무기한 저장
-2. 7일 전역 보존
-3. 30일 전역 보존
-4. Tenant 또는 요금제별 보존기간
-5. 애플리케이션에서 행 단위 주기적 삭제
+1. Offset Pagination
+2. Filter를 Span `WHERE`에 적용
+3. Keyset Pagination과 `HAVING` 집계 필터
 
-### 선택한 방식
+### 선택
 
-* 모든 Tenant에 전역 30일 보존기간 적용
-* TimescaleDB retention background policy 사용
-* `start_time` 기준으로 만료 판단
-* 하루에 한 번 정책 실행
-* 만료된 데이터를 chunk 단위로 제거
-
-### 선택 이유
-
-* MVP 사용자가 최근 장애와 성능 문제를 분석하기에 현실적인 초기 기간
-* 무기한 저장에 따른 디스크 증가 방지
-* 행 단위 `DELETE`보다 chunk 제거가 운영 비용 측면에서 적합
-* TimescaleDB의 자동화된 background job 사용
-* 실제 35일 전 chunk 삭제 시나리오를 통해 정책 동작 검증
-
-### 현재 데이터 수명주기
-
-* 0~2일: rowstore
-* 2~30일: columnstore
-* 30일 초과: chunk 삭제
-
-### 단점과 위험
-
-* 모든 Tenant에 동일한 보존기간이 적용된다.
-* Tenant별 또는 요금제별 retention을 현재 정책만으로 지원할 수 없다.
-* `start_time`이 잘못된 Span은 예상보다 일찍 삭제되거나 오래 유지될 수 있다.
-* 정책 실행 실패를 알리는 운영 경보가 아직 없다.
-* 30일이 실제 디스크 용량에 적합한지는 운영 데이터로 검증되지 않았다.
-
-### Tenant별 보존기간을 지금 구현하지 않는 이유
-
-현재 모든 Tenant의 Span이 하나의 시간 기반 hypertable과 chunk를 공유한다.
-
-TimescaleDB retention은 chunk 전체를 제거하므로 같은 chunk 안의 특정 Tenant 데이터만 서로 다른 기간으로 제거할 수 없다.
-
-Tenant별 보존기간이 실제 요구사항이 되면 다음 대안을 재검토한다.
-
-* Tenant별 hypertable
-* 보존 등급별 hypertable
-* 별도 archive storage
-* 행 단위 삭제와 chunk 정책의 혼합
-* Enterprise 또는 on-prem 전용 저장 정책
-
-### 재검토 조건
-
-* 실제 사용자 또는 요금제가 여러 보존기간을 요구
-* 30일 데이터가 디스크 한도를 초과
-* 대부분 사용자가 7일 이내 데이터만 조회
-* 장기 보관 요구가 발생
-* 일일 저장량과 compression 비율 측정 완료
-
----
-
-## 2026-08-03 — Trace 목록 조회에 Keyset Cursor와 Trace 전체 집계 필터 사용
-
-### 해결하려는 문제
-
-Trace 목록 API는 다음 요구사항을 동시에 만족해야 한다.
-
-* 인증된 Tenant와 Project 데이터만 조회
-* 최신 Trace부터 안정적으로 페이지 이동
-* 서비스, 오류 여부, 최소 Span duration 조건 검색
-* 필터에 일치한 일부 Span만이 아니라 Trace 전체의 Span 수와 서비스 수 유지
-* 페이지 사이에서 조회 조건이 변경되어 발생하는 중복과 누락 방지
-* 제한된 서버 자원에서 무제한 조회 방지
-
-### 검토한 대안
-
-#### Offset Pagination
-
-`OFFSET`과 `LIMIT`을 사용하는 방식이다.
-
-장점:
-
-* 구현이 단순하다.
-* 임의의 페이지 번호로 이동하기 쉽다.
-
-단점:
-
-* 뒤쪽 페이지일수록 앞의 행을 건너뛰는 비용이 커질 수 있다.
-* 페이지 이동 중 새로운 Trace가 저장되면 중복 또는 누락이 발생할 수 있다.
-* 실시간으로 계속 데이터가 추가되는 APM 목록에 적합하지 않다.
-
-#### 필터 조건을 WHERE에 적용
-
-예:
-
-```sql
-WHERE service_name = ?
-   OR status_code = 2
-```
-
-장점:
-
-* SQL이 직관적이다.
-* 조건에 일치하는 Span을 빠르게 줄일 가능성이 있다.
-
-단점:
-
-* 필터에 일치하지 않는 같은 Trace의 Span이 집계에서 제외된다.
-* `spanCount`, `serviceCount`, `MAX(duration_nano)`가 Trace 전체 값이 아니게 된다.
-* 사용자가 목록과 상세 화면에서 서로 다른 집계값을 보게 될 수 있다.
-
-#### Keyset Pagination과 HAVING 집계 필터
-
-Trace 시작 시각과 Trace ID를 Cursor 위치로 사용하고, 서비스·오류·duration 조건은 Trace 집계 이후 `HAVING`으로 적용하는 방식이다.
-
-### 선택한 방식
-
-다음 정렬 기준을 사용한 Keyset Pagination을 선택했다.
+정렬:
 
 ```sql
 ORDER BY trace_start_time DESC,
          trace_id DESC
 ```
 
-다음 페이지 조건은 마지막으로 반환된 Trace의 시작 시각과 Trace ID를 사용한다.
+다음 페이지:
 
 ```sql
 trace_start_time < cursor_time
@@ -931,135 +855,164 @@ OR (
 )
 ```
 
-필터는 다음 의미로 적용한다.
+필터 의미:
 
-* `serviceName`: 해당 서비스를 포함한 Trace
-* `errorOnly=true`: `status_code = 2`인 Span을 포함한 Trace
-* `minSpanDurationNano`: 지정 duration 이상의 Span을 포함한 Trace
+- `serviceName`: 해당 Service를 포함한 Trace
+- `errorOnly`: Error Span을 포함한 Trace
+- `minSpanDurationNano`: 기준 이상 Span을 포함한 Trace
 
-서비스와 오류 조건은 서로 다른 Span에서 충족되어도 같은 Trace 안에 있으면 검색 결과에 포함한다.
+집계값은 전체 Trace Span을 기준으로 유지한다.
 
-집계값은 항상 Trace 전체 Span을 기준으로 계산한다.
+Cursor에는 마지막 Trace 시작 시각, Trace ID, 조회 조건 SHA-256 Fingerprint를 포함한다.
 
-### Cursor 조회 조건 결합
+Fingerprint:
 
-Cursor에는 다음 정보가 포함된다.
-
-* 마지막 Trace의 시작 시각
-* 마지막 Trace ID
-* 조회 조건의 SHA-256 fingerprint
-
-Fingerprint에는 다음 조건을 포함한다.
-
-* 인증된 Tenant ID
-* 인증된 Project ID
-* 조회 시작 시각
-* 조회 종료 시각
-* 정규화된 서비스명
-* 오류 필터
-* 최소 Span duration
-
-첫 페이지와 다른 조건으로 Cursor를 재사용하면 `400 Bad Request`를 반환한다.
+- Tenant ID
+- Project ID
+- From / To
+- Service
+- Error
+- Minimum Duration
 
 ### 선택 이유
 
-* 실시간으로 Trace가 추가되는 환경에서 Offset보다 페이지 중복과 누락 위험이 작다.
-* 같은 시작 시각을 가진 Trace도 Trace ID를 보조 정렬 기준으로 사용해 결정적으로 정렬할 수 있다.
-* 필터를 적용해도 목록의 집계값과 Trace 상세 내용이 일관된다.
-* Cursor를 Tenant와 Project에 결합해 다른 Project 요청에서 잘못 재사용되는 것을 차단한다.
-* 사용자에게 반환할 개수보다 한 건 더 조회해 별도의 COUNT 쿼리 없이 다음 페이지 존재 여부를 판단한다.
-
-### 제한과 위험
-
-* 현재 Cursor fingerprint에는 HMAC 서명이 없다.
-* Base64 Cursor는 암호화가 아니므로 payload를 숨기지 않는다.
-* 권한 경계는 Cursor가 아니라 Repository의 `tenant_id`, `project_id` 조건이 담당한다.
-* 서비스·오류·duration 필터는 Trace 집계가 필요하므로 데이터량이 증가하면 비용이 커질 수 있다.
-* 필터 전용 인덱스의 효과는 아직 측정하지 않았다.
-* Cursor를 발급한 뒤 기존 Span의 시작 시각이나 Trace 구성이 변경되는 경우는 현재 고려하지 않는다. 수집된 Span을 불변 데이터로 취급한다.
-
-### 재검토 조건
-
-다음 조건이 발생하면 설계를 재검토한다.
-
-* Trace 목록 쿼리의 실제 실행 시간이 운영 목표를 만족하지 못할 때
-* `EXPLAIN (ANALYZE, BUFFERS)`에서 집계 또는 Chunk Scan 비용이 주요 병목으로 확인될 때
-* 공개 API에서 Cursor 위조 방지가 요구될 때
-* 사용자에게 임의 페이지 이동 기능이 필요해질 때
-* 필터 종류가 증가해 정적 SQL 관리가 어려워질 때
-* Continuous Aggregate나 별도 Trace summary 테이블이 원본 Span 집계보다 경제적인 규모에 도달할 때
-
-### 현재 결론
-
-MVP에서는 Keyset Pagination과 원본 Span 집계를 유지한다.
-
-새로운 인덱스, Trace summary 테이블, Continuous Aggregate는 추측으로 추가하지 않고 실제 쿼리 측정 결과를 근거로 검토한다.
-
----
-
-## Trace 목록 조회 SQL 최적화 전략
-
-### 해결하려는 문제
-
-Trace 목록 API는 raw Span을 `trace_id`로 집계한 뒤 서비스, 오류 여부, 최대 Span duration 조건을 적용한다.
-
-이 구조는 정확한 Trace 집계값을 제공하지만, 결과가 50개뿐이어도 조회 시간 범위의 Span을 모두 읽고 Trace 전체를 집계한다.
-
-### 검토한 대안
-
-1. 현재 raw Span 전체 집계 방식 유지
-2. duration 조건에 맞는 Trace ID를 먼저 찾은 뒤 후보 Trace만 다시 집계
-3. duration 임계값에 따라 두 SQL을 애플리케이션에서 선택
-4. Trace 단위 Summary 테이블 도입
-
-### 측정 조건
-
-* TimescaleDB 2.28.3
-* PostgreSQL 15.18
-* 20,000 Trace
-* 109,998 Span
-* Trace당 3~8 Span
-* warm-cache 로컬 Docker 환경
-
-### 측정 결과
-
-후보 Trace 비율에 따른 후보 우선 방식의 중앙 실행시간:
-
-* 후보 1%, 200 Trace: 19.819ms
-* 후보 5%, 1,000 Trace: 34.795ms
-* 후보 100%, 20,000 Trace: 345.467ms
-
-동일한 100% 후보 조건의 기존 전체 집계 방식은 98.048ms였다.
-
-후보 우선 방식은 후보가 적을 때 유리했지만, 모든 Trace가 후보가 되면 기존 방식보다 약 3.52배 느렸으며 Buffer hit도 약 12배 증가했다.
-
-### 선택한 방식
-
-MVP에서는 현재 raw Span 전체 집계 SQL을 유지한다.
-
-duration 파라미터의 고정값만으로 후보 선택도를 판단할 수 없으므로, 애플리케이션에서 후보 우선 SQL로 분기하지 않는다.
-
-후보 우선 SQL을 위해 새로운 duration 인덱스도 추가하지 않는다.
-
-### 선택 이유
-
-* 현재 SQL은 모든 필터 조합에서 정확하게 동작한다.
-* 현재 측정 규모에서는 반복 실행시간이 대체로 90~110ms 범위다.
-* 후보 우선 방식은 데이터 분포에 따라 20ms에서 345ms까지 성능 편차가 크다.
-* 프로젝트마다 duration 분포가 다르므로 고정 임계값 기반 분기는 안전하지 않다.
-* 추가 인덱스는 telemetry 저장 비용과 저장 공간을 증가시킨다.
+- Offset보다 실시간 추가 데이터의 중복과 누락 위험이 작다.
+- 동일 시작 시각은 Trace ID로 결정적으로 정렬한다.
+- 필터를 적용해도 목록과 상세의 집계 의미가 일치한다.
+- 다른 Project와 조건에서 Cursor 재사용을 차단한다.
+- `limit + 1`로 별도 Count 없이 다음 페이지를 판단한다.
 
 ### 단점과 위험
 
-* 데이터가 증가하면 조회 시간이 raw Span 수에 비례해 증가할 수 있다.
-* LIMIT과 Cursor가 raw Span 집계량을 줄이지 못한다.
-* 집계 후 필터의 선택도에 대한 PostgreSQL Planner 예상이 부정확하다.
+- Cursor Fingerprint에 HMAC이 없다.
+- Base64는 암호화가 아니다.
+- Cursor는 권한 경계가 아니다.
+- Filter는 전체 Trace 집계가 필요해 데이터 증가 시 비용이 커진다.
+- Cursor가 Raw Span 작업량을 줄이지 않는다.
 
 ### 재검토 조건
 
-다음 조건이 확인되면 Trace Summary 또는 동적 조회 전략을 재검토한다.
+- 목록 지연시간이 운영 목표를 지속 초과
+- Aggregate / Chunk Scan이 주요 병목
+- Cursor 위조 방지가 필요
+- 임의 페이지 이동 요구
+- Trace Summary가 더 경제적인 규모
 
-* 실제 사용자 데이터에서 Trace 목록 지연시간이 제품 목표를 지속적으로 초과
-* 30일 조회 범위의 Span 수 증가로 CPU 또는 DB connection 사용량이 문제가 됨
-* 목록 조회 트래픽이 telemetry 저장 성능에 영향을 줌
-* raw Span 집계 비용이 홈서버 또는 Oracle Cloud 운영 한계를 초과
+---
+
+## D-019. Trace 목록은 현재 Raw Span 전체 집계 SQL 유지
+
+### 상태
+
+채택
+
+### 해결하려는 문제
+
+후보 Trace를 먼저 찾으면 선택도가 낮을 때 빠를 수 있지만, 후보가 많으면 원본 데이터를 두 번 처리해 더 느려질 수 있다.
+
+### 검토한 대안
+
+1. Raw Span 전체 집계
+2. 후보 Trace ID 선조회 후 재집계
+3. Duration 값에 따른 SQL 분기
+4. Trace Summary 테이블
+
+### 측정 조건
+
+- Trace 20,000
+- Span 109,998
+- Warm Cache
+- Local Docker
+- TimescaleDB 2.28.3
+- PostgreSQL 15.18
+
+### 측정 결과
+
+후보 우선:
+
+- 1%, 200 Trace: 19.819ms
+- 5%, 1,000 Trace: 34.795ms
+- 100%, 20,000 Trace: 345.467ms
+
+100% 후보와 동일 조건의 기존 SQL:
+
+- 98.048ms
+
+### 선택
+
+- 현재 Raw Span 전체 집계 SQL 유지
+- 후보 우선 SQL 자동 분기 보류
+- Duration Index 보류
+- Trace Summary 조기 도입 보류
+
+### 선택 이유
+
+- 현재 SQL은 모든 Filter에서 정확하다.
+- 현재 규모의 반복 실행시간은 대체로 90~110ms다.
+- 후보 우선 방식은 데이터 분포에 따라 성능 편차가 크다.
+- Duration 값만으로 실제 선택도를 판단할 수 없다.
+- 신규 Index는 수집 비용과 저장 공간을 증가시킨다.
+
+### 단점과 위험
+
+- 데이터가 증가하면 Raw Span 수에 비례해 비용이 증가한다.
+- Limit과 Cursor가 집계량을 줄이지 못한다.
+- Planner의 집계 후 Filter 선택도 예측이 부정확할 수 있다.
+
+### 재검토 조건
+
+- 실제 사용자 데이터에서 지연 목표 초과
+- 30일 범위 CPU / Connection 문제
+- 조회가 수집 성능에 영향
+- 홈서버 / Oracle Cloud 한계 초과
+
+---
+
+## D-020. Next.js 서버 전용 BFF로 Trace API 호출
+
+### 상태
+
+채택 — 로컬 MVP와 제한된 PoC 범위
+
+### 해결하려는 문제
+
+브라우저가 Spring Boot를 직접 호출하면 Project API Key가 Network 요청이나 공개 환경변수에 노출될 수 있다. Frontend와 Backend가 다른 Origin이면 CORS와 인증 전달도 별도로 관리해야 한다.
+
+### 검토한 대안
+
+1. Browser에서 Spring Boot 직접 호출
+2. `NEXT_PUBLIC_` 환경변수로 API Key 전달
+3. Next.js Route Handler BFF
+4. 사용자 로그인과 세션을 즉시 구현
+
+### 선택
+
+- Browser는 Same-origin `/api/traces` 호출
+- Next.js Route Handler가 Spring Boot 호출
+- Backend URL과 Project API Key는 Server-only 환경변수
+- 목록과 상세 응답은 `Cache-Control: no-store`
+- 전달 Query Parameter를 Allowlist로 제한
+
+### 선택 이유
+
+- API Key가 Browser에 노출되지 않는다.
+- 직접 CORS 구성이 필요 없다.
+- Backend Status와 Error Message를 중계할 수 있다.
+- 로컬 MVP에서 Trace Explorer를 단순하게 검증할 수 있다.
+
+### 단점과 위험
+
+- 사용자 로그인과 세션이 없다.
+- Frontend 접근자는 설정된 Project 데이터를 조회할 수 있다.
+- 서버당 하나의 Project API Key를 사용한다.
+- 공개 SaaS 인증 구조가 아니다.
+- Next.js 서버가 추가 Network Hop과 운영 구성 요소가 된다.
+
+### 재검토 조건
+
+- 인터넷 공개
+- 다중 사용자
+- 다중 Project 선택
+- 조직 / Role 관리
+- API Key 관리 UI
+- 사용자 세션과 권한 검사 도입
