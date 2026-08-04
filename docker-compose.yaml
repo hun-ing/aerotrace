@@ -2,16 +2,33 @@ services:
   timescaledb:
     image: timescale/timescaledb:latest-pg15
     container_name: aerotrace-timescaledb
+
     environment:
       POSTGRES_USER: ${AEROTRACE_DB_USERNAME}
       POSTGRES_PASSWORD: ${AEROTRACE_DB_PASSWORD}
       POSTGRES_DB: ${AEROTRACE_DB_NAME}
+
     ports:
       - "5432:5432"
+
     volumes:
       - aerotrace-db-data:/var/lib/postgresql/data
+
     networks:
       - aerotrace-network
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          pg_isready
+          -U "${AEROTRACE_DB_USERNAME}"
+          -d "${AEROTRACE_DB_NAME}"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
     restart: unless-stopped
 
   otel-storage-init:
@@ -47,11 +64,46 @@ services:
       - "127.0.0.1:8888:8888"
     depends_on:
       timescaledb:
-        condition: service_started
+        condition: service_healthy
       otel-storage-init:
         condition: service_completed_successfully
     networks:
       - aerotrace-network
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"" ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  backend:
+    profiles:
+      - app
+
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    image: aerotrace-backend:local
+    container_name: aerotrace-backend
+
+    environment:
+      AEROTRACE_DB_URL: >-
+        jdbc:postgresql://timescaledb:5432/${AEROTRACE_DB_NAME}
+      AEROTRACE_DB_USERNAME: ${AEROTRACE_DB_USERNAME}
+      AEROTRACE_DB_PASSWORD: ${AEROTRACE_DB_PASSWORD}
+
+    ports:
+      - "8080:8080"
+
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+    networks:
+      - aerotrace-network
+
     restart: unless-stopped
 
 volumes:

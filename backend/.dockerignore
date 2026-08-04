@@ -1,0 +1,13 @@
+.gradle
+build
+out
+
+.idea
+*.iml
+
+.env
+.env.*
+application-local.yaml
+application-local.yml
+
+hs_err_pid*
