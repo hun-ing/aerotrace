@@ -1,12 +1,14 @@
 "use client";
 
 import {
-    type FormEvent,
+    type SubmitEvent as ReactSubmitEvent,
     useEffect,
     useMemo,
     useRef,
     useState,
 } from "react";
+
+import TraceDetailPanel from "@/features/traces/trace-detail-panel";
 
 type TraceListItem = Readonly<{
     traceId: string;
@@ -535,6 +537,14 @@ export default function TraceExplorer() {
             nextCursor: null,
         });
 
+    const [
+        selectedTraceId,
+        setSelectedTraceId,
+    ] = useState<string | null>(null);
+
+    const detailPanelRef =
+        useRef<HTMLDivElement | null>(null);
+
     const [errorMessage, setErrorMessage] =
         useState("");
 
@@ -556,6 +566,26 @@ export default function TraceExplorer() {
 
     const loadMoreAbortControllerRef =
         useRef<AbortController | null>(null);
+
+    useEffect(() => {
+        if (selectedTraceId === null) {
+            return;
+        }
+
+        const animationFrameId =
+            window.requestAnimationFrame(() => {
+                detailPanelRef.current?.scrollIntoView({
+                    behavior: "smooth",
+                    block: "start",
+                });
+            });
+
+        return () => {
+            window.cancelAnimationFrame(
+                animationFrameId,
+            );
+        };
+    }, [selectedTraceId]);
 
     useEffect(() => {
         let cancelled = false;
@@ -830,6 +860,8 @@ export default function TraceExplorer() {
 
         cancelLoadMoreRequest();
 
+        setSelectedTraceId(null);
+
         activeQueryRef.current =
             queryString;
 
@@ -848,7 +880,7 @@ export default function TraceExplorer() {
     }
 
     function submitFilters(
-        event: FormEvent<HTMLFormElement>,
+        event: ReactSubmitEvent<HTMLFormElement>,
     ): void {
         event.preventDefault();
 
@@ -988,6 +1020,7 @@ export default function TraceExplorer() {
 
     function reloadTraces(): void {
         cancelLoadMoreRequest();
+        setSelectedTraceId(null);
 
         setReloadSequence(
             (currentValue) =>
@@ -1076,7 +1109,7 @@ export default function TraceExplorer() {
 
                     <div className="topbar-actions">
                         <div className="environment-badge">
-                            <span aria-hidden="true" />
+                            <span aria-hidden="true"/>
                             Local development
                         </div>
 
@@ -1309,6 +1342,9 @@ export default function TraceExplorer() {
                                 <th scope="col">
                                     Longest span
                                 </th>
+                                <th scope="col">
+                                    Details
+                                </th>
                             </tr>
                             </thead>
 
@@ -1318,7 +1354,7 @@ export default function TraceExplorer() {
                                     <tr>
                                         <td
                                             className="empty-cell"
-                                            colSpan={5}
+                                            colSpan={6}
                                         >
                                             <div className="empty-state">
                                                 <div
@@ -1344,7 +1380,7 @@ export default function TraceExplorer() {
                                 <tr>
                                     <td
                                         className="empty-cell"
-                                        colSpan={5}
+                                        colSpan={6}
                                     >
                                         <div className="empty-state">
                                             <div
@@ -1380,7 +1416,7 @@ export default function TraceExplorer() {
                                     <tr>
                                         <td
                                             className="empty-cell"
-                                            colSpan={5}
+                                            colSpan={6}
                                         >
                                             <div className="empty-state">
                                                 <div
@@ -1407,7 +1443,11 @@ export default function TraceExplorer() {
                                 traceResponse.items.map(
                                     (trace) => (
                                         <tr
-                                            className="trace-row"
+                                            className={`trace-row ${
+                                                selectedTraceId === trace.traceId
+                                                    ? "trace-row-selected"
+                                                    : ""
+                                            }`}
                                             key={trace.traceId}
                                         >
                                             <td>
@@ -1439,6 +1479,22 @@ export default function TraceExplorer() {
                                                 {formatDuration(
                                                     trace.longestSpanDurationNano,
                                                 )}
+                                            </td>
+
+                                            <td className="trace-action-cell">
+                                                <button
+                                                    className="secondary-button trace-detail-button"
+                                                    onClick={() => {
+                                                        setSelectedTraceId(
+                                                            trace.traceId,
+                                                        );
+                                                    }}
+                                                    type="button"
+                                                >
+                                                    {selectedTraceId === trace.traceId
+                                                        ? "Selected"
+                                                        : "View"}
+                                                </button>
                                             </td>
                                         </tr>
                                     ),
@@ -1492,6 +1548,23 @@ export default function TraceExplorer() {
                             </div>
                         )}
                 </section>
+
+                {selectedTraceId !== null &&
+                    activeQuery !== null && (
+                        <div
+                            className="trace-detail-scroll-target"
+                            ref={detailPanelRef}
+                        >
+                            <TraceDetailPanel
+                                activeQuery={activeQuery}
+                                onClose={() => {
+                                    setSelectedTraceId(null);
+                                }}
+                                traceId={selectedTraceId}
+                            />
+                        </div>
+                    )}
+
             </main>
         </div>
     );
