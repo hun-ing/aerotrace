@@ -1,0 +1,16 @@
+services:
+  timescaledb:
+    ports: !override []
+
+  backend:
+    ports: !override []
+
+  otel-collector:
+    ports: !override
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:8888:8888"
+
+  frontend:
+    ports: !override
+      - "127.0.0.1:3000:3000"
