@@ -10,3 +10,49 @@ services:
         condition: service_completed_successfully
       backend:
         condition: service_healthy
+
+  frontend:
+    profiles:
+      - app
+
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+
+    image: aerotrace-frontend:local
+    container_name: aerotrace-frontend
+
+    env_file:
+      - ./frontend.env
+
+    environment:
+      AEROTRACE_BACKEND_BASE_URL: http://backend:8080
+      HOSTNAME: 0.0.0.0
+      PORT: 3000
+
+    ports:
+      - "3000:3000"
+
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >
+          fetch("http://localhost:3000")
+          .then((response) =>
+          process.exit(response.ok ? 0 : 1))
+          .catch(() => process.exit(1))
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+    networks:
+      - aerotrace-network
+
+    restart: unless-stopped
