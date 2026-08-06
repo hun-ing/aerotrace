@@ -1405,3 +1405,45 @@ Backend MVP
 5. Image Tag 확인
 6. 실행 순서와 의존성 확인
 7. 한 명령으로 로컬 통합 실행할 목표 구조 정의
+
+---
+
+## Phase 9 — Docker 통합 실행 및 데이터 보존 검증
+
+### 구현 내용
+
+* TimescaleDB, Backend, OpenTelemetry Collector, Frontend를 Docker Compose 통합 모드로 실행
+* PowerShell 기반 통합 실행 스크립트에 설정 검사, 시작, 종료, 재시작, 상태 확인, 로그 확인 기능 추가
+* `docker compose down`으로 Container와 Network를 제거하되 Named Volume은 유지하도록 운영 절차 고정
+* Windows PowerShell에서 안정적으로 실행되도록 TimescaleDB 조회 명령을 `docker exec ... psql` 직접 실행 방식으로 변경
+
+### 검증 조건
+
+1. 통합 모드에서 전체 서비스 실행
+2. 재생성 전 `public.spans` 행 수 조회
+3. 전체 Container와 Compose Network 제거
+4. TimescaleDB 및 Collector Named Volume 유지 확인
+5. 전체 Container 재생성
+6. 재생성 후 `public.spans` 행 수 재조회
+7. Backend, Frontend, Collector 수집 경로 재검증
+
+### 측정 결과
+
+```text
+재생성 전 Span 수: 120,107
+재생성 후 Span 수: 120,107
+데이터 보존 여부: True
+```
+
+### 확인된 사항
+
+* TimescaleDB 데이터가 Container 파일시스템이 아닌 Docker Named Volume에 정상 저장됨
+* Container 제거 및 재생성 이후에도 기존 Span 데이터가 유실되지 않음
+* 재생성 이후 Backend와 Frontend가 기존 데이터를 다시 조회할 수 있음
+* 운영 절차에서 `docker compose down -v`를 사용하면 데이터 Volume이 삭제될 수 있으므로 금지 명령으로 문서화
+
+### 남은 위험
+
+* Named Volume 유지 검증은 완료했지만 디스크 손상, 서버 손실, 사용자 실수에 대비한 외부 백업은 아직 없음
+* 데이터베이스 백업 및 복원 절차는 운영 배포 전에 별도로 검증해야 함
+* Collector Persistent Queue에 실제 미전송 데이터가 존재하는 상태에서의 재기동 복구 테스트는 별도 장애 시나리오로 수행해야 함
