@@ -679,3 +679,83 @@ docker compose up
 - Collector 수신 성공을 DB 저장 성공으로 간주하지 않는다.
 - 보안 경계는 UI나 Cursor가 아니라 인증 결과와 Repository의 Tenant / Project 조건에서 강제한다.
 - 현재 규모에 필요하지 않은 Kafka, Kubernetes, Elasticsearch를 포트폴리오 목적으로 추가하지 않는다.
+
+---
+
+## 현재 배포 방향
+
+### 최초 외부 공개 검증 환경
+
+Oracle Cloud Ampere A1을 최초 외부 공개 검증 환경으로 사용한다.
+
+목적:
+
+* SaaS Dashboard 외부 접근 검증
+* 외부 애플리케이션의 OTLP 전송 검증
+* 회사 PoC 및 포트폴리오 데모
+* ARM64 Docker 이미지 검증
+* 공개 네트워크 환경의 보안 및 운영 절차 학습
+
+Oracle Cloud 환경은 무료 인스턴스의 용량 부족 및 회수 가능성이 있으므로 실제 사용자 데이터의 유일한 저장 위치로 사용하지 않는다.
+
+### N100 Ubuntu 홈서버
+
+N100 Ubuntu 홈서버는 다음 용도로 사용한다.
+
+* amd64 온프레미스 배포 검증
+* 장기 데이터 저장량 측정
+* JDBC batch 처리량 측정
+* TimescaleDB Retention 및 Compression 실험
+* Collector Persistent Queue 장애 복구 실험
+* 백업 및 복원 실험
+* AeroTrace 자체 모니터링
+
+초기 단계에서는 홈 네트워크를 인터넷에 직접 공개하지 않는다.
+
+### 환경 분리 원칙
+
+다음 환경은 각각 독립적인 데이터베이스와 Secret을 사용한다.
+
+```text
+local-development
+oci-public-demo
+n100-on-premise
+```
+
+환경별로 별도 관리할 값:
+
+```text
+DB 사용자
+DB 비밀번호
+DB 이름
+AeroTrace API Key
+Frontend BFF API Key
+Collector Backend Endpoint
+도메인 및 TLS 설정
+Retention 설정
+```
+
+환경 간 데이터베이스 자동 복제는 MVP 범위에 포함하지 않는다.
+
+### 현재 Phase
+
+Phase 9 — 로컬 통합 실행 및 운영 배포 준비
+
+완료된 작업:
+
+* Backend Docker 이미지 생성
+* Frontend Standalone Docker 이미지 생성
+* Collector와 Backend Docker Network 직접 연결
+* 전체 통합 실행 스크립트 작성
+* Container 재생성 후 TimescaleDB 데이터 보존 검증
+* amd64 및 arm64 이미지 호환성 검증
+* 최초 공개 환경과 온프레미스 환경의 역할 결정
+
+다음 작업:
+
+* OCI 및 N100에서 공통으로 사용할 운영 Compose 구조 분리
+* 운영용 포트 공개 범위 결정
+* Reverse Proxy와 TLS 구조 결정
+* Ubuntu 서버 기본 보안 설정
+* 운영 Secret 생성 및 전달 절차 작성
+* DB 데이터 디렉터리와 백업 위치 결정
