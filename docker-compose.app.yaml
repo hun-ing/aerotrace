@@ -1,0 +1,12 @@
+services:
+  otel-collector:
+    environment:
+      AEROTRACE_BACKEND_ENDPOINT: http://backend:8080
+
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      otel-storage-init:
+        condition: service_completed_successfully
+      backend:
+        condition: service_healthy

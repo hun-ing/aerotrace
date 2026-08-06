@@ -23,6 +23,13 @@ FROM eclipse-temurin:21-jre-jammy AS runtime
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install \
+        --yes \
+        --no-install-recommends \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder \
     /workspace/aerotrace-backend.jar \
     /app/aerotrace-backend.jar

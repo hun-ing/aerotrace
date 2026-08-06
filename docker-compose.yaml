@@ -101,6 +101,19 @@ services:
       timescaledb:
         condition: service_healthy
 
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://localhost:8080/actuator/health
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
     networks:
       - aerotrace-network
 
