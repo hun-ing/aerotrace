@@ -1,0 +1,14 @@
+services:
+  frontend:
+    ports: !override []
+
+    networks:
+      aerotrace-network:
+      edge-gateway:
+        aliases:
+          - aerotrace-web
+
+networks:
+  edge-gateway:
+    name: edge-gateway-net
+    external: true
