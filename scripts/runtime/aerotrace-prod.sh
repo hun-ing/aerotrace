@@ -49,6 +49,9 @@ assert_required_commands() {
 
     docker compose version >/dev/null 2>&1 ||
         fail "docker compose was not found."
+
+    command -v curl >/dev/null 2>&1 ||
+        fail "curl was not found."
 }
 
 assert_required_files() {
@@ -130,6 +133,62 @@ assert_collector_running() {
     fi
 
     echo "aerotrace-otel-collector is running."
+}
+
+wait_for_collector_metrics() {
+    local timeout_seconds="${1:-120}"
+    local started_at
+    local elapsed
+    local container_status
+
+    started_at="$(date +%s)"
+
+    while true; do
+        if curl \
+            --fail \
+            --silent \
+            --show-error \
+            --max-time 3 \
+            http://127.0.0.1:8888/metrics \
+            >/dev/null 2>&1; then
+
+            echo \
+                "Collector metrics endpoint is ready: " \
+                "http://127.0.0.1:8888/metrics"
+
+            return 0
+        fi
+
+        container_status="$(
+            docker inspect \
+                aerotrace-otel-collector \
+                --format '{{.State.Status}}' \
+                2>/dev/null ||
+            true
+        )"
+
+        case "${container_status}" in
+            exited | dead)
+                fail \
+                    "Collector entered state: " \
+                    "${container_status}"
+                ;;
+        esac
+
+        elapsed="$(
+            (
+                $(date +%s) - started_at
+            )
+        )"
+
+        if (( elapsed >= timeout_seconds )); then
+            fail \
+                "Timed out waiting for Collector " \
+                "metrics endpoint."
+        fi
+
+        sleep 2
+    done
 }
 
 assert_storage_init_succeeded() {
@@ -268,6 +327,7 @@ start_production_runtime() {
 
     assert_storage_init_succeeded
     assert_collector_running
+    wait_for_collector_metrics
     assert_production_ports
 
     echo
