@@ -4614,3 +4614,92 @@ Estimated chunks per request = 1.992
 
 현재 DB CPU headroom은 지속적으로 감소하고 있으나 2,250 spans/s를 sustained throughput ceiling으로 판단할 증거는 없다.
 
+---
+
+## 2026-08-10 — 2,375 spans/s DB Headroom 재현성 검증
+
+2,375 spans/s × 60초 sustained workload에서 TimescaleDB CPU가 60%대 중반으로 상승하고 standing Collector queue가 관찰되어 동일 조건으로 두 번째 테스트를 수행했다.
+
+### 데이터 정합성
+
+두 실행 모두:
+
+```text
+Expected spans    = 142,500
+DB final          = 142,500 / 142,500
+Failed requests   = 0
+Refused delta     = 0
+Final queue       = 0
+Final in-flight   = 0
+```
+
+으로 정상 완료됐다.
+
+### TimescaleDB CPU 재현성
+
+Full-rate t=10~60:
+
+```text
+Run1
+average = 66.53%
+median  = 65.80%
+minimum = 60.03%
+maximum = 73.91%
+
+Run2
+average = 65.80%
+median  = 65.99%
+minimum = 56.61%
+maximum = 75.49%
+```
+
+두 실행의 average와 median이 거의 동일하게 재현됐다.
+
+따라서 2,375 spans/s에서 TimescaleDB가 약 60%대 중반 CPU를 지속적으로 사용하는 현상은 단일 run 변동이 아니라 재현 가능한 workload 특성으로 판단한다.
+
+### Collector Queue
+
+Run2의 5초 sampling:
+
+```text
+t=10 → queue=1050
+t=15 → queue=1050
+t=20 → queue=0
+
+t=25 → queue=1050
+t=30 → queue=1050
+t=35 → queue=1050
+t=40 → queue=0
+
+t=45 → queue=1050
+t=50 → queue=1050
+t=55 → queue=0
+
+t=60 → queue=1050
+t=65 → queue=0
+```
+
+한 Collector batch 수준의 standing queue가 반복적으로 나타났지만 queue size가 2100 이상으로 증가하지 않았고 최종적으로 정상 drain됐다.
+
+따라서 2,375 spans/s에서 standing queue는 재현됐지만 growing backlog 또는 exporter saturation은 확인되지 않았다.
+
+### 결론
+
+2,375 spans/s는 동일 조건 두 차례 모두 데이터 정합성과 최종 pipeline drain에 성공했다.
+
+동시에 TimescaleDB full-rate CPU가 약 66% 수준으로 재현되어 이 구간부터 DB headroom 감소가 명확한 성능 특성으로 확인됐다.
+
+현재 상태:
+
+```text
+데이터 정합성      PASS
+failed             0
+refused            0
+standing queue     재현
+growing backlog    미관찰
+DB CPU ~66%        재현
+DB saturation      미확인
+```
+
+따라서 아직 tuning은 수행하지 않지만, 이후 부하 상승 폭을 더 줄이고 DB CPU와 queue 성장 여부를 엄격하게 관찰한다.
+

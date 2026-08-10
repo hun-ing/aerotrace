@@ -1651,3 +1651,40 @@ DB headroom은 감소하고 있지만 growing queue, refused, failed 또는 데�
 
 현재 설정 tuning은 수행하지 않는다.
 
+---
+
+### 2,375 spans/s 재현성 검증
+
+2,375 spans/s × 60초 sustained workload를 동일 조건으로 2회 수행했다.
+
+```text
+Run1 → 142,500 / 142,500 PASS
+Run2 → 142,500 / 142,500 PASS
+
+Failed  = 0
+Refused = 0
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+Run1
+avg    = 66.53%
+median = 65.80%
+
+Run2
+avg    = 65.80%
+median = 65.99%
+```
+
+2,375 spans/s에서 약 60%대 중반 DB CPU 사용이 동일 조건 반복에서도 재현됐다.
+
+Collector queue는 한 1050-span batch 수준으로 반복적으로 유지됐지만 2100 이상으로 성장하지 않았으며 최종 drain됐다.
+
+따라서 2,375 spans/s는 현재 synthetic workload에서 정상 처리 가능한 범위지만 DB headroom 감소가 명확하게 재현된 구간이다.
+
+설정 tuning은 아직 수행하지 않는다.
+
