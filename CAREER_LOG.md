@@ -682,3 +682,107 @@ Trace를 전송한 뒤 Dashboard에서 확인하며,
 ```
 
 이 과정을 완료하면 구현 경험이 실제 배포와 운영 경험으로 확장된다.
+
+---
+
+### 장애 복구 경험 — Nginx stale Docker upstream
+
+AeroTrace 홈서버 운영 환경에서 Frontend 프로세스 장애를 직접 주입해 Docker restart policy의 실제 복구 동작을 검증했다.
+
+Frontend 컨테이너는 자동 재시작되어 `healthy` 상태까지 복구됐지만 실제 Dashboard에서는 `504 Gateway Timeout`이 발생했다. Nginx 로그의 기존 upstream IP와 재시작 후 Docker IP 및 DNS 결과를 비교해 Nginx의 stale upstream resolution이 원인임을 확인했다.
+
+Docker embedded DNS와 Nginx dynamic upstream resolution을 적용하고 동일 장애를 다시 주입하여 컨테이너 복구뿐 아니라 실제 사용자 요청 경로까지 자동 복구되는 것을 검증했다.
+
+### 이력서 문장 초안
+
+Docker Compose 기반 운영 환경에서 Frontend 장애 주입 테스트를 수행해 컨테이너 자동 재시작 후 Nginx가 변경 전 upstream IP를 유지하면서 발생하는 504 장애를 발견하고, Docker embedded DNS 기반 동적 upstream resolution을 적용해 실제 서비스 요청 경로의 자동 복구를 검증
+
+### 면접 소재
+
+`restart: unless-stopped`가 있는데도 서비스가 복구되지 않았던 이유, Docker 컨테이너 IP와 DNS의 관계, Nginx hostname resolution 방식, health check와 실제 사용자 가용성의 차이, 장애 주입을 통해 설정 존재 여부가 아닌 실제 복구 능력을 검증한 과정
+
+### 블로그 주제
+
+**제목:** Docker 컨테이너는 살아났는데 왜 Nginx는 504를 반환했을까?
+
+핵심 메시지는 컨테이너 자동 재시작과 서비스 자동 복구는 같은 개념이 아니며, Reverse Proxy의 service discovery까지 장애 복구 설계에 포함해야 한다는 것이다.
+
+보존할 자료는 504 Nginx error log, 장애 전후 Container PID/IP, RestartCount 변화, Docker DNS 조회 결과, dynamic upstream 설정, 수정 전후 장애 주입 결과이다.
+
+---
+
+## Persistent Queue 장애 복구 검증
+
+### 직접 수행한 경험
+
+AeroTrace telemetry 수집 경로에서 Backend 장애와 OpenTelemetry Collector 프로세스 장애를 연속으로 주입하고 Persistent Queue가 실제 데이터 유실을 방지하는지 검증했다.
+
+Backend를 사용할 수 없는 동안 Collector가 수신한 테스트 Span이 DB에 저장되지 않은 상태임을 확인한 뒤 Collector 프로세스까지 강제 종료했다.
+
+Collector가 Docker restart policy로 다시 실행된 이후에도 queued telemetry가 유지됐으며, Backend 복구 후 retry를 통해 TimescaleDB에 테스트 Span이 정확히 1건 저장되는 것을 확인했다.
+
+### 포트폴리오 강조점
+
+단순히 OpenTelemetry Collector의 `sending_queue`, `retry_on_failure`, `file_storage` 설정을 적용한 것이 아니라 실제 장애를 발생시켜 다음을 검증했다.
+
+* Backend 장애 중 telemetry 수신
+* 디스크 기반 queue 보존
+* Collector crash/restart 이후 queue 복원
+* Backend 복구 후 자동 retry
+* 최종 데이터 유실 여부
+* 최종 중복 저장 여부
+
+### 이력서 문장 초안
+
+OpenTelemetry Collector의 persistent queue와 retry 구조를 적용하고 Backend 장애 및 Collector 프로세스 재시작을 연속으로 주입하여, 수신된 telemetry가 장애 구간을 견디고 Backend 복구 후 TimescaleDB에 정확히 1건 저장되는 데이터 유실 방지 경로를 검증
+
+### 예상 면접 질문
+
+* Collector가 HTTP 200을 반환한 뒤 Backend 저장에 실패하면 데이터는 어디에 존재하는가?
+* memory queue와 persistent queue의 장애 내성 차이는 무엇인가?
+* Collector 컨테이너까지 재시작했는데 데이터가 남을 수 있었던 이유는 무엇인가?
+* Persistent Queue가 있다고 데이터 유실이 절대 발생하지 않는가?
+* queue가 가득 차거나 디스크가 가득 차면 어떻게 되는가?
+* retry로 인해 동일 Span이 중복 저장될 가능성은 어떻게 처리해야 하는가?
+
+### 블로그 주제
+
+**Backend도 죽이고 Collector도 죽여봤다 — OpenTelemetry Persistent Queue는 정말 데이터를 지켜줄까?**
+
+핵심 메시지는 설정 파일에 `persistent queue`가 존재하는 것과 실제 장애 상황에서 데이터 복구를 증명하는 것은 전혀 다른 수준의 검증이라는 것이다.
+
+보존할 자료:
+
+* 장애 테스트 명령과 순서
+* Collector queue/retry 설정
+* Persistent Volume mount
+* Collector RestartCount 변화
+* 장애 전/후 queue metric
+* 테스트 Trace ID / Span ID
+* DB 최종 count=1 결과
+
+---
+
+## OpenTelemetry Persistent Queue 저장 비용 실측
+
+AeroTrace의 Backend 장애 상황을 재현해 OpenTelemetry Collector에 100개의 테스트 Span을 적재하고 queue metric, 디스크 사용량, 복구 후 데이터 정합성을 함께 측정했다.
+
+Collector는 장애 중 100개 Span을 모두 수락했고 `queue_size`가 0에서 100으로 증가했다. `receiver_refused_spans`는 0이었으며 Backend 복구 후 queue가 다시 0으로 감소하고 TimescaleDB에 정확히 100건 저장되는 것을 확인했다.
+
+Persistent Queue storage는 최초 상태 대비 apparent size가 98,304 bytes, filesystem allocated size가 45,056 bytes 증가했다.
+
+이번 테스트 payload 기준으로 각각 약 983 bytes/span, 451 bytes/span의 증가량을 관찰했지만, 실제 운영 Span 크기로 일반화하지 않고 더 큰 표본과 실제 telemetry를 통해 추가 측정하기로 했다.
+
+또한 queue drain 이후에도 Persistent Queue 파일의 크기가 즉시 감소하지 않는 것을 직접 관찰하여, 디스크 사용량 분석 시 현재 파일 크기만이 아니라 high-water mark와 최초 baseline을 함께 봐야 한다는 운영 특성을 확인했다.
+
+### 이력서 문장 후보
+
+OpenTelemetry Collector Persistent Queue의 장애 대응 능력을 기능 검증에 그치지 않고 Backend 장애 상태에서 100 Span을 직접 적재하여 queue metric과 디스크 사용량을 측정하고, 복구 후 100건 전량 저장 및 중복·유실 없음까지 검증
+
+### 면접 소재
+
+* `queue_size`와 실제 디스크 사용량의 관계
+* queue가 drain돼도 파일 크기가 즉시 감소하지 않은 이유를 운영상 어떻게 해석했는가
+* 100 Span 결과만으로 최대 장애 시간을 산정하지 않은 이유
+* apparent size와 allocated size를 둘 다 측정한 이유
+* 실제 서비스 Span 저장량을 산정하려면 어떤 추가 실험이 필요한가

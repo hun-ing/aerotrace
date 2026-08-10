@@ -1447,3 +1447,350 @@ Backend MVP
 * Named Volume 유지 검증은 완료했지만 디스크 손상, 서버 손실, 사용자 실수에 대비한 외부 백업은 아직 없음
 * 데이터베이스 백업 및 복원 절차는 운영 배포 전에 별도로 검증해야 함
 * Collector Persistent Queue에 실제 미전송 데이터가 존재하는 상태에서의 재기동 복구 테스트는 별도 장애 시나리오로 수행해야 함
+
+---
+
+## ENGINEERING_LOG.md 추가
+
+### 2026-08-10 — Frontend 자동 재시작 후 Nginx stale upstream으로 인한 504 장애
+
+#### 테스트 목적
+
+Docker `restart: unless-stopped` 설정이 단순히 컨테이너를 다시 실행하는 수준을 넘어, 실제 AeroTrace Dashboard 서비스까지 자동 복구시키는지 장애 주입으로 검증했다.
+
+#### 장애 주입
+
+`aerotrace-frontend` 컨테이너의 PID 1 프로세스를 `SIGKILL`로 강제 종료했다.
+
+테스트 직전 상태:
+
+```text
+PID: 835820
+RestartCount: 0
+StartedAt: 2026-08-07T03:08:31.740774962Z
+```
+
+장애 후 Docker가 컨테이너를 자동으로 재시작했다.
+
+```text
+RestartCount: 0 -> 1
+새 PID: 2488763
+StartedAt: 2026-08-10T01:14:10.973935763Z
+health: starting -> healthy
+```
+
+Frontend 컨테이너 자체는 약 3초 안에 `healthy` 상태로 복구됐다.
+
+#### 발견된 문제
+
+컨테이너가 정상 복구된 이후 Basic Auth를 통과한 Dashboard 요청에서 `504 Gateway Timeout`이 발생했다.
+
+Nginx error log:
+
+```text
+upstream timed out while connecting to upstream
+upstream: "http://172.16.50.20:3000/"
+
+connect() failed (113: Host is unreachable) while connecting to upstream
+upstream: "http://172.16.50.20:3000/..."
+```
+
+재시작 후 실제 Frontend의 `edge-gateway-net` IP는 다음과 같았다.
+
+```text
+172.16.50.5
+```
+
+Docker embedded DNS 역시 정상적으로 새로운 IP를 반환했다.
+
+```text
+aerotrace-web -> 172.16.50.5
+```
+
+Edge Gateway 컨테이너에서 새 주소로 직접 요청했을 때 Next.js는 정상적으로 `HTTP 200`을 반환했다.
+
+따라서 Docker 및 Frontend 자체 문제가 아니라 Nginx가 기존 upstream IP `172.16.50.20`을 계속 사용하고 있는 것이 원인이었다.
+
+#### 원인
+
+기존 설정:
+
+```nginx
+proxy_pass http://aerotrace-web:3000;
+```
+
+에서 Nginx가 Docker hostname을 설정 로딩 시 해석한 뒤 기존 IP를 계속 사용했다.
+
+Frontend 컨테이너가 비정상 종료 후 재생성/재연결되면서 IP가 변경됐지만 Nginx upstream은 새로운 Docker DNS 결과를 반영하지 못했다.
+
+따라서 다음 상태가 발생했다.
+
+```text
+Frontend 프로세스 장애
+→ Docker 자동 재시작 성공
+→ Frontend Docker IP 변경
+→ Docker DNS 갱신 성공
+→ Nginx는 과거 IP 유지
+→ 504 Gateway Timeout
+```
+
+#### 해결
+
+AeroTrace Frontend upstream을 Docker embedded DNS 기반 동적 resolution 방식으로 변경했다.
+
+핵심 설정:
+
+```nginx
+upstream aerotrace_frontend_upstream {
+    zone aerotrace_frontend_upstream 64k;
+
+    resolver 127.0.0.11 valid=5s ipv6=off;
+    resolver_timeout 2s;
+
+    server aerotrace-web:3000 resolve;
+}
+```
+
+그리고 기존 직접 hostname proxy를 다음과 같이 변경했다.
+
+```nginx
+proxy_pass http://aerotrace_frontend_upstream;
+```
+
+#### 재검증
+
+동일한 Frontend 프로세스 장애 주입 테스트를 다시 수행했다.
+
+Docker 자동 재시작, health 복구, Docker DNS 갱신과 함께 실제 외부 AeroTrace Dashboard까지 정상 복구되는 것을 확인했다.
+
+최종 판정:
+
+```text
+Container recovery : PASS
+Docker DNS update  : PASS
+Nginx DNS update   : PASS
+Service recovery   : PASS
+```
+
+#### 실무적 교훈
+
+컨테이너에 `restart: unless-stopped`가 설정되어 있다는 사실만으로 실제 서비스 복구를 보장할 수 없다.
+
+Reverse Proxy, DNS resolution, Docker network, health check까지 포함한 전체 요청 경로를 장애 주입으로 검증해야 한다.
+
+특히 컨테이너 hostname을 사용하는 Nginx upstream에서는 컨테이너 IP 변경 시 DNS 재해석 방식이 실제 장애 복구 능력에 영향을 줄 수 있다.
+
+---
+
+## 2026-08-10 — Backend 장애 + Collector 재시작 Persistent Queue 복구 검증
+
+### 목적
+
+OpenTelemetry Collector가 telemetry를 수신한 뒤 AeroTrace Backend가 일시적으로 사용할 수 없는 상황에서도 데이터를 유실하지 않고 보관하며, Collector 자체까지 재시작된 이후 Backend가 복구되면 저장을 완료하는지 검증했다.
+
+### 장애 시나리오
+
+다음 순서로 실제 장애를 주입했다.
+
+1. 정상 상태의 Backend, Collector, TimescaleDB 확인
+2. AeroTrace Backend 일시 정지
+3. 고유한 Trace ID / Span ID / Span Name을 가진 테스트 Span 1개를 OTLP/HTTP로 Collector에 전송
+4. Backend가 정지된 상태에서 DB에 Span이 저장되지 않았음을 확인
+5. 아직 전송되지 못한 telemetry가 있는 상태에서 Collector 프로세스를 강제 종료
+6. Docker restart policy에 의해 Collector 자동 재시작
+7. Backend를 복구
+8. Collector의 retry/persistent queue를 통해 telemetry 재전송
+9. TimescaleDB 저장 결과 확인
+
+### 결과
+
+테스트가 정상 완료됐다.
+
+```text
+Backend 장애 중 Collector 수신             PASS
+Backend 장애 중 DB 미저장                   PASS
+Collector 비정상 종료 후 자동 재시작         PASS
+Collector 재시작 후 queued telemetry 유지    PASS
+Backend 복구 후 retry/export                PASS
+최종 DB 저장                                PASS
+최종 test span count = 1                    PASS
+```
+
+테스트 Span이 최종적으로 정확히 1건 저장되어 장애 복구 과정에서 데이터 유실이나 중복 저장이 발생하지 않았음을 확인했다.
+
+### 검증된 구조
+
+```text
+OTLP Client
+    ↓
+OpenTelemetry Collector
+    ↓
+Persistent Sending Queue
+    ↓
+Docker Volume /var/lib/otelcol
+    ↓
+Backend 장애 중 데이터 보존
+    ↓
+Collector 재시작
+    ↓
+Persistent Queue 복원
+    ↓
+Backend 복구
+    ↓
+Retry
+    ↓
+AeroTrace Backend
+    ↓
+TimescaleDB
+```
+
+### 운영상 의미
+
+Collector 설정에 persistent queue가 존재한다는 사실만 확인한 것이 아니라 실제 Backend 장애와 Collector 프로세스 장애를 연속으로 발생시켜 데이터 복구 경로 전체를 검증했다.
+
+단, Persistent Queue 용량과 저장 디스크는 유한하므로 장시간 Backend 장애나 디스크 고갈 상황에서의 최대 버퍼링 능력은 별도의 측정이 필요하다.
+
+### 다음 검증 과제
+
+* sending queue 최대 용량 확인
+* queue 적재량 증가에 따른 디스크 사용량 측정
+* Backend 장기 장애 시 최대 버퍼링 가능 telemetry 양 측정
+* queue saturation 시 동작 및 데이터 유실 조건 확인
+* 운영 alert 기준 수립
+
+---
+
+## 2026-08-10 — OpenTelemetry Persistent Queue 100 Span 저장 비용 측정
+
+### 목적
+
+AeroTrace Backend 장애 시 OpenTelemetry Collector Persistent Queue가 telemetry를 얼마나 저장하는지 실제 디스크 사용량과 Collector 내부 metric을 기준으로 측정했다.
+
+단순 기능 검증이 아니라 향후 Backend 장애 지속시간과 필요한 queue/storage 용량을 산정하기 위한 첫 번째 baseline 실험이다.
+
+### 테스트 조건
+
+* 테스트 Span: 100개
+* OTLP/HTTP 요청: 요청당 Span 1개
+* AeroTrace Backend: `docker pause`로 일시 정지
+* Collector: 정상 실행 유지
+* TimescaleDB: 정상 실행 유지
+* Persistent storage: `/var/lib/otelcol` Docker Volume
+* 테스트 중 Collector 재시작 없음
+
+### 장애 전 상태
+
+```text
+otelcol_exporter_queue_capacity = 50000
+otelcol_exporter_queue_size = 0
+
+Persistent storage apparent bytes = 45056
+Persistent storage allocated bytes = 32768
+```
+
+### Backend 장애 중 전송 결과
+
+Collector에 총 100개의 Span을 전송했다.
+
+```text
+Requested spans       = 100
+Collector accepted    = 100
+DB count during outage = 0
+```
+
+Collector 내부 metric:
+
+```text
+otelcol_exporter_queue_capacity = 50000
+otelcol_exporter_queue_size = 100
+
+otelcol_receiver_accepted_spans = 100
+otelcol_receiver_refused_spans = 0
+```
+
+Backend가 정지된 동안 Collector가 모든 Span을 수락했고 TimescaleDB에는 아직 데이터가 저장되지 않았다.
+
+### Persistent Queue 저장량
+
+100개의 테스트 Span이 queue에 존재하는 시점의 storage 사용량:
+
+```text
+Apparent bytes before = 45056
+Apparent bytes queued = 143360
+Apparent delta        = 98304 bytes
+
+Allocated bytes before = 32768
+Allocated bytes queued = 77824
+Allocated delta        = 45056 bytes
+```
+
+이번 테스트 payload 기준 단순 비율:
+
+```text
+Apparent storage 증가 ≈ 983 bytes/span
+Allocated storage 증가 ≈ 451 bytes/span
+```
+
+이 값은 현재 테스트 Span 구조와 최초 storage 상태에서 측정된 값이며 운영 telemetry의 일반적인 Span 크기라고 간주하지 않는다.
+
+Resource attributes, Span attributes, events, links 등의 크기가 증가하면 실제 저장 비용 역시 달라질 수 있다.
+
+### Backend 복구 결과
+
+Backend를 unpause한 직후 일시적으로 health check가 `unhealthy`였으며 6번째 확인에서 `healthy`로 복귀했다.
+
+Queue drain 이후:
+
+```text
+otelcol_exporter_queue_size = 0
+otelcol_exporter_sent_spans = 101
+
+Final DB count = 100
+```
+
+테스트 이전 `sent_spans=1`에서 테스트 이후 `101`로 증가하여 이번 테스트의 100 Span과 일치했다.
+
+DB에도 테스트 Span이 정확히 100건 존재했다.
+
+따라서 이번 실험에서는:
+
+```text
+수락   100
+거부     0
+복구   100
+중복     0
+유실     0
+```
+
+으로 확인됐다.
+
+### Queue drain 이후 storage 특성
+
+Queue가 완전히 비워진 이후에도:
+
+```text
+Apparent bytes = 143360
+Allocated bytes = 77824
+```
+
+로 유지됐다.
+
+즉, queue drain이 파일 크기의 즉시 축소를 의미하지 않는 동작이 관찰됐다.
+
+따라서 이후 실험에서는 각 실험 시작점의 `du` 차이만으로 Span당 저장량을 단순 계산하지 않고, 최초 baseline과 queue high-water mark를 함께 비교해야 한다.
+
+### 다음 실험
+
+100 Span 결과를 기준으로 1,000 Span을 동일 조건에서 적재한다.
+
+확인 항목:
+
+* queue_size 증가
+* queue_capacity 대비 사용률
+* 1,000 Span high-water mark
+* 최초 baseline 대비 storage 증가량
+* 100 Span과 1,000 Span 사이의 storage 증가 패턴
+* Backend 복구 후 정확히 1,000건 저장
+* refused/enqueue failure 발생 여부
+
+이 결과를 통해 Persistent Queue 디스크 사용량이 테스트 범위에서 어느 정도 선형성을 가지는지 확인한다.

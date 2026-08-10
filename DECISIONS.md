@@ -1145,3 +1145,43 @@ Oracle Cloud와 N100 홈서버에 같은 코드베이스를 배포하면 다음�
 * 월간 가용성 목표가 필요해짐
 * 자동 백업과 장애 복구 목표가 정의됨
 * 단일 서버가 측정된 병목이 됨
+
+---
+
+### ADR — Edge Gateway에서 Docker upstream을 동적으로 해석
+
+#### 해결하려는 문제
+
+AeroTrace Frontend 컨테이너 장애 후 Docker가 컨테이너를 자동 복구했지만 IP가 변경되면서 Edge Gateway Nginx가 기존 IP를 계속 사용해 `504 Gateway Timeout`이 발생했다.
+
+#### 검토한 방식
+
+정적 `proxy_pass http://aerotrace-web:3000` 구성을 그대로 유지하고 Nginx를 재시작하거나 reload하는 방식과 Docker embedded DNS를 이용해 upstream을 동적으로 재해석하는 방식을 검토했다.
+
+#### 선택
+
+Docker embedded DNS `127.0.0.11`과 Nginx dynamic upstream resolution을 사용한다.
+
+```nginx
+resolver 127.0.0.11 valid=5s ipv6=off;
+
+server aerotrace-web:3000 resolve;
+```
+
+#### 선택 이유
+
+컨테이너 장애가 발생할 때마다 운영자가 Nginx를 수동 reload하는 방식은 자동 복구라는 운영 목표에 맞지 않는다.
+
+Docker가 새로운 컨테이너 주소를 DNS에 반영하면 Nginx도 이를 자동으로 따라가도록 만들어 Gateway와 애플리케이션의 복구 수명주기를 분리한다.
+
+#### 단점과 위험
+
+Docker embedded DNS에 의존한다.
+
+Resolver 동작과 Nginx 버전의 dynamic upstream 지원 여부가 운영 환경에 영향을 준다.
+
+DNS 갱신 주기 동안 짧은 복구 지연이 발생할 수 있다.
+
+#### 재검토 조건
+
+향후 Kubernetes, Service Discovery 시스템, 외부 Load Balancer 등 Docker Compose가 아닌 배포 환경으로 변경할 경우 upstream discovery 방식을 다시 검토한다.

@@ -759,3 +759,73 @@ Phase 9 — 로컬 통합 실행 및 운영 배포 준비
 * Ubuntu 서버 기본 보안 설정
 * 운영 Secret 생성 및 전달 절차 작성
 * DB 데이터 디렉터리와 백업 위치 결정
+
+---
+
+## Phase 9 운영 검증 진행 상태
+
+### 검증 완료
+
+* Edge Gateway HTTPS 공개
+* Dashboard Basic Auth 보호
+* AeroTrace Backend / TimescaleDB 비공개 네트워크 구성
+* OTLP 4317/4318 localhost 전용 노출
+* Runtime API Key 환경변수 기반 관리
+* Nginx unknown host 차단
+* 인증서 자동 갱신 통합
+* ACTIVE/PARKED 도메인 인증서 정책 정리
+* Frontend 프로세스 장애 자동 재시작 검증
+* Frontend IP 변경 후 Nginx stale upstream 504 장애 발견 및 동적 Docker DNS resolution 적용
+* 수정 후 실제 Dashboard 서비스 자동 복구 검증
+* OpenTelemetry Collector persistent queue 및 retry 설정 검증
+* Backend 장애 + Collector 재시작 상황에서 queued telemetry 복구 검증
+* 장애 복구 후 테스트 Span 정확히 1건 저장 확인
+
+### 현재 Phase
+
+Phase 9 — 홈서버 운영 배포 및 장애 복구 검증
+
+### 다음 작업
+
+OpenTelemetry Collector Persistent Queue의 실제 용량과 저장 비용을 측정한다.
+
+확인 대상:
+
+* queue size / capacity 설정
+* queue 적재량 metric
+* queue가 사용하는 Docker Volume 증가량
+* 일정량의 Span을 queue에 적재했을 때 Span당 디스크 사용량
+* Backend 장애 지속시간에 따른 버퍼링 가능량
+* queue saturation 및 디스크 부족 시 데이터 유실 조건
+
+---
+
+### Persistent Queue 용량 측정 진행 상황
+
+Backend 장애 상태에서 100개의 테스트 Span을 OpenTelemetry Collector Persistent Queue에 적재하는 첫 번째 저장량 측정을 완료했다.
+
+실측 결과:
+
+```text
+Collector accepted spans = 100
+Collector refused spans = 0
+
+Queue size:
+0 -> 100 -> 0
+
+DB during outage = 0
+DB after recovery = 100
+
+Persistent storage apparent delta = 98304 bytes
+Persistent storage allocated delta = 45056 bytes
+```
+
+이번 테스트 payload 기준 단순 비율은 apparent 약 983 bytes/span, allocated 약 451 bytes/span이었다.
+
+이 값은 실제 운영 telemetry의 일반적인 Span 크기로 확정하지 않는다.
+
+Queue drain 후에도 Persistent storage 파일 크기가 즉시 감소하지 않는 것을 확인했으므로 다음 1,000 Span 실험에서는 최초 baseline과 high-water mark를 함께 비교한다.
+
+### 다음 작업
+
+동일한 조건에서 1,000 Span을 Persistent Queue에 적재하여 queue/storage 증가 패턴과 복구 정합성을 측정한다.
