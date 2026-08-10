@@ -925,3 +925,26 @@ Backend 요청 평균은 860.66 Span, 최대는 900 Span이었으며 현재 JDBC
 
 OpenTelemetry telemetry 수집 파이프라인에 500→750→875 spans/s의 sustained workload를 단계적으로 적용하고, 875 spans/s에서 52,500 Span 전량 저장과 refused 0을 검증했으며 Collector batching을 통해 1,050개 요청이 61개 Backend 요청으로 병합되는 실제 처리 구조를 runtime 로그로 분석
 
+---
+
+## 동일 부하 반복을 통한 성능 가설 검증
+
+1,000 spans/s 테스트의 첫 실행에서 TimescaleDB CPU spike와 약 25초간 지속되는 1,000-span Collector queue가 관찰됐지만 이를 즉시 시스템 처리 한계로 판단하지 않았다.
+
+동일 조건을 두 차례 추가 실행한 결과 두 실행 모두 60,000 Span 전량 저장과 최종 queue drain에 성공했으며, 5초 resource sampling에서는 queue backlog가 전혀 관찰되지 않았다.
+
+또한 Run2와 Run3의 full-rate TimescaleDB CPU 평균이 각각 약 25.88%, 26.06%로 재현되면서 첫 실행의 CPU spike와 queue 현상이 지속적인 saturation이 아니라 간헐적인 변동일 가능성이 높다는 근거를 확보했다.
+
+### 포트폴리오 포인트
+
+- 단일 benchmark 결과를 최대 처리량으로 과대해석하지 않음
+- 동일 조건 반복 실험으로 성능 결과의 재현성 검증
+- CPU maximum보다 steady-state 구간을 분리하여 비교
+- Collector queue의 존재와 지속적인 queue 증가를 구분
+- 최초 가설과 후속 실험이 다를 경우 측정 결과에 맞춰 결론 수정
+- Collector batch와 JDBC batch 경계를 실제 runtime workload로 검증
+
+### 이력서 문장 후보
+
+OpenTelemetry 수집 파이프라인에서 1,000 spans/s sustained workload를 3회 반복 검증하여 각 60,000 Span 전량 저장을 확인하고, 최초 실행에서 관찰된 queue 및 CPU spike를 후속 반복 실험과 steady-state CPU 분석으로 재검증해 단일 benchmark 결과의 과대해석을 방지
+

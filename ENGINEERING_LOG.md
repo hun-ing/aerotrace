@@ -2973,3 +2973,139 @@ requests_over_jdbc_batch_size = 0
 
 다음 단계는 Collector `send_batch_size=1024`와 Backend `JDBC batch-size=1000`에 근접하는 1,000 spans/s sustained test다.
 
+---
+
+## 2026-08-10 — 1,000 spans/s Sustained Load 3회 재현성 검증
+
+### 목적
+
+Collector `send_batch_size=1024`와 Backend JDBC `batch-size=1000` 경계에 근접하는 1,000 spans/s에서 단일 실행 결과의 변동성을 확인하기 위해 동일한 60초 sustained workload를 총 3회 수행했다.
+
+### 공통 조건
+
+```text
+Target rate = 1,000 spans/s
+Duration    = 60 sec
+Expected    = 60,000 spans
+Sender batch = 50 spans/request
+```
+
+세 실행 모두 최종 DB count 60,000/60,000과 queue/in-flight drain을 확인했다.
+
+### Run 1
+
+```text
+DB = 60,000 / 60,000
+
+queue_size=1000:
+t=35, 40, 45, 50, 55, 60
+
+in_flight=1:
+t=35, 40, 45, 50, 55, 60
+```
+
+Full-rate 구간인 t=10~60의 TimescaleDB CPU:
+
+```text
+average = 35.55%
+maximum = 76.32%
+median  = 29.38%
+```
+
+한 batch 수준의 queue가 약 25초 동안 유지됐지만 1000→2000→3000처럼 증가하지 않았으며 테스트 종료 후 정상 drain됐다.
+
+### Run 2
+
+5초 resource sampling에서 queue와 in-flight backlog가 관찰되지 않았다.
+
+t=10~60 TimescaleDB CPU:
+
+```text
+average = 25.88%
+maximum = 27.39%
+```
+
+최종 결과:
+
+```text
+DB = 60,000 / 60,000
+queue = 0
+in_flight = 0
+```
+
+### Run 3
+
+세 번째 동일 조건 테스트에서도 resource sampling 전 구간에서 queue 및 in-flight가 관찰되지 않았다.
+
+t=10~60 TimescaleDB CPU:
+
+```text
+average = 26.06%
+maximum = 27.71%
+```
+
+최종 결과:
+
+```text
+DB = 60,000 / 60,000
+queue = 0
+in_flight = 0
+```
+
+### 재현성 분석
+
+Run2와 Run3의 full-rate TimescaleDB CPU 평균은:
+
+```text
+Run2 = 25.88%
+Run3 = 26.06%
+```
+
+으로 매우 유사했다.
+
+따라서 정상적인 1,000 spans/s steady-state의 TimescaleDB CPU 사용량은 현재 테스트 조건에서 약 26% 수준으로 관찰됐다.
+
+Run1의 높은 CPU spike 및 `queue_size=1000` standing 상태는 동일 조건 Run2와 Run3에서는 재현되지 않았다.
+
+현재 결과를 다음과 같이 해석한다.
+
+```text
+1,000 spans/s sustained ingest
+- 데이터 정합성: 3/3 PASS
+- 지속적인 queue 증가: 미관찰
+- sampled standing queue: 1/3 run에서 관찰
+- queue 없는 run: 2/3
+- DB CPU steady-state: 약 26% 수준으로 2회 재현
+```
+
+따라서 1,000 spans/s를 현재 시스템의 sustained throughput 한계로 판단하지 않는다.
+
+다만 한 번의 실행에서 exporter queue가 장시간 유지된 변동성이 관찰됐으므로 이후 더 높은 부하에서도 queue 발생 빈도와 drain 여부를 계속 관찰한다.
+
+### 1,000 spans/s Batch Boundary
+
+첫 번째 1,000 spans/s 실행의 Backend runtime 로그에서:
+
+```text
+Backend requests = 61
+Received spans   = 60,000
+
+100 spans  × 1
+750 spans  × 1
+950 spans  × 1
+1000 spans × 54
+1050 spans × 4
+```
+
+를 확인했다.
+
+```text
+average Backend request = 983.61 spans
+requests == JDBC batch-size = 54
+requests > JDBC batch-size  = 4
+```
+
+현재 source 구현 기준으로 1050-span request는 JDBC batch-size 1000에 의해 1000 + 50 두 chunk로 분리될 수 있다.
+
+1,000 spans/s부터 Collector batch와 Backend JDBC batch 경계가 실제 runtime workload에 영향을 주기 시작했지만 데이터 정합성 또는 지속적인 queue 증가 문제는 확인되지 않았다.
+

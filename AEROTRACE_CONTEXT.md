@@ -1208,3 +1208,31 @@ Backend request maximum = 900 spans
 
 다음 성능 검증 단계는 Collector batch size와 Backend JDBC batch size 경계에 근접하는 1,000 spans/s × 60초 sustained test다.
 
+---
+
+### 1,000 spans/s Sustained Load 재현성 검증
+
+1,000 spans/s × 60초 sustained workload를 동일 조건으로 총 3회 수행했다.
+
+```text
+Run1 → DB 60,000/60,000 PASS
+Run2 → DB 60,000/60,000 PASS
+Run3 → DB 60,000/60,000 PASS
+```
+
+5초 resource sampling 결과:
+
+```text
+Run1 → queue_size=1000이 약 25초 동안 유지
+Run2 → queue backlog 미관찰
+Run3 → queue backlog 미관찰
+```
+
+Run2와 Run3의 t=10~60 TimescaleDB CPU 평균은 각각 약 25.88%, 26.06%로 매우 유사했다.
+
+따라서 현재 synthetic workload에서 1,000 spans/s는 안정적으로 처리 가능한 범위이며 현재 throughput 한계로 판단하지 않는다.
+
+다만 1/3 run에서 한 batch 수준의 exporter queue가 일정 시간 유지되는 변동성이 관찰됐으므로 더 높은 부하에서도 queue 발생 여부와 drain을 계속 측정한다.
+
+다음 sustained load 단계는 1,125 spans/s다.
+
