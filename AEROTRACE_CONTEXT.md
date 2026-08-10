@@ -1476,3 +1476,34 @@ Average request = 1,039.60 spans
 
 다음 성능 탐색에서는 설정 변경 없이 부하를 소폭 증가시키되 queue의 지속 증가, 데이터 정합성 실패 또는 DB CPU saturation이 발생하면 추가 부하 상승을 중단한다.
 
+---
+
+### Sustained Ingest — 1,875 spans/s Standing Queue 경계
+
+1,875 spans/s × 60초 sustained workload를 동일 조건으로 2회 검증했다.
+
+```text
+Run1 → 112,500 / 112,500 PASS
+Run2 → 112,500 / 112,500 PASS
+
+Failed       = 0
+Refused      = 0
+Final queue  = 0
+Final flight = 0
+```
+
+두 실행 모두 load 중반부터 약 35초 동안 `queue_size=1050`이 지속적으로 관찰됐다.
+
+```text
+Run1: t=25 ~ t=60
+Run2: t=20 ~ t=55
+```
+
+따라서 1,875 spans/s는 현재 workload에서 **standing Collector queue가 재현되기 시작한 성능 구간**으로 기록한다.
+
+그러나 queue size가 1050보다 계속 증가하는 현상은 없었고 테스트 종료 후 정상 drain됐으므로 sustained throughput saturation 또는 overload 한계로 판단하지 않는다.
+
+TimescaleDB CPU는 변동성이 크며 Run2에서 Docker CPU 131.70% sample도 관찰됐다. 단일 CPU sample을 saturation 근거로 사용하지 않고 median, 반복 결과, queue 증가 여부 및 데이터 정합성을 함께 판단한다.
+
+현재 설정은 유지한다.
+

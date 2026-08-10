@@ -3987,3 +3987,118 @@ sampled Collector queue도 최대 한 batch 수준으로 유지됐으며 지속 
 
 따라서 현재 측정 조건에서는 1,750 spans/s를 sustained throughput 한계로 판단할 근거가 없다.
 
+---
+
+## 2026-08-10 — 1,875 spans/s Standing Queue 재현성 검증
+
+1,875 spans/s × 60초 sustained workload에서 장시간 유지되는 Collector queue가 관찰되어 동일 조건으로 두 번째 테스트를 수행했다.
+
+### 데이터 정합성
+
+두 실행 모두:
+
+```text
+Expected spans    = 112,500
+DB final          = 112,500 / 112,500
+Failed requests   = 0
+Refused delta     = 0
+Final queue       = 0
+Final in-flight   = 0
+```
+
+으로 정상 완료됐다.
+
+### Standing Queue 재현
+
+Run1:
+
+```text
+t=25 ~ t=60 → queue=1050
+t=65        → queue=0
+```
+
+Run2:
+
+```text
+t=20 ~ t=55 → queue=1050
+t=60        → queue=0
+```
+
+두 실행에서 약 35초 동안 한 Collector batch 수준의 sampled queue가 연속적으로 유지됐다.
+
+따라서 1,875 spans/s에서 장시간 standing queue가 나타나는 현상은 동일 조건 반복 테스트에서 재현됐다.
+
+다만 두 테스트 모두:
+
+```text
+1050 → 2100 → 3150
+```
+
+처럼 queue size가 시간에 따라 증가하지 않았다.
+
+최종적으로 queue와 in-flight가 모두 0으로 drain됐고 refused와 failed request도 발생하지 않았다.
+
+따라서 현재 현상을 sustained overload backlog 또는 throughput saturation으로 판단하지 않는다.
+
+5초 resource sampling이므로 sample 사이의 더 짧은 queue 변화를 모두 관찰한 것은 아니며, 각 resource row도 구성 요소별 순차 조회 결과이므로 정확한 event ordering을 보장하지 않는다.
+
+### TimescaleDB CPU
+
+Full-rate t=10~60:
+
+```text
+Run1
+average = 52.76%
+median  = 51.93%
+maximum = 83.59%
+
+Run2
+average = 54.34%
+median  = 44.79%
+maximum = 131.70%
+```
+
+Run2에는 131.70% CPU sample이 하나 존재한다.
+
+Docker container CPU metric은 멀티코어 환경에서 100%를 초과할 수 있으므로 해당 값을 단독으로 saturation 근거로 사용하지 않는다.
+
+typical CPU 수준을 확인하기 위한 보조 계산으로 해당 한 sample을 제외하면 Run2:
+
+```text
+average ≈ 46.60%
+median  ≈ 44.74%
+```
+
+이다.
+
+이는 이상치를 삭제해 공식 benchmark 결과를 변경한다는 의미가 아니라 평균값이 한 sample에 얼마나 영향을 받는지를 확인하기 위한 분석이다.
+
+현재 두 run에서는 TimescaleDB 부하 증가 흔적이 존재하지만 지속 CPU saturation이 재현됐다고 판단할 근거는 아직 부족하다.
+
+### 결론
+
+1,875 spans/s는 데이터 정합성 및 최종 pipeline drain 기준으로 두 번 모두 성공했다.
+
+그러나 이전 낮은 rate에서 주기적으로 0까지 내려가던 queue와 달리, 1,875에서는 한 batch인 1050 Span이 약 35초 동안 유지되는 standing queue 현상이 2회 재현됐다.
+
+현재 상태를 다음과 같이 분류한다.
+
+```text
+1,875 spans/s
+
+데이터 정합성              PASS
+failed                     0
+refused                    0
+최종 pipeline drain        PASS
+
+standing queue             재현
+queue size 증가            미관찰
+지속 backlog               미확인
+CPU saturation             미확인
+sustained throughput limit 미도달
+```
+
+설정 변경이나 tuning은 아직 수행하지 않는다.
+
+다음 성능 단계에서는 standing queue가 실제 증가형 backlog로 전환되는지를 확인한다.
+
