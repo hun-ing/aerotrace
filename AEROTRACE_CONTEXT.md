@@ -1601,3 +1601,53 @@ DB headroom은 감소하고 있지만 증가형 queue, refused, failed 또는 �
 
 설정 tuning은 아직 수행하지 않는다.
 
+---
+
+### Sustained Ingest 검증 범위 — 2,250 spans/s
+
+현재 synthetic sustained workload 검증 범위를 2,250 spans/s까지 확장했다.
+
+```text
+2,250 spans/s × 60 sec
+Expected = 135,000
+
+Accepted = 135,000
+DB       = 135,000 / 135,000
+Failed   = 0
+Refused  = 0
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+average = 60.20%
+median  = 59.70%
+minimum = 53.53%
+maximum = 67.09%
+```
+
+DB CPU가 약 60% 수준에서 비교적 지속적으로 유지되는 고부하 구간에 진입했지만 아직 지속 CPU saturation은 확인되지 않았다.
+
+Collector sampled queue는 최대 1050 Span으로 한 batch 수준을 넘지 않았으며 반복적으로 0까지 drain됐다.
+
+시간에 따라 증가하는 exporter backlog는 확인되지 않았다.
+
+Backend runtime request:
+
+```text
+Backend requests = 129
+1050-span requests = 128
+Average request size = 1,046.51 spans
+```
+
+현재 source의 JDBC batch-size 1000 기준 estimated JDBC chunks는 257이다.
+
+현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 2,250 spans/s다.
+
+DB headroom은 감소하고 있지만 growing queue, refused, failed 또는 데이터 정합성 실패는 아직 확인되지 않았다.
+
+현재 설정 tuning은 수행하지 않는다.
+

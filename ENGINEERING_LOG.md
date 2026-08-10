@@ -4451,3 +4451,166 @@ Estimated chunks per request = 1.992
 
 현재 DB headroom은 점차 감소하고 있으나 2,125 spans/s를 sustained throughput ceiling으로 판단할 근거는 없다.
 
+---
+
+## 2026-08-10 — 2,250 spans/s Sustained Load 검증
+
+### 테스트 조건
+
+```text
+Target rate      = 2,250 spans/s
+Duration         = 60 sec
+Expected spans   = 135,000
+Sender batch     = 50
+Sender requests  = 2,700
+```
+
+### 데이터 정합성
+
+```text
+Observed rate      = 2,250.00 spans/s
+
+Requested spans    = 135,000
+Accepted spans     = 135,000
+DB final           = 135,000 / 135,000
+
+Requested requests = 2,700
+Accepted requests  = 2,700
+Failed requests    = 0
+
+Refused delta      = 0
+Final queue        = 0
+Final in-flight    = 0
+```
+
+서비스 restart 증가도 관찰되지 않았다.
+
+### Sender
+
+```text
+Request latency
+p50 = 0.782 ms
+p95 = 1.942 ms
+p99 = 2.087 ms
+max = 7.381 ms
+
+Schedule lag
+p50 = 0.102 ms
+p95 = 0.271 ms
+p99 = 0.302 ms
+max = 3.463 ms
+```
+
+2,250 spans/s에서도 sustained sender pacing 또는 request latency의 지속적인 악화는 관찰되지 않았다.
+
+### TimescaleDB CPU
+
+Full-rate 구간 t=10~60:
+
+```text
+average = 60.20%
+median  = 59.70%
+minimum = 53.53%
+maximum = 67.09%
+```
+
+최근 측정:
+
+```text
+2,000
+average = 56.00%
+median  = 53.24%
+
+2,125
+average = 58.52%
+median  = 56.49%
+
+2,250
+average = 60.20%
+median  = 59.70%
+```
+
+2,250 spans/s에서는 모든 full-rate DB CPU sample이 약 53~67% 범위에 위치했다.
+
+이전 run에서 관찰된 80% 이상의 단일 peak와 달리 이번에는 높은 CPU 사용량이 비교적 일정하게 유지됐다.
+
+따라서 TimescaleDB CPU headroom이 단계적으로 감소하는 현상은 명확하지만, 아직 CPU saturation으로 판단할 수준은 아니다.
+
+### Collector Queue
+
+5초 sampling:
+
+```text
+t=10 → queue=1050
+t=15 → queue=0
+t=20 → queue=0
+
+t=25 → queue=1050
+t=30 → queue=1050
+t=35 → queue=0
+
+t=40 → queue=1050
+t=45 → queue=1050
+t=50 → queue=0
+
+t=55 → queue=1050
+t=60 → queue=1050
+t=65 → queue=0
+```
+
+sampled queue는 최대 1050 Span이었다.
+
+시간이 지날수록 2100, 3150 등으로 증가하는 backlog는 관찰되지 않았으며 테스트 종료 후 queue와 in-flight가 모두 정상 drain됐다.
+
+따라서 2,250 spans/s에서도 지속적인 exporter overload는 확인되지 않았다.
+
+### Backend Batch
+
+```text
+600 spans  × 1
+1050 spans × 128
+```
+
+통계:
+
+```text
+Backend requests     = 129
+Received spans       = 135,000
+Average request size = 1,046.51
+
+Requests below 1000 = 1
+Requests equal 1000 = 0
+Requests over 1000  = 128
+```
+
+Sender 2,700 requests가 Collector batching 이후 Backend 129 requests로 감소했다.
+
+### JDBC Batch
+
+현재 source의 JDBC batch-size 1000 기준:
+
+```text
+Estimated JDBC chunks        = 257
+Estimated chunks per request = 1.992
+```
+
+대부분의 1050-span Backend request가 현재 source 기준 1000 + 50 두 JDBC chunk로 처리되는 조건에서도 135,000 Span 전량 저장에 성공했다.
+
+### 결론
+
+2,250 spans/s × 60초 synthetic sustained workload에서:
+
+- 135,000 Span 전량 저장
+- failed request 0
+- refused delta 0
+- 최종 queue/in-flight drain
+- sampled queue 최대 1050
+- growing backlog 미관찰
+- TimescaleDB CPU average 약 60.2%
+- TimescaleDB CPU median 약 59.7%
+- 서비스 restart 증가 없음
+
+을 확인했다.
+
+현재 DB CPU headroom은 지속적으로 감소하고 있으나 2,250 spans/s를 sustained throughput ceiling으로 판단할 증거는 없다.
+
