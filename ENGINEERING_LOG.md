@@ -1966,3 +1966,226 @@ delta                  = 0
 이는 queue가 drain된 이후에도 확보한 storage 공간을 즉시 반환하지 않고 이후 queue 적재에 재사용할 수 있다는 이전 관찰과 일치한다.
 
 이번 검증으로 Persistent Queue 측정 도구는 DB 정합성과 Collector 내부 queue 처리 완료를 독립적으로 검증할 수 있게 됐다.
+
+---
+
+## 2026-08-10 — 자동화된 OTLP End-to-End 처리량 Baseline 측정
+
+### 목적
+
+OpenTelemetry Collector가 OTLP 요청을 수락하는 속도와 AeroTrace Backend가 실제로 TimescaleDB 저장까지 완료하는 속도를 분리하여 측정했다.
+
+기존 수동 측정에서는 benchmark 시작과 종료 사이에 운영자가 직접 명령을 입력하는 시간이 포함되어 `53.76 spans/s`라는 잘못된 end-to-end 결과가 만들어졌다.
+
+해당 값은 성능 지표에서 폐기하고, Span 전송부터 DB 저장 및 Collector queue drain 완료까지 하나의 스크립트에서 자동으로 측정하도록 benchmark를 개선했다.
+
+### 테스트 조건
+
+```text
+Total spans = 1000
+OTLP batch size = 50 spans/request
+HTTP requests = 20
+Concurrency = 4
+Collector protocol = OTLP/HTTP
+Collector endpoint = localhost:4318
+Backend = 정상
+TimescaleDB = 정상
+Collector queue before test = 0
+Collector in-flight before test = 0
+```
+
+Synthetic Span은 최소 Resource/Scope/Span 데이터를 사용하는 테스트 payload다.
+
+따라서 실제 운영 telemetry workload와 동일한 크기라고 간주하지 않는다.
+
+### 결과
+
+```text
+Requested spans    = 1000
+Accepted spans     = 1000
+
+Requested requests = 20
+Accepted requests  = 20
+Failed requests    = 0
+```
+
+Sender → Collector:
+
+```text
+Send elapsed                 = 0.008564 sec
+Accepted spans/sec           = 116761.15
+Accepted requests/sec        = 2335.22
+
+Request latency p50          = 0.779 ms
+Request latency p95          = 3.110 ms
+Request latency p99          = 3.879 ms
+Request latency max          = 3.879 ms
+```
+
+전체 자동화 측정:
+
+```text
+Wrapper send elapsed         = 0.076144 sec
+DB completion elapsed        = 1.215317 sec
+Pipeline completion elapsed  = 1.216411 sec
+
+Observed DB completion       = 822.83 spans/sec
+Observed pipeline completion = 822.09 spans/sec
+```
+
+최종 정합성:
+
+```text
+DB count       = 1000/1000
+queue_size     = 0
+in_flight      = 0
+
+OTLP end-to-end benchmark = PASS
+```
+
+### 해석
+
+Collector의 OTLP HTTP 수락 속도는 이번 실행에서 약 116K spans/sec였지만 실제 DB 및 pipeline 완료 속도는 약 822 spans/sec였다.
+
+따라서 현재 테스트 조건에서 Collector HTTP 수신 자체가 전체 end-to-end throughput의 직접적인 병목이라는 증거는 없다.
+
+하지만 단일 실행 결과만으로 Backend 또는 DB의 최대 처리량이 822 spans/sec라고 확정하지 않는다.
+
+또한 request latency percentile은 요청 표본이 20개뿐이므로 현재는 참고값으로만 사용한다.
+
+### 다음 측정
+
+동일 조건의 1,000 Span benchmark를 여러 번 반복하여 다음을 계산한다.
+
+- DB completion throughput 중앙값
+- pipeline throughput 중앙값
+- 최소/최대값
+- 실행 간 변동폭
+- Collector acceptance throughput 변동
+
+반복 결과가 안정적이면 테스트 Span 수를 증가시켜 장시간 sustained ingest 조건에서 CPU, memory, DB connection 및 queue 동작을 측정한다.
+
+---
+
+## 2026-08-10 — OTLP End-to-End 처리량 5회 반복 Baseline
+
+### 목적
+
+단일 실행 결과를 AeroTrace의 대표 처리량으로 사용하는 오류를 피하기 위해 동일한 조건의 End-to-End benchmark를 5회 반복했다.
+
+각 실행은 다음 완료 조건을 모두 만족해야 PASS로 판정했다.
+
+```text
+테스트 Span 전체 Collector 수락
+테스트 Span 전체 TimescaleDB 저장
+Collector queue_size = 0
+Collector in_flight_requests = 0
+```
+
+### 테스트 조건
+
+```text
+Runs = 5
+Total spans/run = 1000
+Batch size = 50 spans/request
+Requests/run = 20
+Concurrency = 4
+Protocol = OTLP/HTTP
+Collector = localhost:4318
+Backend = 정상 상태
+TimescaleDB = 정상 상태
+```
+
+테스트 payload는 최소 synthetic Span이므로 실제 운영 Span workload와 동일한 크기라고 간주하지 않는다.
+
+### 개별 결과
+
+| Run | Collector accepted spans/s | DB spans/s | Pipeline spans/s | DB elapsed | Pipeline elapsed |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 120064.85 | 981.57 | 980.67 | 1.018773s | 1.019712s |
+| 2 | 123124.61 | 1240.51 | 1239.04 | 0.806122s | 0.807077s |
+| 3 | 116401.07 | 1241.99 | 1240.39 | 0.805159s | 0.806197s |
+| 4 | 119508.58 | 1043.43 | 1042.07 | 0.958379s | 0.959626s |
+| 5 | 91770.45 | 1306.61 | 1305.02 | 0.765341s | 0.766272s |
+
+모든 실행:
+
+```text
+DB count = 1000/1000
+queue_size = 0
+in_flight_requests = 0
+OTLP end-to-end benchmark = PASS
+```
+
+### 통계
+
+Collector acceptance:
+
+```text
+min    = 91770.45 spans/s
+median = 119508.58 spans/s
+mean   = 114173.91 spans/s
+max    = 123124.61 spans/s
+stdev  = 12749.04 spans/s
+```
+
+DB completion:
+
+```text
+min    = 981.57 spans/s
+median = 1240.51 spans/s
+mean   = 1162.82 spans/s
+max    = 1306.61 spans/s
+stdev  = 141.50 spans/s
+```
+
+Pipeline completion:
+
+```text
+min    = 980.67 spans/s
+median = 1239.04 spans/s
+mean   = 1161.44 spans/s
+max    = 1305.02 spans/s
+stdev  = 141.24 spans/s
+```
+
+DB 및 Pipeline throughput의 상대 표준편차는 약 12%로 관찰됐다.
+
+5회 반복만으로 통계적으로 안정된 최대 처리량이라고 판단하지 않으며, 현재 단계에서는 정상 상태 synthetic workload의 baseline 범위로 사용한다.
+
+### 해석
+
+이전에 수행한 단일 자동 benchmark에서는 DB completion이 약 822.83 spans/s로 측정됐지만 이번 5회 반복에서는 최저값도 981.57 spans/s였다.
+
+따라서 단일 실행값을 대표 처리량으로 확정하지 않고 반복 측정을 수행한 것이 필요했음을 확인했다.
+
+현재 조건의 대표 baseline은 최대값이 아니라 중앙값을 사용하여 다음과 같이 기록한다.
+
+```text
+DB completion median ≈ 1240.51 spans/s
+Pipeline median      ≈ 1239.04 spans/s
+```
+
+또한 DB completion 이후 pipeline completion까지의 추가 시간은 각 실행에서 약 0.9~1.25ms였으며, 이번 정상 부하에서는 DB 저장 완료 이후 Collector drain이 큰 추가 지연을 만들지 않았다.
+
+Collector acceptance throughput과 DB throughput도 동일하게 움직이지 않았다.
+
+예를 들어 Run 5에서는 Collector acceptance가 5회 중 가장 낮았지만 DB completion throughput은 가장 높았다.
+
+따라서 현재 workload에서 localhost OTLP HTTP 수락 성능을 Backend/DB 저장 처리량의 대리 지표로 사용하지 않는다.
+
+### 다음 측정
+
+1,000 Span burst는 전체 실행 시간이 약 1초 이하로 짧기 때문에 CPU, memory, DB connection pool, queue 증가 등 sustained-load 특성을 평가하기 어렵다.
+
+다음 단계에서는 더 긴 시간 동안 지속되는 ingest workload를 만들고 다음을 동시에 측정한다.
+
+- 실제 sustained spans/sec
+- Backend CPU
+- Backend memory
+- Collector CPU/memory
+- TimescaleDB CPU/memory
+- DB connection 사용량
+- Collector queue 크기
+- 실패 요청
+- 데이터 누락/중복

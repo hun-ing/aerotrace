@@ -809,3 +809,47 @@ Backend 장애 상태에서 OpenTelemetry Collector Persistent Queue에 100개�
 ### 이력서 문장 후보
 
 OpenTelemetry Collector Persistent Queue에 100/1,000 Span을 단계적으로 적재해 장애 중 queue와 디스크 high-water mark를 실측하고 복구 후 전량 저장을 검증했으며, DB 저장 완료와 Collector queue drain 시점이 다를 수 있음을 발견해 장애 테스트 완료 조건을 metric 기반으로 개선
+
+---
+
+## 성능 측정 방법 개선 경험
+
+AeroTrace 정상 ingest 처리량을 측정하면서 수동 stopwatch 방식의 end-to-end 측정에 운영자의 명령 입력 시간이 포함되어 잘못된 `53.76 spans/s` 결과가 생성되는 문제를 발견했다.
+
+해당 측정값을 사용하지 않고 benchmark를 자동화해 다음 시점을 프로그램적으로 분리했다.
+
+- OTLP 전송 시작
+- Collector 수락 완료
+- TimescaleDB 저장 완료
+- Collector queue 및 in-flight 처리 완료
+
+자동화된 1,000 Span 실험에서는 1,000건 전량 저장 및 queue drain을 검증했고, Collector 수락 속도와 실제 DB/pipeline 처리 속도가 크게 다름을 확인했다.
+
+이를 통해 단순 request throughput과 실제 서비스 end-to-end throughput을 구분하여 성능을 측정하는 경험을 얻었다.
+
+### 이력서 문장 후보
+
+OpenTelemetry 기반 수집 파이프라인의 성능 측정 과정에서 수동 측정 오차를 발견해 benchmark를 자동화하고, Collector 수락 처리량과 TimescaleDB 저장 완료 처리량을 분리 측정하여 실제 end-to-end 성능 기준선을 구축
+
+---
+
+## 반복 측정을 통한 APM 수집 처리량 Baseline 검증
+
+AeroTrace의 OTLP 수집 성능을 평가하면서 단일 benchmark 결과를 대표 성능값으로 사용하지 않고 동일 조건을 5회 반복해 최소값, 중앙값, 평균, 최대값, 표준편차를 비교했다.
+
+1,000 synthetic Span, batch 50, concurrency 4 조건에서 모든 실행의 데이터 정합성과 Collector queue drain을 검증했으며, DB completion throughput 중앙값 약 1.24K spans/s를 현재 baseline으로 확보했다.
+
+또한 Collector HTTP 수락 처리량과 실제 DB 저장 처리량이 같은 방향으로 움직이지 않는 결과를 관찰해, ingress acceptance throughput을 서비스의 end-to-end 저장 성능으로 해석하면 안 된다는 점을 실측으로 확인했다.
+
+### 포트폴리오 포인트
+
+- 잘못된 수동 성능 측정값을 폐기하고 자동 benchmark 구축
+- Collector 수락과 DB/Pipeline 완료 시간을 독립적으로 측정
+- 단일 benchmark가 아닌 5회 반복으로 성능 변동성 확인
+- 최대값이 아닌 중앙값을 baseline으로 사용
+- 모든 성능 테스트에서 데이터 누락과 queue drain을 동시에 검증
+
+### 이력서 문장 후보
+
+OpenTelemetry 수집 파이프라인의 Collector 수락 처리량과 TimescaleDB 저장 완료 처리량을 분리 측정하고 반복 benchmark를 자동화하여, 5회 데이터 정합성 검증과 함께 synthetic workload 기준 약 1.24K spans/s의 End-to-End 처리량 중앙값을 확보
+

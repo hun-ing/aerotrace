@@ -898,3 +898,79 @@ in_flight_requests = 0
 따라서 현재 Persistent Queue 측정 스크립트의 완료 판정 로직은 검증된 상태다.
 
 또한 이전 1,000 Span 실험에서 확보된 Persistent Queue storage가 이후 10 Span 적재 시 추가 파일 증가 없이 재사용되는 것을 확인했다.
+
+---
+
+### OTLP End-to-End 처리량 측정 시작
+
+자동화된 정상 ingest benchmark를 구축했다.
+
+첫 번째 1,000 Span baseline 조건:
+
+```text
+Batch size = 50
+Concurrency = 4
+Requests = 20
+```
+
+첫 측정 결과:
+
+```text
+Collector accepted = 1000/1000
+Failed requests = 0
+
+Collector acceptance ≈ 116761 spans/sec
+
+DB completion ≈ 822.83 spans/sec
+Pipeline completion ≈ 822.09 spans/sec
+
+Final DB = 1000/1000
+Final queue = 0
+Final in-flight = 0
+```
+
+이 값은 최소 synthetic Span을 사용한 단일 실행 결과이므로 AeroTrace의 확정 처리량이나 최대 처리량으로 간주하지 않는다.
+
+다음 단계는 동일 조건 반복 측정을 통해 처리량 분산과 중앙값을 확인하는 것이다.
+
+---
+
+### OTLP End-to-End 반복 처리량 Baseline
+
+정상 상태에서 1,000 synthetic Span, batch 50, concurrency 4 조건의 End-to-End benchmark를 5회 반복했다.
+
+5회 모두 다음 정합성 조건을 만족했다.
+
+```text
+Accepted spans = 1000/1000
+DB = 1000/1000
+queue_size = 0
+in_flight_requests = 0
+```
+
+DB completion throughput:
+
+```text
+min    = 981.57 spans/s
+median = 1240.51 spans/s
+mean   = 1162.82 spans/s
+max    = 1306.61 spans/s
+stdev  = 141.50 spans/s
+```
+
+Pipeline completion throughput:
+
+```text
+min    = 980.67 spans/s
+median = 1239.04 spans/s
+mean   = 1161.44 spans/s
+max    = 1305.02 spans/s
+stdev  = 141.24 spans/s
+```
+
+현재 synthetic workload에서 대표 baseline은 최대값이 아닌 중앙값 약 1.24K spans/s로 취급한다.
+
+이는 AeroTrace의 확정 최대 처리량이 아니며 실제 운영 Span보다 작은 synthetic payload와 약 1초 이하의 짧은 burst workload에서 측정된 값이다.
+
+다음 성능 검증 단계는 sustained ingest workload에서 자원 사용량과 병목을 동시에 측정하는 것이다.
+
