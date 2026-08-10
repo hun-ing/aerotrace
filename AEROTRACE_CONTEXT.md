@@ -1430,3 +1430,49 @@ Collector queue는 한 1050-span batch 수준에서 간헐적으로 유지되다
 
 현재 설정 변경이나 성능 tuning은 수행하지 않는다.
 
+---
+
+### Sustained Ingest 검증 범위 — 1,750 spans/s
+
+현재 synthetic sustained workload 검증 범위를 1,750 spans/s까지 확장했다.
+
+```text
+1,750 spans/s × 60 sec
+Expected = 105,000
+
+Accepted = 105,000
+DB       = 105,000 / 105,000
+Failed   = 0
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+Collector refused metric은 이번 출력에서 별도로 확인하지 않았으므로 결과에 0으로 기록하지 않는다.
+
+TimescaleDB full-rate CPU:
+
+```text
+average = 45.95%
+median  = 48.52%
+maximum = 57.37%
+```
+
+1,625 두 반복 테스트의 평균 CPU 수준 약 45.88%와 거의 동일하여 1,750까지 부하를 증가시켜도 DB CPU가 추가로 악화되는 패턴은 확인되지 않았다.
+
+5초 resource sampling에서 Collector queue는 최대 1050 Span으로 한 batch 수준을 넘지 않았으며 최종적으로 모두 drain됐다.
+
+Backend runtime request:
+
+```text
+Backend requests = 101
+1050-span requests = 99
+Average request = 1,039.60 spans
+```
+
+현재 source의 JDBC batch-size 1000 기준 estimated JDBC chunks는 200이다.
+
+현재 synthetic 60초 workload에서 1,750 spans/s까지 sustained saturation은 확인되지 않았다.
+
+다음 성능 탐색에서는 설정 변경 없이 부하를 소폭 증가시키되 queue의 지속 증가, 데이터 정합성 실패 또는 DB CPU saturation이 발생하면 추가 부하 상승을 중단한다.
+
