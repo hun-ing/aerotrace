@@ -1013,3 +1013,28 @@ OpenTelemetry 기반 수집 파이프라인의 sustained workload를 1,250 spans
 
 OpenTelemetry 수집 파이프라인의 sustained workload를 1,375 spans/s까지 확장하고 동일 조건 반복 실험을 통해 82,500 Span 전량 저장을 검증하는 동시에 TimescaleDB steady-state CPU 증가 추세와 비누적 Collector queue 패턴을 분리 분석하여 성능 headroom을 측정
 
+---
+
+## 1,500 spans/s Sustained Telemetry 처리 검증
+
+AeroTrace telemetry ingest workload를 단계적으로 1,500 spans/s까지 증가시켜 60초 동안 총 90,000 Span 전량 저장과 Sender failed request 0을 검증했다.
+
+Collector batch processor에 의해 Sender의 1,800개 OTLP request가 Backend에서는 86개 request로 감소했으며, 85개 요청이 1050 Span으로 형성됐다.
+
+현재 Backend JDBC batch-size가 1000이므로 대부분의 request가 source 기준 1000 + 50 두 JDBC chunk로 처리되는 조건에서도 데이터 정합성과 pipeline drain을 유지했다.
+
+1,375 spans/s에서 TimescaleDB CPU 증가가 관찰됐지만 더 높은 1,500 spans/s에서는 steady-state 평균 CPU가 약 34.47%로 낮아져 단일 workload 결과를 saturation으로 과대해석하지 않고 단계적·반복 측정을 통해 성능 경계를 탐색했다.
+
+### 포트폴리오 포인트
+
+- sustained ingest를 1,500 spans/s까지 단계적으로 검증
+- 90,000 Span 전량 저장 확인
+- Collector batching으로 1,800 → 86 Backend request 감소 검증
+- 대부분의 Backend request가 JDBC batch 경계를 넘는 조건 측정
+- queue의 존재와 증가형 backlog를 구분
+- 단일 CPU spike가 아닌 steady-state와 반복 결과로 병목 판단
+
+### 이력서 문장 후보
+
+OpenTelemetry 기반 APM 수집 파이프라인의 sustained workload를 1,500 spans/s까지 단계적으로 확장하여 60초간 90,000 Span 전량 저장을 검증하고, Collector batching 및 JDBC batch 경계에서의 queue·DB CPU·실제 Backend request 분포를 계측해 처리 headroom을 분석
+

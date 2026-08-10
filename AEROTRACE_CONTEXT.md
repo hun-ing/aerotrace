@@ -1347,3 +1347,47 @@ Collector queue는 약 1050 Span 한 batch 수준으로 간헐적으로 나타�
 
 현재 1,375 spans/s는 synthetic workload에서 안정적으로 처리된 범위이나, 이후 부하에서는 TimescaleDB CPU headroom을 주요 경계 지표로 관찰한다.
 
+---
+
+### Sustained Ingest 검증 범위 — 1,500 spans/s
+
+설정 변경 없이 synthetic sustained workload를 1,500 spans/s까지 확장했다.
+
+```text
+1,500 spans/s × 60 sec
+Expected = 90,000 spans
+
+Accepted = 90,000
+DB       = 90,000 / 90,000
+Failed   = 0
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+Full-rate TimescaleDB CPU:
+
+```text
+average = 34.47%
+median  = 31.80%
+maximum = 50.75%
+```
+
+1,375 spans/s보다 workload가 높지만 DB CPU가 지속적으로 악화되는 현상은 재현되지 않았다.
+
+Collector queue는 한 1050-span batch 수준에서 일정 시간 유지되는 구간이 있었지만 이후 정상 drain됐으며 시간에 따른 누적 backlog는 확인되지 않았다.
+
+Backend runtime request:
+
+```text
+Backend requests = 86
+1050-span requests = 85
+Average request size = 1,046.51 spans
+```
+
+현재 source의 JDBC batch-size 1000 기준 estimated JDBC chunk 수는 171이다.
+
+현재 synthetic 60초 workload에서 1,500 spans/s까지 데이터 정합성 및 pipeline drain을 확인했으며 아직 sustained saturation의 근거는 없다.
+
+다음 단계에서는 설정을 변경하지 않고 더 높은 load에서 queue 증가와 TimescaleDB CPU headroom을 계속 탐색한다.
+
