@@ -1277,3 +1277,45 @@ Resource sampling에서는 1050-span queue가 간헐적으로 관찰됐지만 �
 
 다음 단계에서는 설정을 변경하지 않고 1,250 spans/s로 부하를 증가시켜 같은 1050-span batch 처리 빈도가 높아질 때 queue 및 TimescaleDB CPU 변화를 확인한다.
 
+---
+
+### 현재 Sustained Ingest 검증 범위 — 1,250 spans/s
+
+설정 변경 없이 sustained workload를 1,250 spans/s까지 확장했다.
+
+```text
+1,250 spans/s × 60 sec
+→ 75,000 / 75,000 DB 저장
+→ failed request 0
+→ final queue 0
+→ final in-flight 0
+```
+
+Backend runtime request:
+
+```text
+Backend requests = 73
+1050-span requests = 71
+Average = 1,027.40 spans/request
+```
+
+현재 Collector `send_batch_size=1024`, Sender input batch=50 조합에서 1050-span Backend batch가 지속적으로 생성되고 있다.
+
+Backend JDBC batch-size는 1000이므로 현재 source 구현 기준 대부분의 request가 1000 + 50 두 chunk로 처리된다.
+
+Resource sampling에서는 테스트 초반 `queue_size=1050`이 세 sample 동안 유지됐지만 이후 부하 종료까지 queue가 0으로 유지됐다.
+
+시간에 따라 queue가 증가하는 sustained backlog는 확인되지 않았다.
+
+t=10~60 TimescaleDB CPU:
+
+```text
+average = 31.36%
+median  = 30.98%
+maximum = 43.84%
+```
+
+1,125 spans/s보다 workload가 증가했지만 평균 CPU가 증가하지 않았으므로 현재 1,250 spans/s까지 CPU saturation 근거는 없다.
+
+다음 성능 단계에서는 설정 변경 없이 1,375 spans/s로 부하를 증가해 지속 backlog와 DB CPU headroom을 계속 확인한다.
+

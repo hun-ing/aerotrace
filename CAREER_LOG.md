@@ -975,3 +975,25 @@ Backend JDBC batch-size는 1000이므로 현재 source 기준 대부분의 1050-
 
 OpenTelemetry 수집 파이프라인에서 1,125 spans/s sustained workload를 검증하고, Sender batch 50·Collector batch threshold 1024·JDBC batch 1000의 경계로 인해 Backend 요청 65개 중 63개가 1050 Span으로 형성되는 구조를 runtime 로그로 분석하여 실제 DB batch 처리 단위를 계측
 
+---
+
+## 1,250 spans/s까지 Sustained Telemetry 처리 범위 확장
+
+AeroTrace의 synthetic telemetry ingest를 1,250 spans/s까지 단계적으로 증가시켜 60초 동안 75,000 Span 전량 저장, failed request 0, 최종 Collector queue drain을 검증했다.
+
+1,125 spans/s부터 Sender batch 50과 Collector batch threshold 1024의 조합으로 대부분의 Backend request가 1050 Span으로 형성됐으며, JDBC batch-size 1000에 의해 현재 source 기준 1000 + 50 두 chunk로 분리되는 패턴이 1,250 spans/s에서도 재현됐다.
+
+그럼에도 1,250 spans/s의 TimescaleDB steady-state CPU 평균은 약 31.36%로 1,125 spans/s와 거의 동일했고, Collector queue도 테스트 초반 한 batch 수준에서 유지된 뒤 완전히 drain됐다.
+
+### 포트폴리오 포인트
+
+- sustained workload를 1,250 spans/s까지 단계적으로 확장
+- Collector batch threshold와 Sender input batch의 정수 경계가 실제 1050-span Backend request를 만드는 현상 검증
+- JDBC batch-size를 초과하는 request가 대부분인 조건에서도 데이터 정합성과 자원 사용량 측정
+- queue 존재 자체와 시간에 따른 backlog 증가를 구분
+- 더 높은 workload에서도 CPU 평균이 악화되지 않는지 비교하여 단일 spike가 아닌 steady-state 기준으로 판단
+
+### 이력서 문장 후보
+
+OpenTelemetry 기반 수집 파이프라인의 sustained workload를 1,250 spans/s까지 확장하여 75,000 Span 전량 저장과 failed request 0을 검증하고, Collector batch 1024와 JDBC batch 1000 경계에서 생성되는 1050-span request 및 queue·DB CPU 변화를 runtime 데이터로 분석
+
