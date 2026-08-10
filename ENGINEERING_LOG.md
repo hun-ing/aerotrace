@@ -1794,3 +1794,175 @@ Allocated bytes = 77824
 * refused/enqueue failure 발생 여부
 
 이 결과를 통해 Persistent Queue 디스크 사용량이 테스트 범위에서 어느 정도 선형성을 가지는지 확인한다.
+
+---
+
+## 2026-08-10 — Persistent Queue 1,000 Span 저장량 측정
+
+### 목적
+
+100 Span 실험보다 10배 큰 1,000 Span을 동일한 Backend 장애 조건에서 OpenTelemetry Collector Persistent Queue에 적재하여 queue 크기, persistent storage high-water mark, 데이터 복구 정합성을 측정했다.
+
+### 테스트 조건
+
+- 테스트 Span: 1,000개
+- 요청당 Span: 1개
+- Backend: `docker pause`
+- Collector: 정상 실행
+- TimescaleDB: 정상 실행
+- Queue capacity: 50,000
+- 이전 100 Span 테스트 후 persistent storage 파일이 확보한 공간을 유지하고 있는 상태에서 측정
+
+### 결과
+
+```text
+Requested spans         = 1000
+Collector accepted      = 1000
+DB count during outage  = 0
+Final DB count          = 1000
+
+receiver accepted:
+100 -> 1100
+
+receiver refused:
+0
+
+queue:
+0 -> 1000
+```
+
+Backend 장애 중 TimescaleDB에는 테스트 Span이 저장되지 않았으며 Backend 복구 이후 테스트 Span 1,000건이 모두 조회됐다.
+
+### Persistent storage
+
+1,000 Span 실험 시작 시:
+
+```text
+Apparent  = 143360 bytes
+Allocated = 77824 bytes
+```
+
+Queue 1,000 high-water:
+
+```text
+Apparent  = 536576 bytes
+Allocated = 307200 bytes
+```
+
+이번 실행 중 추가 증가:
+
+```text
+Apparent delta  = 393216 bytes
+Allocated delta = 229376 bytes
+```
+
+단순히 이번 실행의 증가량으로 계산하면 각각 약 393.2 bytes/span, 229.4 bytes/span이다.
+
+그러나 이전 100 Span 실험에서 persistent storage가 이미 확보한 공간을 유지하고 있었으므로 이 값을 일반적인 Span당 storage 비용으로 간주하지 않는다.
+
+최초 실험 전 baseline과 이번 1,000 Span high-water를 비교하면:
+
+```text
+Initial apparent baseline = 45056
+1000-span high-water      = 536576
+Total apparent increase   = 491520 bytes
+
+Initial allocated baseline = 32768
+1000-span high-water       = 307200
+Total allocated increase   = 274432 bytes
+```
+
+현재 테스트 payload와 실험 순서 기준 high-water 비율은 약:
+
+```text
+Apparent  ≈ 491.5 bytes/span
+Allocated ≈ 274.4 bytes/span
+```
+
+이었다.
+
+실제 운영 Span의 attributes, events, links 등의 크기가 다르므로 운영 데이터 저장 비용으로 일반화하지 않는다.
+
+### 추가 발견 — Queue drain 판정 오류
+
+DB에 1,000건이 모두 저장된 직후 Collector metric은 다음 상태였다.
+
+```text
+queue_size = 31
+sent_spans = 1070
+```
+
+실험 시작 시 `sent_spans=101`이었으므로 해당 metric snapshot 기준으로는 +969였다.
+
+따라서 기존 측정 스크립트는 DB count가 목표치에 도달했다는 사실만으로 queue drain까지 완료됐다고 판단하고 있었다.
+
+데이터 정합성 검증은 통과했지만 queue가 실제 0이 되는 시점까지 기다리는 조건이 빠져 있었다.
+
+다음 작업에서는 측정 스크립트를 수정해 다음 두 조건을 별도로 검증한다.
+
+1. 테스트 Span DB count가 목표값에 도달
+2. Collector `queue_size=0`이 될 때까지 추가 대기
+
+그 후에만 queue drain 완료로 판정한다.
+
+---
+
+### 2026-08-10 — Persistent Queue 측정 도구 Queue Drain 판정 개선 검증
+
+1,000 Span 측정에서 TimescaleDB에 모든 테스트 Span이 저장된 시점에도 OpenTelemetry Collector의 `queue_size`가 31로 남아 있는 것을 발견했다.
+
+기존 측정 스크립트는 DB의 테스트 Span 수가 목표값에 도달하면 곧바로 측정 완료로 판단했기 때문에, DB 저장 완료와 Collector 내부 pipeline 처리 완료를 동일한 시점으로 잘못 판단할 수 있었다.
+
+측정 완료 조건을 다음과 같이 변경했다.
+
+```text
+1. 테스트 Span의 DB count가 목표값에 도달
+2. otelcol_exporter_queue_size = 0
+3. otelcol_exporter_in_flight_requests = 0
+4. 위 조건을 모두 만족한 후 PASS
+```
+
+수정 후 10 Span smoke test를 수행했다.
+
+결과:
+
+```text
+Requested spans        = 10
+Collector accepted     = 10
+DB during outage       = 0
+Final DB count         = 10
+
+queue during outage    = 10
+
+queue after recovery   = 0
+in_flight_requests     = 0
+Collector queue drain  = OK
+
+Persistent queue 10-span measurement = PASS
+```
+
+독립적으로 Collector metric을 다시 조회한 결과도 다음과 같았다.
+
+```text
+queue_size         = 0
+in_flight_requests = 0
+queue_capacity     = 50000
+```
+
+Backend, Collector, TimescaleDB도 최종적으로 모두 정상 상태임을 확인했다.
+
+추가로 Persistent Queue storage는 1,000 Span 실험에서 확보한 공간을 10 Span 실험에서 재사용했다.
+
+```text
+Apparent bytes before = 536576
+Apparent bytes queued = 536576
+delta                 = 0
+
+Allocated bytes before = 307200
+Allocated bytes queued = 307200
+delta                  = 0
+```
+
+이는 queue가 drain된 이후에도 확보한 storage 공간을 즉시 반환하지 않고 이후 queue 적재에 재사용할 수 있다는 이전 관찰과 일치한다.
+
+이번 검증으로 Persistent Queue 측정 도구는 DB 정합성과 Collector 내부 queue 처리 완료를 독립적으로 검증할 수 있게 됐다.

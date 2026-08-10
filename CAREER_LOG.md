@@ -786,3 +786,26 @@ OpenTelemetry Collector Persistent Queue의 장애 대응 능력을 기능 검�
 * 100 Span 결과만으로 최대 장애 시간을 산정하지 않은 이유
 * apparent size와 allocated size를 둘 다 측정한 이유
 * 실제 서비스 Span 저장량을 산정하려면 어떤 추가 실험이 필요한가
+
+---
+
+## Persistent Queue 100 → 1,000 Span 용량 실험
+
+Backend 장애 상태에서 OpenTelemetry Collector Persistent Queue에 100개와 1,000개의 테스트 Span을 단계적으로 적재하고 queue metric, disk high-water mark, 복구 후 DB 정합성을 비교했다.
+
+1,000 Span 테스트에서는 Collector가 전량 수락하고 receiver refused가 0인 상태에서 queue가 1,000까지 증가했으며 Backend 복구 후 TimescaleDB에 1,000건 모두 저장되는 것을 확인했다.
+
+또한 DB 저장 완료 직후에도 Collector `queue_size`가 31로 남아 있는 것을 발견해, 기존 테스트가 DB count와 queue drain을 동일한 완료 조건으로 취급하고 있다는 측정 로직의 문제를 발견했다.
+
+이를 통해 장애 테스트에서도 단순 PASS/FAIL보다 각 컴포넌트의 완료 기준을 독립적인 metric으로 검증해야 한다는 운영 경험을 얻었다.
+
+### 포트폴리오 포인트
+
+- Backend 장애 상태에서 1,000 Span queue high-water 직접 측정
+- Collector accepted/refused 및 exporter queue metric과 DB 결과 교차 검증
+- persistent storage의 공간 재사용 특성을 고려해 단순 Span당 평균값의 과도한 일반화를 피함
+- 테스트 스크립트 자체의 잘못된 queue drain 판정을 metric으로 발견
+
+### 이력서 문장 후보
+
+OpenTelemetry Collector Persistent Queue에 100/1,000 Span을 단계적으로 적재해 장애 중 queue와 디스크 high-water mark를 실측하고 복구 후 전량 저장을 검증했으며, DB 저장 완료와 Collector queue drain 시점이 다를 수 있음을 발견해 장애 테스트 완료 조건을 metric 기반으로 개선

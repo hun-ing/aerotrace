@@ -75,6 +75,39 @@ print_queue_metrics() {
 }
 
 
+collector_metric_value() {
+  local metric_name="$1"
+  local value
+
+  value="$(
+    curl \
+      --silent \
+      --show-error \
+      "${collector_metrics}" |
+    awk \
+      -v metric_name="${metric_name}" \
+      '
+        index($0, metric_name "{") == 1 &&
+        index($0, "exporter=\"otlp_http/aerotrace\"") {
+          print $2
+          exit
+        }
+      '
+  )"
+
+  if [ -z "${value}" ]; then
+    printf \
+      'Collector metric not found: %s\n' \
+      "${metric_name}" \
+      >&2
+    return 1
+  fi
+
+  printf '%s\n' \
+    "${value}"
+}
+
+
 count_test_spans() {
   docker exec \
     "${db_container}" \
@@ -428,7 +461,7 @@ fi
 
 
 echo
-echo "===== Waiting for all spans ====="
+echo "===== Waiting for all spans in DB ====="
 
 final_count=0
 recovered=0
@@ -461,6 +494,47 @@ done
 if [ "${recovered}" -ne 1 ]; then
   echo "Not all spans reached DB."
   exit 28
+fi
+
+
+echo
+echo "===== Waiting for Collector queue drain ====="
+
+queue_drained=0
+
+for attempt in $(seq 1 120)
+do
+  queue_now="$(
+    collector_metric_value \
+      otelcol_exporter_queue_size
+  )"
+
+  in_flight_now="$(
+    collector_metric_value \
+      otelcol_exporter_in_flight_requests
+  )"
+
+  printf \
+    'attempt=%03d queue=%s in_flight=%s\n' \
+    "${attempt}" \
+    "${queue_now}" \
+    "${in_flight_now}"
+
+  if \
+    [ "${queue_now}" = "0" ] &&
+    [ "${in_flight_now}" = "0" ]
+  then
+    queue_drained=1
+    echo "Collector queue drain: OK"
+    break
+  fi
+
+  sleep 1
+done
+
+if [ "${queue_drained}" -ne 1 ]; then
+  echo "Collector queue did not fully drain."
+  exit 29
 fi
 
 
@@ -502,4 +576,4 @@ printf 'Allocated bytes queued:   %s\n' "${allocated_queued}"
 printf 'Allocated byte delta:     %s\n' "${allocated_delta}"
 
 echo
-echo "Persistent queue 100-span measurement: PASS"
+echo "Persistent queue ${test_span_count}-span measurement: PASS"

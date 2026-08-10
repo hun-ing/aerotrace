@@ -829,3 +829,72 @@ Queue drain 후에도 Persistent storage 파일 크기가 즉시 감소하지 �
 ### 다음 작업
 
 동일한 조건에서 1,000 Span을 Persistent Queue에 적재하여 queue/storage 증가 패턴과 복구 정합성을 측정한다.
+
+---
+
+### Persistent Queue 용량 측정
+
+100 Span 및 1,000 Span 단계별 Persistent Queue 실험을 완료했다.
+
+1,000 Span 테스트 결과:
+
+```text
+Collector accepted = 1000
+Collector refused = 0
+DB during outage = 0
+DB after recovery = 1000
+
+Queue high-water = 1000
+Queue capacity = 50000
+
+Persistent storage high-water:
+Apparent  = 536576 bytes
+Allocated = 307200 bytes
+```
+
+최초 persistent storage baseline에서 1,000 Span high-water까지 증가량:
+
+```text
+Apparent increase  = 491520 bytes
+Allocated increase = 274432 bytes
+```
+
+현재 테스트 payload와 실험 조건에 한정된 수치이며 실제 운영 Span 크기로 일반화하지 않는다.
+
+추가로 기존 측정 스크립트가 DB count 목표 달성만으로 queue drain 완료를 선언하는 문제를 발견했다.
+
+1,000 Span DB 저장 완료 시점의 Collector metric에는 아직 `queue_size=31`이 남아 있었다.
+
+다음 작업은 queue size가 실제 0이 되는 시점까지 대기하도록 측정 스크립트 완료 조건을 개선하는 것이다.
+
+---
+
+### Persistent Queue 측정 도구 검증 완료
+
+Persistent Queue 측정 스크립트의 완료 조건을 개선했다.
+
+이전에는 테스트 Span이 DB에 모두 저장되면 측정이 끝난 것으로 판단했지만, 1,000 Span 테스트에서 DB 저장 완료 시점에도 Collector queue가 남아 있는 사례를 확인했다.
+
+현재 측정 완료 조건은 다음과 같다.
+
+```text
+DB test span count = target
+AND
+otelcol_exporter_queue_size = 0
+AND
+otelcol_exporter_in_flight_requests = 0
+```
+
+수정 후 10 Span smoke test에서 다음을 확인했다.
+
+```text
+Collector accepted = 10
+DB during outage = 0
+DB after recovery = 10
+queue_size = 0
+in_flight_requests = 0
+```
+
+따라서 현재 Persistent Queue 측정 스크립트의 완료 판정 로직은 검증된 상태다.
+
+또한 이전 1,000 Span 실험에서 확보된 Persistent Queue storage가 이후 10 Span 적재 시 추가 파일 증가 없이 재사용되는 것을 확인했다.
