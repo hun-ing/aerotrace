@@ -853,3 +853,26 @@ AeroTrace의 OTLP 수집 성능을 평가하면서 단일 benchmark 결과를 �
 
 OpenTelemetry 수집 파이프라인의 Collector 수락 처리량과 TimescaleDB 저장 완료 처리량을 분리 측정하고 반복 benchmark를 자동화하여, 5회 데이터 정합성 검증과 함께 synthetic workload 기준 약 1.24K spans/s의 End-to-End 처리량 중앙값을 확보
 
+---
+
+## 60초 Sustained Telemetry Ingest 실험
+
+짧은 burst benchmark만으로 운영 처리능력을 판단하지 않고, 목표 ingest rate를 일정하게 유지하는 부하 발생기와 CPU·memory·DB connection·Collector queue 관측기를 직접 구성하여 60초 sustained workload를 검증했다.
+
+500 spans/s를 정확히 60초 유지하여 총 30,000 synthetic Span을 전송했고, 600개 OTLP 요청 전체 성공, TimescaleDB 30,000건 전량 저장, Collector refused 0 및 최종 queue drain을 확인했다.
+
+또한 Collector queue가 이미 0인 시점에도 DB count가 29,450건으로 남아 있다가 이후 30,000건이 되는 현상을 관찰하여, queue drain과 DB persistence 완료를 동일하게 판단하면 안 된다는 점을 실제 테스트로 확인했다.
+
+### 포트폴리오 포인트
+
+- 순간 burst가 아닌 일정 rate의 sustained-load generator 구현
+- sender schedule lag를 측정하여 부하 발생기 자체의 정확도 검증
+- 부하와 동시에 Backend/Collector/TimescaleDB CPU·memory 자동 수집
+- DB connection과 Collector queue 상태를 함께 관찰
+- 30,000건 데이터 정합성과 refused/queue drain 동시 검증
+- 관측 sampling 한계를 고려해 결과를 과도하게 해석하지 않음
+
+### 이력서 문장 후보
+
+OpenTelemetry 수집 파이프라인에 500 spans/s의 부하를 60초간 지속하고 Backend·Collector·TimescaleDB 자원 사용량과 queue 상태를 동시에 계측하여, 30,000 Span 전량 저장 및 Collector refused 0을 검증하고 sustained-load 성능 기준선을 구축
+

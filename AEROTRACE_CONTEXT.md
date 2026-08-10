@@ -974,3 +974,64 @@ stdev  = 141.24 spans/s
 
 다음 성능 검증 단계는 sustained ingest workload에서 자원 사용량과 병목을 동시에 측정하는 것이다.
 
+---
+
+### 500 spans/s Sustained Load 검증 완료
+
+정상 상태에서 synthetic OTLP workload를 500 spans/s로 60초 동안 지속하여 총 30,000 Span을 수집했다.
+
+결과:
+
+```text
+Target rate     = 500 spans/s
+Observed rate   = 500.00 spans/s
+Duration        = 60.000133 sec
+
+Accepted        = 30,000 / 30,000
+Failed requests = 0
+Final DB        = 30,000 / 30,000
+
+Collector refused delta = 0
+Final queue              = 0
+Final in-flight          = 0
+```
+
+Resource baseline:
+
+```text
+Backend CPU
+  avg 1.85%
+  max 7.08%
+
+Collector CPU
+  avg 1.74%
+  max 4.06%
+
+TimescaleDB CPU
+  avg 11.61%
+  max 15.71%
+```
+
+TimescaleDB CPU가 세 컴포넌트 중 가장 높게 관찰됐지만 현재 부하에서 병목으로 확정할 수준의 근거는 없다.
+
+Memory:
+
+```text
+Backend
+318.5 MiB -> 319.7 MiB final
+
+Collector
+48.48 MiB -> 65.56 MiB final
+
+TimescaleDB
+164.2 MiB -> 187.4 MiB final
+```
+
+Collector와 TimescaleDB의 증가분은 현재 단일 실험만으로 leak이라고 판단하지 않으며 이후 sustained-load 단계에서 추세를 비교한다.
+
+DB connection 총수는 11로 유지됐다.
+
+5초 resource sample에서는 Collector queue 및 in-flight backlog가 관찰되지 않았다.
+
+다음 성능 단계는 같은 측정 방법으로 750 spans/s sustained workload를 실행해 자원 사용량과 backlog 발생 여부를 비교하는 것이다.
+

@@ -2189,3 +2189,213 @@ Collector acceptance throughput과 DB throughput도 동일하게 움직이지 �
 - Collector queue 크기
 - 실패 요청
 - 데이터 누락/중복
+
+---
+
+## 2026-08-10 — 500 spans/s × 60초 Sustained Load Baseline
+
+### 목적
+
+약 1초 동안 수행되던 기존 burst benchmark를 넘어 일정한 ingest rate를 장시간 유지하면서 AeroTrace Backend, OpenTelemetry Collector, TimescaleDB의 자원 사용량과 데이터 정합성을 측정했다.
+
+첫 sustained-load는 기존 synthetic End-to-End throughput 중앙값보다 충분히 낮은 500 spans/s에서 시작했다.
+
+### 테스트 조건
+
+```text
+Target rate       = 500 spans/s
+Duration          = 60 sec
+Batch size        = 50 spans/request
+Request rate      = 10 requests/sec
+Expected spans    = 30,000
+
+Resource interval = 5 sec
+Resource duration = 70 sec
+Samples           = 15
+```
+
+부하 전 5초 baseline과 부하 종료 후 5초 post-load 구간을 포함했다.
+
+### Sender 결과
+
+```text
+Requested spans          = 30,000
+Accepted spans           = 30,000
+
+Requested requests       = 600
+Accepted requests        = 600
+Failed requests          = 0
+
+Actual elapsed           = 60.000133 sec
+Target rate              = 500 spans/sec
+Observed accepted rate   = 500.00 spans/sec
+```
+
+Request latency:
+
+```text
+p50 = 2.017 ms
+p95 = 2.314 ms
+p99 = 2.418 ms
+max = 7.436 ms
+```
+
+Sender schedule lag:
+
+```text
+p50 = 0.227 ms
+p95 = 0.329 ms
+p99 = 0.336 ms
+max = 0.338 ms
+```
+
+따라서 sender가 목표 부하를 생성하지 못해 낮은 부하가 걸린 테스트는 아니었다.
+
+### 데이터 정합성
+
+최종 결과:
+
+```text
+Expected spans = 30,000
+DB count       = 30,000 / 30,000
+
+queue          = 0
+in_flight      = 0
+
+Collector accepted counter delta = 30,000
+Collector refused counter delta  = 0
+Collector sent counter delta     = 30,000
+```
+
+30,000건 모두 저장되었으며 요청 실패와 Collector refused 증가가 없었다.
+
+### Collector와 DB 완료 시점 차이
+
+Sender 종료 직후 첫 completion poll:
+
+```text
+DB count   = 29,450 / 30,000
+queue      = 0
+in_flight  = 0
+```
+
+다음 poll에서는:
+
+```text
+DB count   = 30,000 / 30,000
+queue      = 0
+in_flight  = 0
+```
+
+이었다.
+
+따라서 Collector queue drain만으로 TimescaleDB persistence까지 완료됐다고 판단하지 않는다.
+
+Sustained benchmark 완료 조건은 계속 다음 세 조건을 함께 사용한다.
+
+```text
+DB test span count = target
+AND
+Collector queue_size = 0
+AND
+Collector in_flight_requests = 0
+```
+
+### CPU
+
+15개 resource sample 전체:
+
+```text
+Backend
+  avg = 1.85%
+  max = 7.08%
+
+Collector
+  avg = 1.74%
+  max = 4.06%
+
+TimescaleDB
+  avg = 11.61%
+  max = 15.71%
+```
+
+현재 500 spans/s 조건에서는 TimescaleDB의 CPU 사용량이 세 컴포넌트 중 가장 높게 관찰됐다.
+
+그러나 해당 사용량만으로 TimescaleDB를 병목이라고 확정하지 않는다.
+
+### Memory
+
+```text
+Backend
+  baseline = 318.5 MiB
+  average  = 319.37 MiB
+  max      = 319.8 MiB
+  final    = 319.7 MiB
+
+Collector
+  baseline = 48.48 MiB
+  average  = 61.01 MiB
+  max      = 65.57 MiB
+  final    = 65.56 MiB
+
+TimescaleDB
+  baseline = 164.2 MiB
+  average  = 176.80 MiB
+  max      = 187.4 MiB
+  final    = 187.4 MiB
+```
+
+Collector와 TimescaleDB의 memory가 부하 이후 baseline보다 높은 상태로 유지됐지만, 60초 단일 실험과 5초 post-load 관측만으로 memory leak이라고 판단하지 않는다.
+
+향후 부하 단계에서 high-water 재사용 또는 지속 증가 여부를 비교한다.
+
+### DB Connections
+
+```text
+connections
+  baseline = 11
+  average  = 11
+  max      = 11
+  final    = 11
+
+active
+  sampled max = 0
+```
+
+DB connection 총수는 증가하지 않았다.
+
+다만 5초 sampling으로 짧은 DB transaction을 놓칠 수 있으므로 `active=0`을 DB가 사용되지 않았다는 의미로 해석하지 않는다.
+
+Connection pool saturation 판단에는 더 세밀한 pool/DB metric이 필요하다.
+
+### Collector Queue
+
+5초 간격으로 수집한 모든 resource sample:
+
+```text
+queue_size max sampled = 0
+in_flight max sampled  = 0
+```
+
+이는 500 spans/s에서 지속적인 queue backlog가 관찰되지 않았음을 의미한다.
+
+5초 sample 사이의 짧은 queue 변동까지 존재하지 않았다고 단정하지 않는다.
+
+### 결론
+
+500 spans/s를 60초 동안 정확하게 유지한 synthetic workload에서:
+
+- 30,000 Span 전량 저장
+- 실패 요청 0
+- Collector refused 0
+- 지속적인 queue backlog 미관찰
+- DB connection 총수 증가 없음
+- Backend와 Collector CPU에 충분한 여유 관찰
+- TimescaleDB가 상대적으로 가장 높은 CPU 사용량 기록
+
+을 확인했다.
+
+현재 조건에서는 500 spans/s sustained ingest가 안정적으로 처리되는 baseline으로 기록한다.
+
+다음 단계에서는 동일한 방법으로 750 spans/s까지 한 단계만 부하를 증가시켜 CPU, memory, queue, 정합성 변화 추세를 비교한다.
+
