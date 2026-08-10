@@ -1554,3 +1554,50 @@ Average request size = 1,043.48 spans
 
 설정 tuning은 아직 수행하지 않는다.
 
+---
+
+### Sustained Ingest 검증 범위 — 2,125 spans/s
+
+현재 synthetic sustained workload 검증 범위를 2,125 spans/s까지 확장했다.
+
+```text
+2,125 spans/s × 60 sec
+Expected = 127,500
+
+Accepted = 127,500
+DB       = 127,500 / 127,500
+Failed   = 0
+Refused  = 0
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+average = 58.52%
+median  = 56.49%
+maximum = 81.41%
+```
+
+2,000 spans/s의 average 56.00%, median 53.24%보다 완만하게 증가했다.
+
+Collector queue는 후반 약 25초 동안 1050 Span 한 batch 수준으로 유지됐지만 1050보다 큰 sampled queue는 관찰되지 않았고 최종적으로 정상 drain됐다.
+
+Backend runtime request:
+
+```text
+Backend requests = 122
+1050-span requests = 121
+Average request size = 1,045.08 spans
+```
+
+현재 source의 JDBC batch-size 1000 기준 estimated JDBC chunks는 243이다.
+
+현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 2,125 spans/s다.
+
+DB headroom은 감소하고 있지만 증가형 queue, refused, failed 또는 데이터 정합성 실패는 아직 확인되지 않았다.
+
+설정 tuning은 아직 수행하지 않는다.
+
