@@ -1035,3 +1035,176 @@ DB connection 총수는 11로 유지됐다.
 
 다음 성능 단계는 같은 측정 방법으로 750 spans/s sustained workload를 실행해 자원 사용량과 backlog 발생 여부를 비교하는 것이다.
 
+---
+
+### 750 spans/s Sustained Load 검증
+
+500 spans/s baseline 이후 동일 조건에서 부하를 750 spans/s로 증가시켜 60초 sustained test를 수행했다.
+
+```text
+Observed rate   = 750.00 spans/s
+Accepted        = 45,000 / 45,000
+Failed requests = 0
+DB final        = 45,000 / 45,000
+Refused delta   = 0
+Final queue     = 0
+Final in-flight = 0
+```
+
+최종 데이터 정합성과 pipeline drain은 정상적으로 완료됐다.
+
+자원 사용:
+
+```text
+Backend CPU
+  avg 2.90%
+  max 8.81%
+
+Collector CPU
+  avg 1.70%
+  max 2.34%
+
+TimescaleDB CPU
+  avg 23.77%
+  max 55.29%
+```
+
+500 spans/s에서는 sampled queue backlog가 없었지만 750 spans/s에서는:
+
+```text
+queue sampled max = 750
+in_flight max = 1
+```
+
+이 처음 관찰됐다.
+
+최종 queue는 0으로 정상 drain됐고 refusal은 없었다.
+
+현재 750 spans/s는 데이터 정합성 관점에서는 PASS지만, TimescaleDB CPU 증가와 Collector queue backlog가 처음 나타난 성능 경계 조사 지점이다.
+
+다음 단계에서는 부하를 바로 높이지 않고 750 spans/s resource time-series를 분석해 queue 발생 시점과 TimescaleDB CPU의 상관관계를 확인한다.
+
+---
+
+### 750 spans/s Backlog 분석
+
+750 spans/s sustained test에서 관찰된 `queue_size=750`은 여러 sample 동안 지속되지 않고 한 번의 sample에서만 나타난 뒤 다음 sample에서 0으로 drain됐다.
+
+동일 구간의 receiver/exporter counter 변화도 exporter가 잠시 incoming telemetry보다 뒤처졌다가 이후 따라잡은 패턴을 보였다.
+
+따라서 현재 상태는:
+
+```text
+750 spans/s 데이터 정합성       PASS
+지속적인 queue 증가             미관찰
+일시적인 exporter backlog       관찰
+최종 queue drain                PASS
+TimescaleDB CPU 증가            관찰
+DB CPU와 queue 직접 상관관계    미확정
+```
+
+로 기록한다.
+
+다음 단계에서는 부하를 즉시 높이지 않고 Collector batch/sending queue 설정과 Backend JDBC batch/DB connection 설정을 확인하여 현재 처리 단위와 병렬성을 파악한다.
+
+---
+
+### 750 spans/s Batch 동작 해석 보정
+
+750 spans/s sustained test의 Backend INFO 로그를 확인한 결과 Collector가 45,000 Span을 Backend에 총 61개의 요청으로 전달했다.
+
+주요 request 크기는 750 spans였으며 실제 분포는:
+
+```text
+550 × 1
+750 × 56
+800 × 3
+50  × 1
+```
+
+이었다.
+
+이는 `batch.timeout=1s`, `send_batch_size=1024` 설정과 750 spans/s의 입력 rate에서 timeout 중심으로 batch가 flush되는 패턴과 일치한다.
+
+따라서 한 차례 관찰된 `queue_size=750`은 지속 overload의 증거라기보다 하나의 Collector batch가 exporter queue를 통과하던 순간을 포착했을 가능성이 높다.
+
+현재 750 spans/s 상태는:
+
+```text
+데이터 정합성              PASS
+failed requests             0
+refused                     0
+최종 queue drain            PASS
+지속 queue 증가             미관찰
+순간 750-span queue         관찰
+처리 한계 도달              미확인
+```
+
+으로 기록한다.
+
+또한 DB count와 Collector metric이 순차적으로 수집되므로 `DB count < target`과 `queue=0`이 같은 출력에 존재하더라도 이를 동일 시점의 상태로 간주하지 않는다.
+
+---
+
+### Sustained Ingest 실제 처리 단위
+
+750 spans/s runtime 로그 분석 결과:
+
+```text
+Sender requests = 900
+Backend requests = 61
+Total spans = 45,000
+```
+
+Backend request는 대부분 약 750 spans 단위였으며 Collector의 1초 batch timeout 동작과 일치했다.
+
+Backend JDBC batch size는 1000이므로 현재 source 구현 기준으로 750 테스트의 모든 Backend request는 한 JDBC batch chunk 내에서 처리될 수 있다.
+
+DB connection 출처 확인 결과:
+
+```text
+Application PostgreSQL JDBC connections = 10
+TimescaleDB background connection        = 1
+```
+
+이었으므로 기존 resource monitor의 `db_connections=11`은 Hikari pool connection 11개를 의미하지 않는다.
+
+Resource monitor는 앞으로 애플리케이션 원격 JDBC connection만 집계하도록 보정한다.
+
+---
+
+### Sustained Ingest 현재 검증 범위
+
+설정 변경 없이 다음 sustained workload를 검증했다.
+
+```text
+500 spans/s × 60 sec → 30,000 / 30,000 PASS
+750 spans/s × 60 sec → 45,000 / 45,000 PASS
+875 spans/s × 60 sec → 52,500 / 52,500 PASS
+```
+
+875 spans/s 결과:
+
+```text
+Observed rate   = 875.00 spans/s
+Failed requests = 0
+Refused         = 0
+Final queue     = 0
+Final in-flight = 0
+```
+
+Resource sampling에서도 queue backlog가 관찰되지 않았다.
+
+Collector batch processor는 1,050개의 sender request를 Backend request 61개로 합쳤다.
+
+```text
+Backend request average = 860.66 spans
+Backend request maximum = 900 spans
+```
+
+현재 JDBC batch size는 1000이며 875 테스트에서는 JDBC batch size를 초과한 Backend request가 없었다.
+
+750에서 관찰된 TimescaleDB CPU peak와 순간 queue는 더 높은 875 spans/s에서 재현되지 않았으므로 지속적인 saturation 또는 처리 한계로 판단하지 않는다.
+
+다음 성능 검증 단계는 Collector batch size와 Backend JDBC batch size 경계에 근접하는 1,000 spans/s × 60초 sustained test다.
+

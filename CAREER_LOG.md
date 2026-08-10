@@ -876,3 +876,52 @@ OpenTelemetry 수집 파이프라인의 Collector 수락 처리량과 TimescaleD
 
 OpenTelemetry 수집 파이프라인에 500 spans/s의 부하를 60초간 지속하고 Backend·Collector·TimescaleDB 자원 사용량과 queue 상태를 동시에 계측하여, 30,000 Span 전량 저장 및 Collector refused 0을 검증하고 sustained-load 성능 기준선을 구축
 
+---
+
+## 단계적 Sustained Load에서 첫 병목 신호 발견
+
+AeroTrace의 sustained ingest workload를 500 spans/s에서 750 spans/s로 단계적으로 증가시키면서 단순 성공 여부뿐 아니라 CPU, memory, DB connection, Collector queue 및 데이터 정합성을 비교했다.
+
+750 spans/s를 60초 동안 정확히 유지해 45,000 Span 전량 저장과 refused 0을 검증했지만, 500 spans/s에서는 관찰되지 않았던 Collector queue backlog가 처음 나타났고 TimescaleDB CPU도 비선형적으로 증가하는 현상을 확인했다.
+
+이를 근거로 다음 부하를 즉시 높이지 않고 queue와 DB CPU time-series의 상관관계를 먼저 분석하는 방향을 선택했다.
+
+### 포트폴리오 포인트
+
+- 부하를 단계적으로 증가시키며 성능 경계 탐색
+- 데이터 정합성 PASS와 내부 backlog 발생을 별개로 판단
+- 최대 처리량 숫자를 만들기 위해 무작정 부하를 높이지 않고 병목 징후 발생 시점에서 원인 분석으로 전환
+- Collector queue와 TimescaleDB 자원 사용량을 함께 관측
+- queue metric 단위를 확인하기 전 span 수로 임의 환산하지 않음
+
+### 이력서 문장 후보
+
+OpenTelemetry 수집 파이프라인의 sustained workload를 500→750 spans/s로 단계적으로 증가시키며 데이터 정합성과 자원 사용량을 비교하고, 45,000 Span 전량 저장을 유지하는 동시에 Collector queue backlog와 TimescaleDB CPU의 비선형 증가를 포착해 병목 분석 지점을 식별
+
+---
+
+## Sustained Load 단계적 병목 탐색 — 500 → 750 → 875 spans/s
+
+짧은 burst benchmark의 최대 처리량만 기록하지 않고 일정한 telemetry ingest rate를 유지하는 sustained test를 500, 750, 875 spans/s로 단계적으로 수행했다.
+
+875 spans/s에서 60초 동안 52,500 Span을 전량 저장하고 요청 실패 및 Collector refusal 0을 확인했다.
+
+또한 Backend runtime 로그를 실제 workload와 대조하여 Sender의 1,050개 작은 OTLP 요청이 Collector batching을 통해 61개의 Backend 요청으로 합쳐지는 것을 검증했다.
+
+Backend 요청 평균은 860.66 Span, 최대는 900 Span이었으며 현재 JDBC batch size 1000을 초과한 요청은 없었다.
+
+750 spans/s에서 TimescaleDB CPU peak와 순간 queue가 관찰됐지만 더 높은 875 spans/s에서는 재현되지 않았다. 이를 통해 단일 성능 샘플을 병목으로 단정하지 않고 더 높은 workload에서 재검증한 뒤 해석을 수정하는 경험을 확보했다.
+
+### 포트폴리오 포인트
+
+- 500 → 750 → 875 spans/s 단계적 sustained-load 검증
+- Sender rate와 schedule lag를 측정해 부하 발생기 정확도 검증
+- Collector batching 전후 request 수를 Backend runtime 로그로 검증
+- Collector queue, DB CPU, memory, JDBC connection을 workload와 함께 분석
+- 측정값 하나만으로 병목을 단정하지 않고 반복 실험으로 기존 가설을 수정
+- Collector batch와 JDBC batch 경계를 실제 runtime 데이터로 추적
+
+### 이력서 문장 후보
+
+OpenTelemetry telemetry 수집 파이프라인에 500→750→875 spans/s의 sustained workload를 단계적으로 적용하고, 875 spans/s에서 52,500 Span 전량 저장과 refused 0을 검증했으며 Collector batching을 통해 1,050개 요청이 61개 Backend 요청으로 병합되는 실제 처리 구조를 runtime 로그로 분석
+

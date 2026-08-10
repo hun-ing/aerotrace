@@ -250,16 +250,16 @@ PY
             SELECT
               count(*) FILTER (
                 WHERE datname = current_database()
-                  AND pid <> pg_backend_pid()
+                  AND client_addr IS NOT NULL
               ),
               count(*) FILTER (
                 WHERE datname = current_database()
-                  AND pid <> pg_backend_pid()
+                  AND client_addr IS NOT NULL
                   AND state = 'active'
               ),
               count(*) FILTER (
                 WHERE datname = current_database()
-                  AND pid <> pg_backend_pid()
+                  AND client_addr IS NOT NULL
                   AND state = 'idle'
               ),
               current_setting('max_connections')::int
