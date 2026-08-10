@@ -1319,3 +1319,31 @@ maximum = 43.84%
 
 다음 성능 단계에서는 설정 변경 없이 1,375 spans/s로 부하를 증가해 지속 backlog와 DB CPU headroom을 계속 확인한다.
 
+---
+
+### 1,375 spans/s 재현성 검증
+
+1,375 spans/s × 60초 sustained workload를 동일 조건으로 2회 검증했다.
+
+```text
+Run1 → 82,500 / 82,500 PASS
+Run2 → 82,500 / 82,500 PASS
+```
+
+두 실행 모두 최종 Collector queue와 in-flight가 0까지 drain됐다.
+
+Full-rate TimescaleDB CPU:
+
+```text
+1,250       avg 31.36%
+
+1,375 Run1  avg 40.97%
+1,375 Run2  avg 36.79%
+```
+
+1,375에서 첫 실행의 높은 CPU maximum은 재현되지 않았지만, steady-state CPU 수준 자체가 1,250보다 높아지는 추세는 두 실행에서 공통적으로 관찰됐다.
+
+Collector queue는 약 1050 Span 한 batch 수준으로 간헐적으로 나타났다가 정상 drain됐으며 시간에 따른 지속적인 backlog 증가는 확인되지 않았다.
+
+현재 1,375 spans/s는 synthetic workload에서 안정적으로 처리된 범위이나, 이후 부하에서는 TimescaleDB CPU headroom을 주요 경계 지표로 관찰한다.
+

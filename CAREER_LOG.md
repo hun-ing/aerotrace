@@ -997,3 +997,19 @@ AeroTrace의 synthetic telemetry ingest를 1,250 spans/s까지 단계적으로 �
 
 OpenTelemetry 기반 수집 파이프라인의 sustained workload를 1,250 spans/s까지 확장하여 75,000 Span 전량 저장과 failed request 0을 검증하고, Collector batch 1024와 JDBC batch 1000 경계에서 생성되는 1050-span request 및 queue·DB CPU 변화를 runtime 데이터로 분석
 
+---
+
+## 처리 성공과 자원 Headroom을 분리한 성능 경계 분석
+
+1,375 spans/s sustained workload에서 82,500 Span 전량 저장에 성공했지만 TimescaleDB CPU가 1,250 spans/s보다 증가하는 현상을 관찰했다.
+
+단일 CPU spike를 병목으로 단정하지 않고 동일 조건을 반복 검증한 결과 첫 실행의 83% peak는 재현되지 않았지만, 두 1,375 runs 모두 1,250보다 높은 steady-state CPU 수준을 보여 DB 처리 비용 증가 추세 자체는 재현됨을 확인했다.
+
+동시에 Collector queue는 한 batch 수준에서 반복적으로 발생했지만 매번 정상 drain됐으며 지속적인 backlog 증가는 없었다.
+
+이를 통해 “요청 성공 여부”, “queue 존재 여부”, “queue 증가 여부”, “CPU headroom”을 분리하여 sustained throughput 경계를 판단했다.
+
+### 이력서 문장 후보
+
+OpenTelemetry 수집 파이프라인의 sustained workload를 1,375 spans/s까지 확장하고 동일 조건 반복 실험을 통해 82,500 Span 전량 저장을 검증하는 동시에 TimescaleDB steady-state CPU 증가 추세와 비누적 Collector queue 패턴을 분리 분석하여 성능 headroom을 측정
+

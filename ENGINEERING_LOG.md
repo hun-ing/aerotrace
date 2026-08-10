@@ -3468,3 +3468,86 @@ estimated chunks per request = 1.973
 
 현재 측정 조건에서 1,250 spans/s를 sustained throughput 한계로 판단할 근거는 없다.
 
+---
+
+### 1,375 spans/s 동일 조건 재현성 검증
+
+1,375 spans/s 첫 테스트에서 TimescaleDB CPU 증가가 관찰되어 동일한 설정과 workload로 두 번째 60초 sustained test를 수행했다.
+
+두 번째 실행도:
+
+```text
+Expected spans = 82,500
+DB count       = 82,500 / 82,500
+Final queue    = 0
+Final in-flight = 0
+```
+
+으로 정상 완료됐다.
+
+#### TimescaleDB CPU 재현성
+
+Full-rate 구간 t=10~60 기준:
+
+```text
+1,250 spans/s
+average = 31.36%
+median  = 30.98%
+maximum = 43.84%
+
+1,375 spans/s Run1
+average = 40.97%
+median  = 36.63%
+maximum = 83.14%
+
+1,375 spans/s Run2
+average = 36.79%
+median  = 34.88%
+maximum = 51.28%
+```
+
+두 1,375 spans/s 실행의 평균 CPU를 단순 평균하면 약 38.88%다.
+
+첫 실행의 83.14% maximum은 두 번째 실행에서 재현되지 않았으므로 이를 정상 steady-state CPU 비용으로 판단하지 않는다.
+
+그러나 두 실행 모두 1,250 spans/s의 steady-state CPU 평균 및 median보다 높은 수준을 보여 1,375 spans/s부터 TimescaleDB CPU 비용이 증가하는 추세는 재현된 것으로 기록한다.
+
+#### Collector Queue
+
+두 번째 실행에서는:
+
+```text
+t=10 → queue=1050
+t=15 → queue=0
+
+t=25 → queue=1050
+t=30 → queue=0
+
+t=35 → queue=1050
+t=40 → queue=0
+
+t=45 → queue=1050
+t=50 → queue=0
+
+t=55 → queue=1050
+t=60 → queue=0
+```
+
+패턴이 관찰됐다.
+
+queue는 한 Collector batch 수준에서 반복적으로 나타났지만 매번 다음 sample에서 0으로 drain됐다.
+
+시간에 따라 queue가 1050→2100→3150처럼 증가하는 지속 backlog는 확인되지 않았다.
+
+queue 발생 sample의 TimescaleDB CPU 역시 약 28~42% 범위로 다양해 queue와 DB CPU peak 사이의 직접적인 상관관계는 확인되지 않았다.
+
+#### 결론
+
+1,375 spans/s는 동일 조건 두 차례 모두 데이터 정합성과 최종 pipeline drain에 성공했다.
+
+현재 상태는 sustained throughput 한계를 초과한 상태로 판단하지 않는다.
+
+다만 1,250→1,375 workload 증가 시 TimescaleDB steady-state CPU 상승이 반복 관찰됐으므로 이후 부하 단계에서는 DB CPU headroom을 주요 성능 경계 지표로 함께 사용한다.
+
+아직 queue 누적, refused, 데이터 유실 또는 CPU saturation이 확인되지 않았으므로 현재 설정을 변경하거나 batch tuning을 수행하지 않는다.
+
