@@ -3109,3 +3109,181 @@ requests > JDBC batch-size  = 4
 
 1,000 spans/s부터 Collector batch와 Backend JDBC batch 경계가 실제 runtime workload에 영향을 주기 시작했지만 데이터 정합성 또는 지속적인 queue 증가 문제는 확인되지 않았다.
 
+---
+
+## 2026-08-10 — 1,125 spans/s Sustained Load와 Batch Boundary 검증
+
+### 테스트 조건
+
+```text
+Target rate       = 1,125 spans/s
+Duration          = 60 sec
+Expected spans    = 67,500
+Sender batch      = 50 spans/request
+Sender requests   = 1,350
+```
+
+### 결과
+
+```text
+Observed rate     = 1,125.00 spans/s
+
+Requested spans   = 67,500
+Accepted spans    = 67,500
+DB final          = 67,500 / 67,500
+
+Requested requests = 1,350
+Accepted requests  = 1,350
+Failed requests    = 0
+
+Final queue       = 0
+Final in-flight   = 0
+```
+
+Sender request latency:
+
+```text
+p50 = 1.890 ms
+p95 = 2.186 ms
+p99 = 2.293 ms
+max = 7.910 ms
+```
+
+Schedule lag:
+
+```text
+p50 = 0.157 ms
+p95 = 0.279 ms
+p99 = 0.298 ms
+max = 0.356 ms
+```
+
+### Collector → Backend Request Distribution
+
+Backend runtime 로그:
+
+```text
+450 spans  × 1
+900 spans  × 1
+1050 spans × 63
+```
+
+통계:
+
+```text
+Backend requests         = 65
+Received spans           = 67,500
+Average request size     = 1,038.46 spans
+Minimum request size     = 450
+Maximum request size     = 1,050
+```
+
+Sender가 50 Span 단위로 Collector에 데이터를 보내고 Collector `send_batch_size`가 1024이므로:
+
+```text
+20 × 50 = 1000
+21 × 50 = 1050
+```
+
+이 된다.
+
+1,125 spans/s에서는 1초 timeout 이전에 1024 threshold를 넘어가는 조건이 만들어지며 실제 Backend request 65개 중 63개가 1050 Span이었다.
+
+따라서 현재 workload에서는 Collector batch size threshold와 Sender input batch 단위가 결합되어 1050 Span이 주된 Backend request 크기로 형성되는 것을 runtime 데이터로 확인했다.
+
+### JDBC Batch Boundary
+
+Backend JDBC batch size:
+
+```text
+1000
+```
+
+Backend request 65개 중:
+
+```text
+below 1000 = 2
+equal 1000 = 0
+over 1000  = 63
+```
+
+이었다.
+
+현재 `JdbcSpanWriter` source의 chunking 로직을 적용하면 1050 Span request는:
+
+```text
+1000 + 50
+```
+
+두 JDBC chunk로 분리된다.
+
+계산된 처리 단위:
+
+```text
+estimated JDBC chunks       = 128
+estimated chunks/request    = 1.969
+```
+
+1,125 spans/s부터 Collector가 생성하는 대부분의 Backend request가 JDBC batch-size를 초과하면서 요청당 JDBC chunk 수가 사실상 두 개로 증가하는 경계에 진입했다.
+
+이는 실제 JDBC invocation counter가 아니라 현재 확인한 source chunking 로직과 runtime Backend request size를 기반으로 계산한 값이다.
+
+### Collector Queue Time-Series
+
+5초 sampling에서:
+
+```text
+t=15 → queue=1050, in_flight=1
+t=20 → queue=0
+
+t=30 → queue=1050, in_flight=1
+t=35 → queue=0
+
+t=45 → queue=1050, in_flight=1
+t=50 → queue=0
+
+t=55 → queue=1050, in_flight=1
+t=60 → queue=0
+```
+
+이 관찰됐다.
+
+queue가 1050→2100→3150처럼 시간에 따라 증가하지 않았으며 매번 다음 sample에서 정상적으로 0까지 drain됐다.
+
+accepted/sent counter에서도 queue가 관찰된 다음 구간에 exporter sent 증가량이 accepted 증가량보다 커져 backlog를 따라잡는 패턴이 반복됐다.
+
+따라서 현재 queue 현상은 지속적인 overload보다 한 Collector batch 수준의 주기적 pipeline handoff로 해석한다.
+
+### TimescaleDB CPU
+
+Full-rate 구간 t=10~60:
+
+```text
+average = 31.43%
+median  = 26.61%
+minimum = 25.91%
+maximum = 60.61%
+```
+
+1,000 spans/s의 재현성이 높았던 Run2/Run3 steady-state 평균 약 25.97%보다 평균 CPU는 증가했다.
+
+그러나 median은 26.61%였고 일부 높은 sample이 평균을 끌어올렸다.
+
+queue 발생 시점과 DB CPU peak도 지속적으로 일치하지 않았으므로 JDBC chunk 분할 또는 queue 발생을 DB CPU spike의 직접 원인이라고 아직 판단하지 않는다.
+
+### 결론
+
+1,125 spans/s synthetic sustained workload에서:
+
+- 67,500 Span 전량 저장
+- failed request 0
+- 최종 queue/in-flight drain
+- 지속 증가하는 queue 미관찰
+- 대부분의 Collector batch가 1050 Span으로 형성
+- Backend request 63/65가 JDBC batch-size 1000 초과
+- TimescaleDB steady CPU 증가 관찰
+
+을 확인했다.
+
+현재 결과는 처리 실패나 saturation을 나타내지 않지만, Collector batch와 JDBC batch 크기 불일치가 실제 JDBC chunk 수를 증가시키는 구간에 진입했으므로 이후 부하 단계에서도 DB CPU와 queue 추세를 계속 측정한다.
+

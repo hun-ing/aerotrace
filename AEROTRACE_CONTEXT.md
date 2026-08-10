@@ -1236,3 +1236,44 @@ Run2와 Run3의 t=10~60 TimescaleDB CPU 평균은 각각 약 25.88%, 26.06%로 �
 
 다음 sustained load 단계는 1,125 spans/s다.
 
+---
+
+### 1,125 spans/s Sustained Load
+
+1,125 spans/s를 60초 동안 유지하여 총 67,500 Span을 전량 저장했다.
+
+```text
+Observed rate = 1,125.00 spans/s
+DB            = 67,500 / 67,500
+Failed        = 0
+Final queue   = 0
+Final in-flight = 0
+```
+
+Collector → Backend runtime request:
+
+```text
+65 requests
+average = 1,038.46 spans/request
+
+1050-span request = 63 / 65
+```
+
+현재 Sender input batch 50과 Collector `send_batch_size=1024` 조합에서 21개의 sender batch가 합쳐지면 1050 Span이 되므로 실제 Collector output도 대부분 1050 Span으로 형성됐다.
+
+Backend JDBC batch-size는 1000이므로 현재 source 기준 1050-span Backend request는 1000 + 50 두 JDBC chunk로 분리된다.
+
+1,125 테스트의 계산 결과:
+
+```text
+Backend requests         = 65
+Requests > JDBC 1000     = 63
+Estimated JDBC chunks    = 128
+```
+
+Resource sampling에서는 1050-span queue가 간헐적으로 관찰됐지만 매번 다음 sample에서 0까지 drain되었으며 시간에 따라 누적되지는 않았다.
+
+1,125 spans/s는 현재 synthetic sustained workload에서 데이터 정합성과 최종 pipeline drain이 확인된 처리 범위다.
+
+다음 단계에서는 설정을 변경하지 않고 1,250 spans/s로 부하를 증가시켜 같은 1050-span batch 처리 빈도가 높아질 때 queue 및 TimescaleDB CPU 변화를 확인한다.
+

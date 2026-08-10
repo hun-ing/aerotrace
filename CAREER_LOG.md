@@ -948,3 +948,30 @@ OpenTelemetry telemetry 수집 파이프라인에 500→750→875 spans/s의 sus
 
 OpenTelemetry 수집 파이프라인에서 1,000 spans/s sustained workload를 3회 반복 검증하여 각 60,000 Span 전량 저장을 확인하고, 최초 실행에서 관찰된 queue 및 CPU spike를 후속 반복 실험과 steady-state CPU 분석으로 재검증해 단일 benchmark 결과의 과대해석을 방지
 
+---
+
+## Collector Batch와 JDBC Batch 경계의 실제 Runtime 분석
+
+1,125 spans/s sustained workload를 통해 Collector와 Backend의 서로 다른 batch 설정이 실제 runtime에서 어떻게 상호작용하는지 분석했다.
+
+Sender가 50 Span 단위로 telemetry를 보내고 Collector batch threshold가 1024인 환경에서 Backend runtime 로그를 분석한 결과 65개 Backend 요청 중 63개가 1050 Span으로 형성됐다.
+
+이는 20개의 sender batch는 1000 Span이지만 21개가 합쳐지는 순간 1050 Span이 되어 Collector threshold를 넘는 구조와 일치했다.
+
+Backend JDBC batch-size는 1000이므로 현재 source 기준 대부분의 1050-span request가 1000 + 50 두 JDBC chunk로 분리되는 경계에 진입했다.
+
+그럼에도 67,500 Span 전량 저장, failed request 0, 최종 queue drain을 확인했으며 queue가 시간에 따라 증가하지 않고 한 batch 수준에서 반복적으로 drain되는 것을 time-series로 검증했다.
+
+### 포트폴리오 포인트
+
+- 설정값만 읽지 않고 runtime request distribution으로 실제 batch 동작 검증
+- Sender batch 50, Collector threshold 1024, JDBC batch 1000의 상호작용 분석
+- Backend request size로부터 JDBC chunk 실행 단위를 계산
+- queue 존재와 지속적인 queue 증가를 구분
+- CPU 평균과 median을 함께 비교하여 순간 spike가 평균에 미치는 영향 분석
+- 설정 최적화를 서두르지 않고 실제 문제 발생 여부를 먼저 측정
+
+### 이력서 문장 후보
+
+OpenTelemetry 수집 파이프라인에서 1,125 spans/s sustained workload를 검증하고, Sender batch 50·Collector batch threshold 1024·JDBC batch 1000의 경계로 인해 Backend 요청 65개 중 63개가 1050 Span으로 형성되는 구조를 runtime 로그로 분석하여 실제 DB batch 처리 단위를 계측
+
