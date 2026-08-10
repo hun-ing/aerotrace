@@ -3715,3 +3715,117 @@ Estimated chunks/request    = 1.988
 
 현재 테스트 조건에서는 1,500 spans/s를 sustained throughput 한계로 판단할 근거가 없다.
 
+---
+
+## 2026-08-10 — 1,625 spans/s Sustained Load 재현성 검증
+
+### 테스트 조건
+
+```text
+Target rate     = 1,625 spans/s
+Duration        = 60 sec
+Expected spans  = 97,500
+Sender batch    = 50
+```
+
+동일한 설정과 workload로 2회 테스트했다.
+
+### 데이터 정합성
+
+두 실행 모두:
+
+```text
+Expected spans = 97,500
+DB final       = 97,500 / 97,500
+Failed         = 0
+Final queue    = 0
+Final in-flight = 0
+```
+
+으로 정상 완료됐다.
+
+### TimescaleDB CPU 재현성
+
+Full-rate 구간 t=10~60:
+
+```text
+1,500 spans/s
+average = 34.47%
+median  = 31.80%
+maximum = 50.75%
+
+1,625 Run1
+average = 44.65%
+median  = 41.21%
+maximum = 88.82%
+
+1,625 Run2
+average = 47.11%
+median  = 47.49%
+maximum = 70.45%
+```
+
+두 1,625 run의 average를 단순 평균하면 약 45.88%다.
+
+Run1의 88.82% maximum 자체는 Run2에서 재현되지 않았으므로 단일 peak를 saturation 증거로 사용하지 않는다.
+
+그러나 average와 median이 두 실행 모두 1,500 spans/s보다 명확하게 높은 수준으로 나타나 1,625 spans/s부터 TimescaleDB CPU 비용이 상승하는 현상은 재현된 것으로 판단한다.
+
+### Collector Queue
+
+Run2의 5초 sampling:
+
+```text
+t=10 → queue=1050
+t=15 → queue=0
+
+t=20 → queue=1050
+t=25 → queue=1050
+t=30 → queue=0
+
+t=40 → queue=1050
+t=45 → queue=1050
+t=50 → queue=0
+
+t=60 → queue=1050
+t=65 → queue=0
+```
+
+queue는 한 Collector batch 수준에서 일정 시간 유지되었지만 시간에 따라 계속 증가하지 않았으며 모든 backlog가 정상 drain됐다.
+
+따라서 현재 queue 패턴은 지속적인 exporter overload로 판단하지 않는다.
+
+Resource monitoring은 5초 sampling이며 각 구성 요소를 순차적으로 조회하기 때문에 짧은 transient queue와 구성 요소 간 정확한 event ordering은 이 데이터만으로 확정하지 않는다.
+
+### Sender
+
+Run2:
+
+```text
+Observed accepted rate = 1,625.00 spans/s
+
+Request latency
+p50 = 1.147 ms
+p95 = 2.066 ms
+p99 = 2.210 ms
+max = 9.901 ms
+
+Schedule lag
+p50 = 0.115 ms
+p95 = 0.277 ms
+p99 = 0.301 ms
+max = 5.096 ms
+```
+
+tail outlier는 있었지만 p95/p99 수준은 낮게 유지되어 sustained sender pacing 문제는 확인되지 않았다.
+
+### 결론
+
+1,625 spans/s는 동일 조건 두 차례 모두 데이터 정합성과 최종 pipeline drain에 성공했다.
+
+따라서 현재 synthetic workload에서 1,625 spans/s를 throughput saturation으로 판단하지 않는다.
+
+다만 TimescaleDB steady CPU 상승이 두 실행에서 재현됐으므로 1,625 spans/s부터 DB headroom 감소가 실제 성능 추세로 나타나는 구간으로 기록한다.
+
+아직 queue 누적, failed request, 데이터 유실 또는 지속 CPU saturation이 확인되지 않았으므로 batch 또는 DB 설정은 변경하지 않는다.
+

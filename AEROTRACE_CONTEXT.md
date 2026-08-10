@@ -1391,3 +1391,42 @@ Average request size = 1,046.51 spans
 
 다음 단계에서는 설정을 변경하지 않고 더 높은 load에서 queue 증가와 TimescaleDB CPU headroom을 계속 탐색한다.
 
+---
+
+### Sustained Ingest 검증 범위 — 1,625 spans/s
+
+1,625 spans/s × 60초 workload를 동일 조건으로 두 차례 검증했다.
+
+```text
+Run1 → 97,500 / 97,500 PASS
+Run2 → 97,500 / 97,500 PASS
+
+Failed = 0
+Final queue = 0
+Final in-flight = 0
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+1,500
+avg 34.47%
+median 31.80%
+
+1,625 Run1
+avg 44.65%
+median 41.21%
+
+1,625 Run2
+avg 47.11%
+median 47.49%
+```
+
+1,625에서 DB CPU 상승이 동일 조건 반복 테스트에서도 재현됐다.
+
+Collector queue는 한 1050-span batch 수준에서 간헐적으로 유지되다가 정상 drain됐으며 지속적으로 증가하는 backlog는 확인되지 않았다.
+
+현재 1,625 spans/s는 synthetic sustained workload에서 정상 처리된 범위지만, 이후 부하 단계에서는 TimescaleDB CPU headroom 감소를 주요 경계 신호로 취급한다.
+
+현재 설정 변경이나 성능 tuning은 수행하지 않는다.
+
