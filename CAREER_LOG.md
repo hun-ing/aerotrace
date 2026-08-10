@@ -1062,3 +1062,21 @@ AeroTrace의 sustained telemetry ingest를 1,625 spans/s까지 증가시킨 뒤 
 
 OpenTelemetry 수집 파이프라인을 1,625 spans/s까지 단계적으로 부하 테스트하고 동일 조건 반복 실험으로 97,500 Span 전량 저장을 검증하는 동시에 TimescaleDB steady CPU 상승을 재현하여 처리 한계와 자원 headroom 감소를 구분 분석
 
+---
+
+## 2,000 spans/s Sustained Telemetry Ingest 검증
+
+AeroTrace telemetry ingest를 설정 변경 없이 단계적으로 2,000 spans/s까지 증가시켜 60초 동안 총 120,000 Span 전량 저장을 검증했다.
+
+2,400개의 Sender OTLP request가 Collector batching을 거쳐 Backend에서는 115개 request로 감소했으며, 대부분의 Backend request가 1050 Span으로 형성됐다.
+
+Backend JDBC batch-size 1000 기준 대부분의 요청이 현재 source에서 1000 + 50 두 chunk로 처리되는 조건에서도 failed request와 Collector refused 없이 전체 데이터를 저장했다.
+
+1,875 spans/s부터 standing queue가 관찰됐지만 2,000 spans/s에서도 sampled queue가 1050보다 증가하지 않았고 반복적으로 0까지 drain되어 queue 존재와 실제 증가형 backlog를 분리해서 분석했다.
+
+TimescaleDB CPU는 약 50%대 수준까지 증가했지만 queue 증가, refused, 정합성 실패가 발생하지 않아 CPU 사용량만으로 saturation을 단정하지 않고 처리 성공·queue 추세·DB headroom을 함께 평가했다.
+
+### 이력서 문장 후보
+
+OpenTelemetry 기반 APM 수집 파이프라인을 synthetic sustained workload 기준 2,000 spans/s까지 단계적으로 검증하여 60초간 120,000 Span 전량 저장과 failed/refused 0을 확인하고, Collector queue·TimescaleDB CPU·실제 Backend/JDBC batch 동작을 계측해 처리 headroom을 분석
+

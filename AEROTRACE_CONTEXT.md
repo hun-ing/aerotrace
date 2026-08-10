@@ -1507,3 +1507,50 @@ TimescaleDB CPU는 변동성이 크며 Run2에서 Docker CPU 131.70% sample도 �
 
 현재 설정은 유지한다.
 
+---
+
+### Sustained Ingest 검증 범위 — 2,000 spans/s
+
+현재 synthetic sustained workload 검증 범위를 2,000 spans/s까지 확장했다.
+
+```text
+2,000 spans/s × 60 sec
+Expected = 120,000
+
+Accepted = 120,000
+DB       = 120,000 / 120,000
+Failed   = 0
+Refused  = 0
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+average = 56.00%
+median  = 53.24%
+maximum = 84.99%
+```
+
+2,000 spans/s에서는 DB가 대략 50%대 CPU 수준을 지속적으로 사용하는 구간에 진입했다.
+
+Collector queue는 초반 한 1050-span batch가 유지되는 구간이 있었지만 이후 반복적으로 0까지 drain됐고, 1050보다 큰 sampled queue는 관찰되지 않았다.
+
+따라서 현재까지 증가형 backlog 또는 sustained saturation은 확인되지 않았다.
+
+Backend runtime request:
+
+```text
+Backend requests = 115
+1050-span requests = 114
+Average request size = 1,043.48 spans
+```
+
+현재 source의 JDBC batch-size 1000 기준 estimated JDBC chunks는 229이다.
+
+현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 2,000 spans/s다.
+
+설정 tuning은 아직 수행하지 않는다.
+
