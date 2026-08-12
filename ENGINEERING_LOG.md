@@ -4827,3 +4827,96 @@ t=65 → 0
 설정 tuning은 아직 수행하지 않는다.
 
 ---
+
+## 2026-08-12 — 2,625 spans/s High-load 재현성 검증
+
+2,625 spans/s × 60초 sustained workload에서 첫 번째 실행의 DB CPU spike와 지속 standing queue 특성을 확인하기 위해 동일 조건으로 Repeat2를 수행했다.
+
+### 데이터 정합성
+
+두 실행 모두:
+
+```text
+Expected spans  = 157,500
+DB final        = 157,500 / 157,500
+Failed requests = 0
+Refused delta   = 0
+Final queue     = 0
+Final in-flight = 0
+```
+
+으로 정상 완료됐다.
+
+Observed sender rate 역시 두 실행 모두 2,625.00 spans/s였다.
+
+### TimescaleDB CPU
+
+Full-rate t=10~60:
+
+```text
+Run1
+average = 73.80%
+median  = 66.80%
+minimum = 63.31%
+maximum = 109.44%
+
+Run2
+average = 69.86%
+median  = 73.32%
+minimum = 60.68%
+maximum = 75.85%
+```
+
+Run1에서는 100% 이상의 CPU sample 두 개가 average를 높였고, Repeat2에서는 해당 spike가 재현되지 않았다.
+
+반면 Repeat2에서는 대부분의 full-rate sample이 약 60~76% 범위에 위치했고 median은 73.32%였다.
+
+따라서 2,625 spans/s에서는 TimescaleDB가 대체로 60~70%대 CPU를 사용하는 high-load 영역에 진입한 것으로 판단한다.
+
+다만 failed/refused 또는 데이터 정합성 실패가 없으므로 이를 sustained saturation으로 판단하지 않는다.
+
+### Collector Queue
+
+Run1에서는 5초 sampling 기준 t=5~60 동안 모든 sample에서 queue=1050이 관찰됐다.
+
+Repeat2에서는:
+
+```text
+t=5  → 1050
+t=10 → 0
+t=15 → 1050
+t=20 → 0
+t=25 → 1050
+t=30 → 0
+t=35 → 1050
+t=40 → 0
+t=45 → 1050
+t=50 → 0
+t=55 → 1050
+t=60 → 0
+```
+
+으로 한 batch 수준의 queue가 반복적으로 생성되고 drain되는 패턴이었다.
+
+따라서 Run1의 지속 standing queue 특성은 Repeat2에서 동일하게 재현되지 않았다.
+
+두 실행 모두 sampled queue는 1050을 넘지 않았고 시간에 따라 증가하는 backlog는 관찰되지 않았다.
+
+### 결론
+
+2,625 spans/s × 60초 workload를 동일 조건으로 2회 검증한 결과:
+
+- 두 실행 모두 157,500 Span 전량 저장
+- failed request 0
+- refused delta 0
+- 최종 queue/in-flight 정상 drain
+- sampled queue 최대 1050
+- growing backlog 미관찰
+- TimescaleDB는 대체로 60~70%대 CPU의 high-load 영역
+
+을 확인했다.
+
+따라서 2,625 spans/s는 현재 synthetic workload에서 high-load 영역이지만 sustained throughput ceiling은 아니다.
+
+설정 tuning은 아직 수행하지 않는다.
+

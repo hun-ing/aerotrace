@@ -1734,3 +1734,49 @@ Run1에서는 sampled queue=2100이 초반 한 번 관찰됐지만 즉시 drain�
 
 설정 tuning은 수행하지 않는다.
 
+---
+
+### Sustained Ingest 검증 범위 — 2,625 spans/s
+
+현재 synthetic sustained workload 검증 범위를 2,625 spans/s까지 확장했다.
+
+동일 조건 2회 수행:
+
+```text
+2,625 spans/s × 60 sec
+Expected = 157,500
+
+Run1 DB = 157,500 / 157,500
+Run2 DB = 157,500 / 157,500
+
+Failed  = 0
+Refused = 0
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+Run1
+average = 73.80%
+median  = 66.80%
+
+Run2
+average = 69.86%
+median  = 73.32%
+```
+
+2,625 spans/s에서는 TimescaleDB가 대체로 60~70%대 CPU를 사용하는 high-load 영역에 진입했다.
+
+Run1에서는 queue=1050이 전체 부하 구간에서 지속적으로 sampled됐지만 Repeat2에서는 1050과 0이 반복되었다.
+
+두 실행 모두 sampled queue는 1050을 넘지 않았으며 growing backlog는 확인되지 않았다.
+
+따라서 현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 2,625 spans/s다.
+
+2,625 spans/s를 sustained throughput ceiling으로 판단할 증거는 아직 없다.
+
+설정 tuning은 수행하지 않는다.
+
