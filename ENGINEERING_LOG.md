@@ -5179,3 +5179,124 @@ Python 문법 검증                  PASS
 
 향후 sustained-load DB CPU 분석은 `scripts/summarize-sustained-db-cpu.py`를 기준으로 수행하고, 기대 sampling slot이 모두 존재할 때만 CPU 통계를 유효한 결과로 사용한다.
 
+---
+
+## 2026-08-12 — 2,875 spans/s High-load 재현성 검증
+
+2,875 spans/s × 60초 첫 실행에서 TimescaleDB CPU가 높은 수준으로 유지되고 transient queue=2100이 관찰되어 동일 조건으로 Repeat2를 수행했다.
+
+### 데이터 정합성
+
+두 실행 모두:
+
+```text
+Expected spans  = 172,500
+DB final        = 172,500 / 172,500
+Failed requests = 0
+Refused delta   = 0
+Final queue     = 0
+Final in-flight = 0
+Observed rate   = 2,875.00 spans/s
+```
+
+으로 정상 완료됐다.
+
+### TimescaleDB CPU 재현성
+
+검증된 `scripts/summarize-sustained-db-cpu.py`를 사용해 full-rate t=10~60의 11개 sampling slot을 집계했다.
+
+```text
+Run1
+average = 80.79%
+median  = 75.80%
+minimum = 70.45%
+maximum = 135.41%
+
+Run2
+average = 78.88%
+median  = 77.22%
+minimum = 74.27%
+maximum = 87.10%
+```
+
+두 실행 전체 22개 sample의 참고 통계:
+
+```text
+average = 79.84%
+median  = 76.62%
+```
+
+Run1에는 135.41%의 높은 단일 sample이 있었지만 Repeat2에서는 모든 full-rate sample이 74.27~87.10% 범위에 위치했다.
+
+따라서 2,875 spans/s에서 TimescaleDB가 대체로 75~80% 수준의 CPU를 지속적으로 사용하는 high-load 특성은 동일 조건 반복에서도 재현된 것으로 판단한다.
+
+### Collector Queue
+
+Run1에서는 t=50에서 queue=2100이 한 번 관찰됐지만 다음 sample에서 1050으로 감소했고 최종 drain됐다.
+
+Repeat2에서는 sampled queue 최대값이 1050이었다.
+
+```text
+t=10 → 1050
+t=15 → 1050
+t=20 → 0
+t=25 → 1050
+t=30 → 1050
+t=35 → 0
+t=40 → 1050
+t=45 → 1050
+t=50 → 0
+t=55 → 1050
+t=60 → 1050
+```
+
+따라서:
+
+```text
+queue=2100 transient      1/2 run
+2100 연속 유지            0/2 run
+growing backlog           0/2 run
+final drain               2/2 run
+```
+
+으로 확인됐다.
+
+DB CPU headroom은 크게 감소했지만 Collector exporter queue가 시간에 따라 증가하는 sustained throughput saturation은 아직 확인되지 않았다.
+
+### Sender Tail Outlier
+
+Repeat2 sender:
+
+```text
+Request latency
+p50 = 0.733 ms
+p95 = 1.756 ms
+p99 = 2.042 ms
+max = 105.549 ms
+
+Schedule lag
+p99 = 0.273 ms
+max = 89.303 ms
+```
+
+max latency와 schedule lag에서 단일 큰 tail 값이 관찰됐지만 p95/p99는 낮은 수준을 유지했고 failed request 없이 목표 2,875 spans/s pacing을 달성했다.
+
+따라서 현재는 지속적인 sender saturation이 아니라 tail outlier로 기록한다.
+
+### 결론
+
+2,875 spans/s × 60초 workload를 동일 조건으로 2회 검증한 결과:
+
+- 두 실행 모두 172,500 Span 전량 저장
+- failed request 0
+- refused delta 0
+- 최종 queue/in-flight 정상 drain
+- growing Collector backlog 미관찰
+- TimescaleDB CPU 약 75~80% high-load 특성 재현
+
+을 확인했다.
+
+2,875 spans/s는 현재 synthetic workload에서 명확한 high-load 영역이지만 sustained throughput ceiling으로 판단할 증거는 아직 없다.
+
+다음 부하 단계에서는 DB headroom과 queue 성장 여부를 더욱 엄격하게 확인하며, 지속 queue 증가 또는 처리 실패가 관찰되면 추가 rate 상승을 중단한다.
+

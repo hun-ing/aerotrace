@@ -1863,3 +1863,42 @@ full-rate sample 하나를 제거한 failure test에서는 missing slot을 탐�
 
 향후 sustained ingest 성능 테스트의 DB CPU 통계는 이 분석 스크립트를 기준으로 사용한다.
 
+---
+
+### Sustained Ingest 검증 범위 — 2,875 spans/s
+
+2,875 spans/s × 60초 synthetic sustained workload를 동일 조건으로 2회 검증했다.
+
+```text
+Run1 DB = 172,500 / 172,500
+Run2 DB = 172,500 / 172,500
+
+Failed  = 0
+Refused = 0
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+Run1
+average = 80.79%
+median  = 75.80%
+
+Run2
+average = 78.88%
+median  = 77.22%
+```
+
+2,875 spans/s에서는 TimescaleDB가 대체로 75~80% CPU의 high-load 영역에서 동작하는 현상이 재현됐다.
+
+Run1에서 queue=2100이 transient하게 한 번 관찰됐지만 Repeat2에서는 sampled queue 최대값이 1050이었고, 두 실행 모두 시간에 따라 증가하는 backlog는 확인되지 않았다.
+
+따라서 현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 2,875 spans/s다.
+
+DB headroom은 상당히 감소했지만 2,875 spans/s를 sustained throughput ceiling으로 판단할 증거는 아직 없다.
+
+설정 tuning은 아직 수행하지 않는다.
+
