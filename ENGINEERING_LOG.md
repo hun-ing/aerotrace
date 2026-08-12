@@ -5083,3 +5083,99 @@ Estimated chunks per request = 1.994
 
 또한 timestamp 기반 full-rate sample 경계 조건에서 sample이 누락될 수 있는 측정 도구 문제를 발견했으며 이후 분석 시 sampling slot을 반올림해 처리한다.
 
+---
+
+## 2026-08-12 — Sustained Load DB CPU 분석 경계 오류 수정
+
+2,750 spans/s sustained-load 결과를 분석하는 과정에서 time-series에는 t=10~60 구간의 sample이 11개 존재했지만 기존 CPU 요약 결과는 `full_rate_samples=10`으로 계산되는 문제를 발견했다.
+
+### 원인
+
+기존 분석은 첫 resource sample과의 실제 timestamp 차이를 사용해 다음과 같이 full-rate 구간을 선택했다.
+
+```python
+if 10 <= sec <= 60:
+```
+
+resource monitor는 목표 sampling 시각을 기준으로 동작하지만 실제 timestamp에는 수 ms 수준의 scheduling drift가 존재할 수 있다.
+
+따라서 화면상 반올림 결과가 `t=60`으로 보이는 sample도 실제 elapsed time이 예를 들어 `60.002`초이면 위 조건에서 제외될 수 있었다.
+
+이 문제 때문에 DB CPU average와 median을 계산할 때 마지막 full-rate sample이 누락될 수 있었다.
+
+### 개선
+
+다음 재사용 분석 스크립트를 추가했다.
+
+```text
+scripts/summarize-sustained-db-cpu.py
+```
+
+스크립트는 실제 elapsed timestamp를 가장 가까운 sampling interval slot으로 정규화한다.
+
+예:
+
+```text
+10.003 sec → t=10
+14.999 sec → t=15
+60.002 sec → t=60
+```
+
+또한 기대하는 full-rate slot 중 하나라도 존재하지 않을 경우 부분 데이터로 통계를 계산하지 않고 non-zero exit code로 종료하도록 했다.
+
+기본 full-rate slots:
+
+```text
+10,15,20,25,30,35,40,45,50,55,60
+```
+
+### 기존 2,750 spans/s 데이터 재검증
+
+대상:
+
+```text
+benchmark-results/sustained-20260812T003946Z/resources.tsv
+```
+
+결과:
+
+```text
+full_rate_slots=10,15,20,25,30,35,40,45,50,55,60
+full_rate_samples=11
+db_cpu_avg=71.53%
+db_cpu_median=70.48%
+db_cpu_min=65.90%
+db_cpu_max=81.02%
+```
+
+기존 분석에서 누락됐던 t=60 sample까지 포함해 총 11개 full-rate sample이 정상 집계됐다.
+
+### 누락 검출 테스트
+
+기존 resource 데이터의 full-rate sample 하나를 임시 파일에서 제거한 후 분석 스크립트를 실행했다.
+
+결과:
+
+```text
+missing full-rate sampling slots: t=10
+Exit code: 2
+```
+
+sample 누락 시 부분 데이터로 잘못된 통계를 생성하지 않고 명시적으로 실패하는 것을 확인했다.
+
+### 완료 조건
+
+```text
+Python 문법 검증                  PASS
+정상 데이터 11개 slot 집계       PASS
+2,750 CPU 통계 재현              PASS
+누락 sample 검출                 PASS
+누락 시 non-zero 종료            PASS
+```
+
+### 운영/성능 측정 의미
+
+성능 테스트에서는 서비스 자체의 처리 오류뿐 아니라 측정 도구의 경계조건 오류도 잘못된 capacity 판단을 만들 수 있다.
+
+향후 sustained-load DB CPU 분석은 `scripts/summarize-sustained-db-cpu.py`를 기준으로 수행하고, 기대 sampling slot이 모두 존재할 때만 CPU 통계를 유효한 결과로 사용한다.
+

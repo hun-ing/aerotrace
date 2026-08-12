@@ -1829,3 +1829,37 @@ Average request size = 1,044.30 spans
 
 설정 tuning은 아직 수행하지 않는다.
 
+---
+
+### Sustained Load CPU 분석 도구
+
+DB CPU sustained-load 분석용 스크립트:
+
+```text
+scripts/summarize-sustained-db-cpu.py
+```
+
+기존 timestamp 직접 범위 비교 방식에서 sampling drift 때문에 화면상 t=60인 sample이 full-rate 통계에서 누락될 수 있는 문제를 수정했다.
+
+현재 분석 방식:
+
+- 실제 elapsed timestamp를 sampling interval slot으로 정규화
+- 기본 full-rate 구간 t=10~60
+- 5초 간격 총 11개 sample 기대
+- expected slot 누락 시 통계 생성을 중단하고 non-zero exit
+- 부분 데이터로 average/median을 조용히 계산하지 않음
+
+2,750 spans/s 기존 benchmark 데이터로 검증:
+
+```text
+full_rate_samples = 11
+DB CPU average    = 71.53%
+DB CPU median     = 70.48%
+DB CPU minimum    = 65.90%
+DB CPU maximum    = 81.02%
+```
+
+full-rate sample 하나를 제거한 failure test에서는 missing slot을 탐지하고 exit code 2로 종료하는 것을 확인했다.
+
+향후 sustained ingest 성능 테스트의 DB CPU 통계는 이 분석 스크립트를 기준으로 사용한다.
+
