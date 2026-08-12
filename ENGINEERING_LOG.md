@@ -4920,3 +4920,166 @@ t=60 → 0
 
 설정 tuning은 아직 수행하지 않는다.
 
+---
+
+## 2026-08-12 — 2,750 spans/s Sustained Load 검증
+
+### 테스트 조건
+
+```text
+Target rate      = 2,750 spans/s
+Duration         = 60 sec
+Expected spans   = 165,000
+Sender batch     = 50
+Sender requests  = 3,300
+```
+
+### 데이터 정합성
+
+```text
+Observed rate      = 2,750.00 spans/s
+
+Requested spans    = 165,000
+Accepted spans     = 165,000
+DB final           = 165,000 / 165,000
+
+Requested requests = 3,300
+Accepted requests  = 3,300
+Failed requests    = 0
+
+Refused delta      = 0
+Final queue        = 0
+Final in-flight    = 0
+```
+
+서비스 restart 증가는 관찰되지 않았다.
+
+### Sender
+
+```text
+Request latency
+p50 = 0.731 ms
+p95 = 1.831 ms
+p99 = 2.030 ms
+max = 4.539 ms
+
+Schedule lag
+p50 = 0.098 ms
+p95 = 0.263 ms
+p99 = 0.276 ms
+max = 2.332 ms
+```
+
+2,750 spans/s에서도 sender pacing 또는 request latency의 지속적인 악화는 관찰되지 않았다.
+
+### DB CPU 분석 구간 오류 발견
+
+기존 DB CPU 분석 명령은 실제 timestamp 차이를 사용해:
+
+```python
+if 10 <= sec <= 60:
+```
+
+조건으로 full-rate sample을 선택했다.
+
+resource monitor의 실제 timestamp가 목표 시각에서 수 ms 벗어날 수 있기 때문에 화면상 `t=60`으로 출력된 sample도 실제 `sec`가 60을 약간 초과하면 분석에서 제외될 수 있다.
+
+2,750 테스트에서 time-series에는 t=10~60 총 11개 sample이 있었지만 기존 요약은 `full_rate_samples=10`으로 출력되어 이 문제가 확인됐다.
+
+향후 분석에서는 sampling 시각을 intended 5-second slot으로 반올림한 뒤 full-rate 구간을 선택한다.
+
+2,750 테스트의 실제 표시된 t=10~60 11개 sample 기준 TimescaleDB CPU는:
+
+```text
+samples = 11
+average = 71.53%
+median  = 70.48%
+minimum = 65.90%
+maximum = 81.02%
+```
+
+이다.
+
+이번 테스트에서는 모든 full-rate sample이 약 66~81% 범위에 위치해 TimescaleDB가 지속적인 high-load 영역에서 동작한 것으로 관찰됐다.
+
+그러나 직전 2,625 Repeat2의 average 69.86%, median 73.32%와 비교하면 workload 증가에 따라 DB CPU가 단순 선형 증가한다고 판단할 수는 없다.
+
+### Collector Queue
+
+5초 sampling:
+
+```text
+t=5  → 1050
+t=10 → 1050
+t=15 → 1050
+t=20 → 1050
+
+t=25 → 0
+t=30 → 0
+
+t=35 → 1050
+t=40 → 1050
+t=45 → 1050
+t=50 → 1050
+t=55 → 1050
+t=60 → 1050
+
+t=65 → 0
+```
+
+sampled queue 최대값은 1050이었다.
+
+2100 이상의 queue가 연속 유지되거나 시간에 따라 3150, 4200 등으로 증가하는 패턴은 관찰되지 않았다.
+
+따라서 2,750 spans/s에서도 growing exporter backlog는 확인되지 않았다.
+
+### Backend / JDBC Batch
+
+Backend runtime request:
+
+```text
+150 spans  × 1
+1050 spans × 157
+```
+
+통계:
+
+```text
+Backend requests     = 158
+Received spans       = 165,000
+Average request size = 1,044.30
+
+Requests below 1000 = 1
+Requests equal 1000 = 0
+Requests over 1000  = 157
+```
+
+현재 source의 JDBC batch-size 1000 기준:
+
+```text
+Estimated JDBC chunks        = 315
+Estimated chunks per request = 1.994
+```
+
+대부분의 request가 1050 Span으로 유지되어 기존 Collector/JDBC batch 패턴의 구조적인 변화는 확인되지 않았다.
+
+### 결론
+
+2,750 spans/s × 60초 synthetic sustained workload에서:
+
+- 165,000 Span 전량 저장
+- failed request 0
+- refused delta 0
+- 최종 queue/in-flight 정상 drain
+- sampled queue 최대 1050
+- growing backlog 미관찰
+- TimescaleDB CPU average 71.53%
+- TimescaleDB CPU median 70.48%
+- 서비스 restart 증가 없음
+
+을 확인했다.
+
+따라서 2,750 spans/s는 현재 synthetic workload에서 정상 처리 가능한 high-load 영역이며 아직 sustained throughput ceiling으로 판단할 증거는 없다.
+
+또한 timestamp 기반 full-rate sample 경계 조건에서 sample이 누락될 수 있는 측정 도구 문제를 발견했으며 이후 분석 시 sampling slot을 반올림해 처리한다.
+

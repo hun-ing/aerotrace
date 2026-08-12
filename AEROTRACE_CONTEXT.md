@@ -1780,3 +1780,52 @@ Run1에서는 queue=1050이 전체 부하 구간에서 지속적으로 sampled�
 
 설정 tuning은 수행하지 않는다.
 
+---
+
+### Sustained Ingest 검증 범위 — 2,750 spans/s
+
+현재 synthetic sustained workload 검증 범위를 2,750 spans/s까지 확장했다.
+
+```text
+2,750 spans/s × 60 sec
+Expected = 165,000
+
+Accepted = 165,000
+DB       = 165,000 / 165,000
+Failed   = 0
+Refused  = 0
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+samples = 11
+average = 71.53%
+median  = 70.48%
+minimum = 65.90%
+maximum = 81.02%
+```
+
+DB는 약 70% CPU 수준의 high-load 영역에서 동작했지만 sampled queue는 최대 1050이었고 지속적으로 증가하는 backlog는 확인되지 않았다.
+
+Backend runtime request:
+
+```text
+Backend requests = 158
+1050-span requests = 157
+Average request size = 1,044.30 spans
+```
+
+현재 source의 JDBC batch-size 1000 기준 estimated JDBC chunks는 315이다.
+
+현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 2,750 spans/s다.
+
+2,750 spans/s를 sustained throughput ceiling으로 판단할 증거는 아직 없다.
+
+성능 분석 중 timestamp 경계 조건 때문에 화면상 t=60 sample이 full-rate CPU 요약에서 제외될 수 있는 문제를 발견했다. 향후 full-rate 분석은 sampling slot을 반올림한 후 수행한다.
+
+설정 tuning은 아직 수행하지 않는다.
+
