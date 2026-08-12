@@ -4703,3 +4703,127 @@ DB saturation      미확인
 
 따라서 아직 tuning은 수행하지 않지만, 이후 부하 상승 폭을 더 줄이고 DB CPU와 queue 성장 여부를 엄격하게 관찰한다.
 
+---
+
+## 2026-08-12 — 2,500 spans/s Sustained Load 재현성 검증
+
+2,500 spans/s × 60초 첫 테스트에서 이전 단계와 다른 신호인 sampled queue=2100과 높은 TimescaleDB CPU가 관찰되어 동일 조건으로 두 번째 테스트를 수행했다.
+
+### 데이터 정합성
+
+두 실행 모두:
+
+```text
+Expected spans  = 150,000
+DB final        = 150,000 / 150,000
+Failed requests = 0
+Refused delta   = 0
+Final queue     = 0
+Final in-flight = 0
+```
+
+으로 정상 완료됐다.
+
+Observed sender rate도 두 실행 모두 2,500.00 spans/s였다.
+
+### TimescaleDB CPU 재현성
+
+Full-rate t=10~60:
+
+```text
+Run1
+average = 72.69%
+median  = 69.79%
+minimum = 59.16%
+maximum = 104.50%
+
+Run2
+average = 64.03%
+median  = 64.17%
+minimum = 53.66%
+maximum = 74.80%
+```
+
+Run1에서 관찰된 약 70% 이상의 DB CPU 수준은 동일 조건 Repeat2에서는 재현되지 않았다.
+
+직전 2,375 spans/s 결과는:
+
+```text
+Run1 average = 66.53%
+Run1 median  = 65.80%
+
+Run2 average = 65.80%
+Run2 median  = 65.99%
+```
+
+였으므로, 현재 측정만으로 workload 증가와 DB CPU 사용량 사이에 단순한 선형 관계가 있다고 판단하지 않는다.
+
+5초 간격의 container resource sampling과 실제 서버의 background activity 및 workload timing에 따른 run-to-run variation을 고려해야 한다.
+
+### Collector Queue
+
+Run1에서는 테스트 초반:
+
+```text
+t=5  → queue=2100
+t=10 → queue=0
+```
+
+이 관찰됐다.
+
+이는 현재까지 처음 관찰된 two-batch 수준의 sampled queue였지만 즉시 drain됐고 이후 증가하지 않았다.
+
+Repeat2에서는:
+
+```text
+t=5  → 1050
+t=10 → 1050
+t=15 → 1050
+t=20 → 1050
+
+t=25 → 0
+t=30 → 0
+t=35 → 0
+
+t=40 → 1050
+t=45 → 1050
+t=50 → 1050
+t=55 → 1050
+t=60 → 1050
+
+t=65 → 0
+```
+
+으로 최대 sampled queue는 1050이었다.
+
+따라서 Run1의 queue=2100은 동일 조건에서 재현되지 않았다.
+
+두 실행 모두:
+
+```text
+1050 → 2100 → 3150 → ...
+```
+
+처럼 시간에 따라 성장하는 backlog는 관찰되지 않았으며 최종 queue/in-flight는 정상 drain됐다.
+
+### 결론
+
+2,500 spans/s × 60초 workload를 동일 조건으로 2회 검증한 결과:
+
+- 두 실행 모두 150,000 Span 전량 저장
+- failed request 0
+- refused delta 0
+- 최종 queue/in-flight 정상 drain
+- growing backlog 미관찰
+- Run1의 queue=2100은 Repeat2에서 미재현
+- DB CPU는 run 간 변동 존재
+
+를 확인했다.
+
+따라서 2,500 spans/s는 현재 synthetic workload에서 정상 처리 가능한 범위로 확인됐지만 sustained throughput ceiling으로 판단할 근거는 없다.
+
+또한 단일 benchmark의 순간 CPU 또는 queue 관찰값을 capacity 경계로 단정하지 않고 동일 조건 반복 측정으로 재현성을 확인해야 한다는 점을 실제 측정으로 검증했다.
+
+설정 tuning은 아직 수행하지 않는다.
+
+---

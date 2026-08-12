@@ -1688,3 +1688,49 @@ Collector queue는 한 1050-span batch 수준으로 반복적으로 유지됐지
 
 설정 tuning은 아직 수행하지 않는다.
 
+---
+
+### Sustained Ingest 검증 범위 — 2,500 spans/s
+
+현재 synthetic sustained workload 검증 범위를 2,500 spans/s까지 확장했다.
+
+동일 조건으로 2회 수행:
+
+```text
+2,500 spans/s × 60 sec
+Expected = 150,000
+
+Run1 DB = 150,000 / 150,000
+Run2 DB = 150,000 / 150,000
+
+Failed  = 0
+Refused = 0
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+Run1
+average = 72.69%
+median  = 69.79%
+
+Run2
+average = 64.03%
+median  = 64.17%
+```
+
+DB CPU는 동일 workload에서도 의미 있는 run-to-run variation이 관찰됐다.
+
+Run1에서는 sampled queue=2100이 초반 한 번 관찰됐지만 즉시 drain됐으며 Repeat2에서는 sampled queue 최대값이 1050이었다.
+
+두 실행 모두 지속적으로 증가하는 Collector backlog는 확인되지 않았다.
+
+따라서 현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 2,500 spans/s다.
+
+2,500 spans/s를 sustained throughput ceiling으로 판단할 증거는 아직 없다.
+
+설정 tuning은 수행하지 않는다.
+
