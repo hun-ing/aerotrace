@@ -1956,3 +1956,56 @@ saturation           미확인
 
 설정 tuning은 아직 수행하지 않는다.
 
+---
+
+### Sustained Ingest 검증 범위 — 3,125 spans/s
+
+3,125 spans/s × 60초 synthetic sustained workload를 동일 조건으로 2회 검증했다.
+
+```text
+Run1 DB = 187,500 / 187,500
+Run2 DB = 187,500 / 187,500
+
+Failed        = 0
+Refused       = 0
+Restart 증가 = 없음
+
+Final queue     = 0
+Final in-flight = 0
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+Run1
+average = 84.31%
+median  = 82.37%
+
+Run2
+average = 88.73%
+median  = 84.54%
+```
+
+Repeat2에는 127.11%의 단일 높은 CPU sample이 있었지만 이를 제외한 보조 통계에서도 average 약 84.89%, median 약 84.21%로 나타났다.
+
+따라서 3,125 spans/s에서 TimescaleDB가 지속적으로 80%대 CPU를 사용하는 high-load 특성이 재현됐다.
+
+Collector queue는 Run1에서 전체 부하 구간 동안 1050이 유지됐고 Repeat2에서는 대부분의 구간에서 1050이었지만 일부 sample에서 0으로 drain됐다.
+
+두 실행 모두 queue가 2100 이상으로 증가하거나 시간에 따라 성장하는 현상은 없었다.
+
+현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 3,125 spans/s다.
+
+```text
+데이터 정합성        2/2 PASS
+DB high-load         재현
+one-batch queue      빈번하게 관찰
+queue >= 2100        미관찰
+growing backlog      미관찰
+saturation           미확인
+```
+
+이는 최대 처리량 또는 production capacity를 의미하지 않는다.
+
+설정 tuning은 아직 수행하지 않으며 작은 증가폭으로 ceiling 탐색을 계속한다.
+
