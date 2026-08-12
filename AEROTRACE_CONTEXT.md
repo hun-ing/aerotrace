@@ -2009,3 +2009,43 @@ saturation           미확인
 
 설정 tuning은 아직 수행하지 않으며 작은 증가폭으로 ceiling 탐색을 계속한다.
 
+---
+
+### Sustained Ingest 고부하 경계 — 3,250 spans/s
+
+3,250 spans/s × 60초 synthetic sustained workload를 총 3회 검증했다.
+
+세 실행 모두:
+
+- 195,000 / 195,000 Span 저장
+- failed request 0
+- Collector refused 0
+- 서비스 restart 증가 없음
+- 최종 queue/in-flight 정상 drain
+
+을 확인했다.
+
+TimescaleDB full-rate CPU median:
+
+- Run1: 91.25%
+- Run2: 89.00%
+- Run3: 89.27%
+
+따라서 3,250 spans/s에서 TimescaleDB가 약 90% 수준 CPU를 사용하는 high-load 특성이 3/3 재현됐다.
+
+Collector queue는 Run1에서 최대 3150 및 연속 `3150 → 2100`이 관찰됐지만 Run2와 Run3에서는 최대 1050으로 재현되지 않았다.
+
+현재 판단:
+
+- 검증된 최고 synthetic 60초 rate: 3,250 spans/s
+- DB high-load: 3/3 재현
+- multi-batch queue 경계 신호: 1/3
+- growing backlog: 미확인
+- 데이터 정합성: 3/3 PASS
+- sustained saturation: 미확정
+- production capacity: 미측정
+
+사전에 정의한 queue 경계 조건이 한 번 발생했고 DB headroom도 상당히 감소했으므로 더 높은 rate 탐색은 중단한다.
+
+다음 단계는 설정 변경 없이 3,250 spans/s에서 Collector, Backend, JDBC, TimescaleDB를 분리 측정해 실제 병목 위치를 확인하는 것이다.
+

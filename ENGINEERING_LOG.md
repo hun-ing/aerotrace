@@ -5588,3 +5588,131 @@ Run1과 Repeat2 모두 max latency/schedule lag에서 순간적인 tail 값은 �
 
 향후 queue >= 2100이 연속 sample에서 유지되거나 시간에 따라 증가할 경우 rate 상승을 중단하고 Collector → Backend → JDBC → TimescaleDB 경로의 병목 분석으로 전환한다.
 
+---
+
+## 2026-08-12 — 3,250 spans/s 고부하 경계 3회 검증
+
+3,250 spans/s × 60초 synthetic sustained workload를 총 3회 실행해 고부하 경계 신호의 재현성을 검증했다.
+
+결과 디렉터리:
+
+- Run1: `sustained-20260812T022108Z`
+- Run2: `sustained-20260812T030219Z`
+- Run3: `sustained-20260812T031142Z`
+
+### 데이터 정합성
+
+세 실행 모두:
+
+- Expected spans: 195,000
+- DB final: 195,000 / 195,000
+- Failed requests: 0
+- Refused delta: 0
+- Final queue: 0
+- Final in-flight: 0
+- Backend/Collector/DB restart 증가 없음
+
+으로 정상 완료됐다.
+
+따라서 3,250 spans/s workload를 60초 동안 처리하는 동안 데이터 유실이나 요청 실패는 관찰되지 않았다.
+
+### TimescaleDB CPU
+
+검증된 `scripts/summarize-sustained-db-cpu.py`를 사용해 각 실행의 t=10~60 full-rate sample 11개를 집계했다.
+
+Run1:
+
+- average: 95.68%
+- median: 91.25%
+- min: 58.12%
+- max: 154.07%
+
+Run2:
+
+- average: 91.31%
+- median: 89.00%
+- min: 85.74%
+- max: 114.59%
+
+Run3:
+
+- average: 91.32%
+- median: 89.27%
+- min: 84.88%
+- max: 112.27%
+
+3회 전체 33개 full-rate sample의 참고 통계:
+
+- average: 92.77%
+- median: 89.27%
+- min: 58.12%
+- max: 154.07%
+
+multi-core CPU spike 때문에 average가 영향을 받을 수 있으므로 각 실행의 median을 주요 판단 지표로 사용한다.
+
+Run1 91.25%, Run2 89.00%, Run3 89.27%로 TimescaleDB가 약 90% 수준의 CPU를 사용하는 high-load 특성은 3/3 재현됐다.
+
+### Collector Queue
+
+Run1에서는 sampled queue가 최대 3150까지 증가했으며 다음과 같은 연속 multi-batch queue가 관찰됐다.
+
+`3150 → 2100`
+
+이는 사전에 정한 추가 rate 상승 중단 조건인 `queue >= 2100` 연속 sample 조건을 충족했다.
+
+그러나 Run2와 Run3에서는 sampled queue 최대값이 각각 1050이었으며 queue >= 2100은 재현되지 않았다.
+
+따라서:
+
+- multi-batch queue 경계 신호: 1/3
+- queue >= 2100 연속: 1/3
+- growing backlog: 미확인
+- final drain: 3/3 성공
+
+으로 판단한다.
+
+Run1의 경계 신호를 sustained saturation으로 확정할 수는 없지만 무시할 수도 없으므로, 더 높은 rate 탐색 대신 병목 분리 측정으로 전환한다.
+
+### Sender
+
+Run1:
+
+- request latency p99: 113.203 ms
+- schedule lag p99: 661.332 ms
+
+Run2:
+
+- request latency p99: 1.925 ms
+- schedule lag p99: 0.258 ms
+
+Run3:
+
+- request latency p99: 1.856 ms
+- schedule lag p99: 0.263 ms
+
+Run1에서 발생한 sender scheduling stall은 Run2와 Run3에서는 재현되지 않았다.
+
+따라서 지속적인 sender saturation으로 판단하지 않는다.
+
+### 결론
+
+현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 3,250 spans/s다.
+
+단, 이는 최대 처리량이나 production capacity를 의미하지 않는다.
+
+3,250 spans/s에서:
+
+- 195,000 Span 전량 저장 3/3
+- failed/refused 0
+- 최종 drain 3/3
+- DB CPU 약 90% high-load 3/3
+- multi-batch queue 경계 신호 1/3
+
+이 확인됐다.
+
+DB headroom이 상당히 감소했고 사전에 정의한 queue 경계 조건이 한 번 발생했으므로 추가 rate 상승은 중단한다.
+
+다음 단계에서는 3,250 spans/s 부하를 기준으로 Collector → Backend → JDBC → TimescaleDB 경로를 분리 측정하여 실제 병목 위치를 확인한다.
+
+측정 전 설정 tuning은 수행하지 않는다.
+

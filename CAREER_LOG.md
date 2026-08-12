@@ -1098,3 +1098,25 @@ TimescaleDB는 약 80% 전후 CPU의 high-load 영역에 진입했고 Collector�
 
 제한된 서버 환경에서 OpenTelemetry APM 수집 파이프라인의 sustained 부하를 단계적으로 측정하고 동일 조건 반복 검증을 수행해 synthetic workload 기준 3,000 spans/s에서 60초간 180,000 Span 전량 저장과 failed/refused 0을 확인했으며, TimescaleDB CPU·Collector queue·JDBC batch를 계측해 데이터 정합성을 유지한 상태에서의 실제 처리 headroom을 분석
 
+---
+
+## 성능 한계 탐색 — 3,250 spans/s 고부하 경계
+
+synthetic sustained telemetry ingest 부하를 단계적으로 증가시키고 동일 조건 반복 측정을 통해 3,250 spans/s까지 검증했다.
+
+3,250 spans/s × 60초 테스트를 3회 수행해 매 실행 195,000 Span 전량 저장, failed/refused 0, 최종 queue drain을 확인했다.
+
+단순히 성공 여부만 확인하지 않고 TimescaleDB CPU, Collector queue, sender latency와 scheduling lag, JDBC batch 구조를 함께 측정했다.
+
+TimescaleDB CPU median이 3회 모두 약 89~91% 수준으로 재현됐고, 한 실행에서는 Collector queue가 3150 → 2100으로 연속 유지되는 경계 신호가 발생했다.
+
+해당 queue 현상과 sender stall이 다른 두 실행에서는 재현되지 않았기 때문에 이를 즉시 최대 처리량으로 단정하지 않고, 동시에 높은 DB CPU와 사전에 정의한 중단 기준을 고려해 추가 rate 상승을 중단하고 병목 분리 측정 단계로 전환했다.
+
+포트폴리오 핵심 포인트:
+
+- benchmark 완료 조건을 DB count + Collector queue/in-flight drain으로 정의
+- 동일 조건 반복 실행으로 일시적 spike와 재현 가능한 현상 구분
+- 평균뿐 아니라 median 및 time-series 기반으로 고부하 상태 판단
+- 측정 결과 없이 tuning하지 않고 baseline을 먼저 확보
+- 처리 성공률과 실제 시스템 headroom을 구분
+
