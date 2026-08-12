@@ -50,8 +50,16 @@ public class OtlpTraceController {
           @RequestBody
           JsonNode request
   ) {
+    long parseStartedAt = System.nanoTime();
+
     ParsedTraceRequest parsedRequest =
             requestParser.parse(request);
+
+    long parseNanos =
+            System.nanoTime() - parseStartedAt;
+
+    long ingestEnvelopeStartedAt =
+            System.nanoTime();
 
     SpanWriteResult writeResult =
             ingestionService.ingest(
@@ -59,6 +67,16 @@ public class OtlpTraceController {
                     authenticatedProject.projectId(),
                     parsedRequest
             );
+
+    long ingestEnvelopeNanos =
+            System.nanoTime() - ingestEnvelopeStartedAt;
+
+    log.info(
+            "OTLP trace timing: received={}, parseNanos={}, ingestEnvelopeNanos={}",
+            writeResult.requestedCount(),
+            parseNanos,
+            ingestEnvelopeNanos
+    );
 
     if (parsedRequest.spans().isEmpty()) {
       log.info(
