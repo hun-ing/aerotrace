@@ -1080,3 +1080,21 @@ TimescaleDB CPU는 약 50%대 수준까지 증가했지만 queue 증가, refused
 
 OpenTelemetry 기반 APM 수집 파이프라인을 synthetic sustained workload 기준 2,000 spans/s까지 단계적으로 검증하여 60초간 120,000 Span 전량 저장과 failed/refused 0을 확인하고, Collector queue·TimescaleDB CPU·실제 Backend/JDBC batch 동작을 계측해 처리 headroom을 분석
 
+---
+
+## Sustained Telemetry Ingest 3,000 spans/s 검증
+
+OpenTelemetry 기반 AeroTrace ingest pipeline의 sustained load를 단계적으로 증가시키고 동일 조건 반복 테스트를 통해 synthetic workload 기준 3,000 spans/s까지 검증했다.
+
+3,000 spans/s × 60초 테스트를 2회 수행해 각 실행에서 180,000 Span 전량 저장, failed request 0, Collector refused 0, 최종 queue drain을 확인했다.
+
+TimescaleDB는 약 80% 전후 CPU의 high-load 영역에 진입했고 Collector에는 한 batch 수준의 standing queue가 전체 부하 구간에서 반복적으로 관찰됐지만, queue가 시간에 따라 증가하는 growing backlog는 발생하지 않았다.
+
+단일 CPU spike 또는 순간 queue 값을 capacity 한계로 단정하지 않고 동일 조건 반복 측정, median과 average 비교, queue 성장 추세, 최종 데이터 정합성을 함께 사용해 실제 saturation 여부를 판단했다.
+
+또한 benchmark timestamp 경계 때문에 CPU sample이 누락되는 측정 도구 오류를 발견하고 sampling slot 기반 분석 및 누락 검증을 추가해 성능 측정 신뢰도를 개선했다.
+
+### 이력서 문장 후보
+
+제한된 서버 환경에서 OpenTelemetry APM 수집 파이프라인의 sustained 부하를 단계적으로 측정하고 동일 조건 반복 검증을 수행해 synthetic workload 기준 3,000 spans/s에서 60초간 180,000 Span 전량 저장과 failed/refused 0을 확인했으며, TimescaleDB CPU·Collector queue·JDBC batch를 계측해 데이터 정합성을 유지한 상태에서의 실제 처리 headroom을 분석
+

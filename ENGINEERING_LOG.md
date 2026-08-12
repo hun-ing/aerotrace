@@ -5300,3 +5300,162 @@ max latency와 schedule lag에서 단일 큰 tail 값이 관찰됐지만 p95/p99
 
 다음 부하 단계에서는 DB headroom과 queue 성장 여부를 더욱 엄격하게 확인하며, 지속 queue 증가 또는 처리 실패가 관찰되면 추가 rate 상승을 중단한다.
 
+---
+
+## 2026-08-12 — 3,000 spans/s High-load 재현성 검증
+
+3,000 spans/s × 60초 첫 실행에서 TimescaleDB CPU가 약 80% 이상으로 유지되고 Collector queue=1050이 전체 부하 구간에서 지속적으로 관찰되어 동일 조건으로 Repeat2를 수행했다.
+
+### 데이터 정합성
+
+두 실행 모두:
+
+```text
+Expected spans  = 180,000
+DB final        = 180,000 / 180,000
+Failed requests = 0
+Refused delta   = 0
+Final queue     = 0
+Final in-flight = 0
+```
+
+으로 정상 완료됐다.
+
+서비스 restart도:
+
+```text
+backend   0 → 0
+collector 1 → 1
+db        0 → 0
+```
+
+으로 증가하지 않았다.
+
+### Sender
+
+Run1 observed rate:
+
+```text
+2,999.99 spans/s
+```
+
+Repeat2:
+
+```text
+Observed rate = 2,999.94 spans/s
+
+Request latency
+p50 = 0.729 ms
+p95 = 1.641 ms
+p99 = 1.955 ms
+max = 7.347 ms
+
+Schedule lag
+p99 = 0.271 ms
+max = 5.918 ms
+```
+
+Run1에서 request latency max 182.345 ms와 schedule lag max 166.345 ms의 tail outlier가 관찰됐지만 Repeat2에서는 재현되지 않았다.
+
+두 실행 모두 failed request 없이 목표 rate를 유지했으므로 현재는 지속적인 sender saturation 신호로 판단하지 않는다.
+
+### TimescaleDB CPU 재현성
+
+검증된 `scripts/summarize-sustained-db-cpu.py`를 사용해 t=10~60의 full-rate sampling slot 11개를 모두 집계했다.
+
+```text
+Run1
+average = 83.23%
+median  = 83.87%
+minimum = 78.20%
+maximum = 90.21%
+
+Run2
+average = 78.81%
+median  = 78.55%
+minimum = 76.96%
+maximum = 82.62%
+```
+
+두 실행의 전체 22개 full-rate sample을 사용한 참고 통계:
+
+```text
+average ≈ 81.02%
+median  ≈ 79.80%
+minimum = 76.96%
+maximum = 90.21%
+```
+
+combined 통계는 개별 run을 대체하는 capacity 수치가 아니라 동일 workload 반복 결과의 전체적인 CPU 범위를 확인하기 위한 보조 지표로만 사용한다.
+
+두 실행 모두 full-rate 구간에서 TimescaleDB가 지속적으로 높은 CPU를 사용했다.
+
+따라서 3,000 spans/s에서 TimescaleDB가 대략 80% 전후의 CPU를 사용하는 high-load 특성이 재현됐다고 판단한다.
+
+### Collector Queue 재현성
+
+Run1과 Repeat2 모두 5초 sampling 기준 테스트 부하 구간 t=5~60의 모든 sample에서:
+
+```text
+queue=1050
+in_flight=1
+```
+
+수준이 지속적으로 관찰됐다.
+
+그러나 두 실행 모두 queue가:
+
+```text
+1050 → 2100 → 3150
+```
+
+처럼 시간에 따라 증가하지 않았으며 테스트 종료 후 queue와 in-flight는 모두 0으로 정상 drain됐다.
+
+따라서 3,000 spans/s에서 한 Collector batch 수준의 persistent standing queue는 2/2 재현됐지만 growing exporter backlog는 확인되지 않았다.
+
+### Backend / JDBC
+
+Run1 Backend request:
+
+```text
+500 spans  × 1
+1000 spans × 1
+1050 spans × 170
+```
+
+통계:
+
+```text
+Backend requests     = 172
+Received spans       = 180,000
+Average request size = 1,046.51
+
+Estimated JDBC chunks        = 342
+Estimated chunks per request = 1.988
+```
+
+기존 Collector batching 및 JDBC batch 구조의 급격한 변화는 확인되지 않았다.
+
+### 결론
+
+3,000 spans/s × 60초 synthetic sustained workload를 동일 조건으로 2회 검증한 결과:
+
+- 두 실행 모두 180,000 Span 전량 저장
+- failed request 0
+- refused delta 0
+- 서비스 restart 증가 없음
+- 최종 queue/in-flight 정상 drain
+- one-batch standing queue가 전체 부하 구간에서 2/2 재현
+- growing backlog 미관찰
+- TimescaleDB 약 80% CPU high-load 특성 재현
+
+을 확인했다.
+
+현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 3,000 spans/s다.
+
+단, 이는 최대 처리량 또는 production capacity를 의미하지 않는다.
+
+3,000 spans/s에서 DB headroom이 상당히 감소하고 persistent one-batch queue가 재현됐지만 growing backlog, refused, failed 또는 데이터 정합성 실패가 없으므로 sustained throughput saturation으로 판단할 근거는 아직 없다.
+
+추가 부하 탐색은 작은 증가폭으로 진행하며 queue가 2100 이상으로 지속되거나 성장할 경우 추가 rate 상승을 중단하고 병목 분석으로 전환한다.
+

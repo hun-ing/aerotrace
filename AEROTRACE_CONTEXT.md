@@ -1902,3 +1902,57 @@ DB headroom은 상당히 감소했지만 2,875 spans/s를 sustained throughput c
 
 설정 tuning은 아직 수행하지 않는다.
 
+---
+
+### Sustained Ingest 검증 범위 — 3,000 spans/s
+
+3,000 spans/s × 60초 synthetic sustained workload를 동일 조건으로 2회 검증했다.
+
+```text
+Run1 DB = 180,000 / 180,000
+Run2 DB = 180,000 / 180,000
+
+Failed  = 0
+Refused = 0
+
+Final queue     = 0
+Final in-flight = 0
+Restart 증가   = 없음
+```
+
+TimescaleDB full-rate CPU:
+
+```text
+Run1
+average = 83.23%
+median  = 83.87%
+
+Run2
+average = 78.81%
+median  = 78.55%
+```
+
+두 실행 모두 TimescaleDB가 대략 80% 전후 CPU를 사용하는 high-load 특성이 확인됐다.
+
+Collector queue는 두 실행 모두 t=5~60의 모든 5초 sample에서 1050으로 유지되어 one-batch standing queue가 재현됐다.
+
+그러나 queue가 2100 이상으로 증가하거나 시간에 따라 성장하는 현상은 없었으며 두 실행 모두 최종적으로 정상 drain됐다.
+
+현재 synthetic 60초 workload에서 검증된 최고 sustained ingest rate는 3,000 spans/s다.
+
+이는 최대 처리량 또는 production capacity를 의미하지 않는다.
+
+현재 상태:
+
+```text
+데이터 정합성        2/2 PASS
+failed               0
+refused              0
+standing queue       2/2 재현
+growing backlog      미관찰
+DB high-load         재현
+saturation           미확인
+```
+
+설정 tuning은 아직 수행하지 않는다.
+
