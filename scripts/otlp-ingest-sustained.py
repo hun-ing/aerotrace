@@ -4,9 +4,26 @@ import argparse
 import http.client
 import json
 import math
+import queue
 import secrets
+import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
+
+
+DEFAULT_WORKERS = 4
+DEFAULT_QUEUE_CAPACITY = 32
+DEFAULT_MAX_RATE_ERROR_PCT = 1.0
+DEFAULT_MAX_P99_LAG_INTERVALS = 2.0
+
+
+@dataclass(frozen=True)
+class LoadTask:
+    request_number: int
+    first_span_number: int
+    span_count: int
+    scheduled_at: float
 
 
 def percentile(values, percentile_value):
@@ -106,6 +123,142 @@ def new_connection(host, port):
     )
 
 
+def sender_worker(
+    worker_number,
+    task_queue,
+    span_prefix,
+    host,
+    port,
+    endpoint,
+    stats,
+    stats_lock,
+):
+    connection = new_connection(
+        host,
+        port,
+    )
+
+    try:
+        while True:
+            task = task_queue.get()
+
+            try:
+                if task is None:
+                    return
+
+                payload = build_payload(
+                    span_prefix,
+                    task.first_span_number,
+                    task.span_count,
+                )
+
+                request_start = time.perf_counter()
+
+                send_start_lag_ms = max(
+                    0.0,
+                    (
+                        request_start
+                        - task.scheduled_at
+                    )
+                    * 1000.0,
+                )
+
+                try:
+                    connection.request(
+                        "POST",
+                        endpoint,
+                        body=payload,
+                        headers={
+                            "Content-Type": (
+                                "application/json"
+                            ),
+                        },
+                    )
+
+                    response = connection.getresponse()
+                    response.read()
+
+                    request_elapsed = (
+                        time.perf_counter()
+                        - request_start
+                    )
+
+                    with stats_lock:
+                        stats["latencies_ms"].append(
+                            request_elapsed * 1000.0
+                        )
+
+                        stats[
+                            "send_start_lags_ms"
+                        ].append(
+                            send_start_lag_ms
+                        )
+
+                        if response.status == 200:
+                            stats[
+                                "accepted_requests"
+                            ] += 1
+
+                            stats[
+                                "accepted_spans"
+                            ] += task.span_count
+
+                        else:
+                            stats[
+                                "failed_requests"
+                            ] += 1
+
+                            print(
+                                "FAILED "
+                                f"worker={worker_number} "
+                                f"request="
+                                f"{task.request_number} "
+                                f"status={response.status}"
+                            )
+
+                except Exception as exc:
+                    request_elapsed = (
+                        time.perf_counter()
+                        - request_start
+                    )
+
+                    with stats_lock:
+                        stats["latencies_ms"].append(
+                            request_elapsed * 1000.0
+                        )
+
+                        stats[
+                            "send_start_lags_ms"
+                        ].append(
+                            send_start_lag_ms
+                        )
+
+                        stats[
+                            "failed_requests"
+                        ] += 1
+
+                        print(
+                            "FAILED "
+                            f"worker={worker_number} "
+                            f"request="
+                            f"{task.request_number} "
+                            f"error={exc!r}"
+                        )
+
+                    connection.close()
+
+                    connection = new_connection(
+                        host,
+                        port,
+                    )
+
+            finally:
+                task_queue.task_done()
+
+    finally:
+        connection.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -129,6 +282,30 @@ def main():
         "--batch-size",
         type=int,
         default=50,
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+    )
+
+    parser.add_argument(
+        "--queue-capacity",
+        type=int,
+        default=DEFAULT_QUEUE_CAPACITY,
+    )
+
+    parser.add_argument(
+        "--max-rate-error-pct",
+        type=float,
+        default=DEFAULT_MAX_RATE_ERROR_PCT,
+    )
+
+    parser.add_argument(
+        "--max-p99-lag-intervals",
+        type=float,
+        default=DEFAULT_MAX_P99_LAG_INTERVALS,
     )
 
     parser.add_argument(
@@ -164,9 +341,40 @@ def main():
             "--batch-size must be positive"
         )
 
+    if args.workers <= 0:
+        raise SystemExit(
+            "--workers must be positive"
+        )
+
+    if args.queue_capacity <= 0:
+        raise SystemExit(
+            "--queue-capacity must be positive"
+        )
+
+    if args.max_rate_error_pct < 0:
+        raise SystemExit(
+            "--max-rate-error-pct must not be negative"
+        )
+
+    if args.max_p99_lag_intervals <= 0:
+        raise SystemExit(
+            "--max-p99-lag-intervals must be positive"
+        )
+
     total_spans = (
         args.target_spans_per_sec
         * args.duration_sec
+    )
+
+    request_interval_ms = (
+        args.batch_size
+        / args.target_spans_per_sec
+        * 1000.0
+    )
+
+    max_p99_lag_ms = (
+        request_interval_ms
+        * args.max_p99_lag_intervals
     )
 
     run_id = (
@@ -183,42 +391,99 @@ def main():
 
     print(f"Run ID:                 {run_id}")
     print(f"Span prefix:            {span_prefix}")
+
     print(
         "Target spans/sec:       "
         f"{args.target_spans_per_sec}"
     )
+
     print(
-        f"Duration sec:            "
+        "Duration sec:            "
         f"{args.duration_sec}"
     )
+
     print(
-        f"Batch size:              "
+        "Batch size:              "
         f"{args.batch_size}"
     )
+
     print(
-        f"Requested total spans:   "
+        "Workers:                 "
+        f"{args.workers}"
+    )
+
+    print(
+        "Sender queue capacity:   "
+        f"{args.queue_capacity}"
+    )
+
+    print(
+        "Request interval ms:     "
+        f"{request_interval_ms:.3f}"
+    )
+
+    print(
+        "Max rate error pct:      "
+        f"{args.max_rate_error_pct:.3f}"
+    )
+
+    print(
+        "Max p99 lag ms:          "
+        f"{max_p99_lag_ms:.3f}"
+    )
+
+    print(
+        "Requested total spans:   "
         f"{total_spans}"
     )
 
     print()
     print("===== Sending sustained OTLP load =====")
 
-    connection = new_connection(
-        args.host,
-        args.port,
+    task_queue = queue.Queue(
+        maxsize=args.queue_capacity
     )
+
+    stats_lock = threading.Lock()
+
+    stats = {
+        "accepted_spans": 0,
+        "accepted_requests": 0,
+        "failed_requests": 0,
+        "latencies_ms": [],
+        "producer_lags_ms": [],
+        "send_start_lags_ms": [],
+        "producer_backpressure_events": 0,
+    }
+
+    workers = []
+
+    for worker_number in range(
+        1,
+        args.workers + 1,
+    ):
+        worker = threading.Thread(
+            target=sender_worker,
+            args=(
+                worker_number,
+                task_queue,
+                span_prefix,
+                args.host,
+                args.port,
+                args.endpoint,
+                stats,
+                stats_lock,
+            ),
+            name=f"otlp-sender-{worker_number}",
+        )
+
+        worker.start()
+        workers.append(worker)
 
     benchmark_start = time.perf_counter()
 
     requested_spans = 0
-    accepted_spans = 0
-
     requested_requests = 0
-    accepted_requests = 0
-    failed_requests = 0
-
-    latencies_ms = []
-    schedule_lags_ms = []
 
     try:
         while requested_spans < total_spans:
@@ -244,99 +509,61 @@ def main():
                     scheduled_at - now
                 )
 
-            actual_start = time.perf_counter()
-
-            schedule_lag_ms = max(
-                0.0,
-                (
-                    actual_start
-                    - scheduled_at
-                )
-                * 1000.0,
-            )
-
-            schedule_lags_ms.append(
-                schedule_lag_ms
+            request_number = (
+                requested_requests + 1
             )
 
             first_span_number = (
                 requested_spans + 1
             )
 
-            payload = build_payload(
-                span_prefix,
-                first_span_number,
-                batch_count,
+            task = LoadTask(
+                request_number=request_number,
+                first_span_number=first_span_number,
+                span_count=batch_count,
+                scheduled_at=scheduled_at,
             )
+
+            try:
+                task_queue.put_nowait(task)
+
+            except queue.Full:
+                with stats_lock:
+                    stats[
+                        "producer_backpressure_events"
+                    ] += 1
+
+                task_queue.put(task)
+
+            enqueued_at = time.perf_counter()
+
+            producer_lag_ms = max(
+                0.0,
+                (
+                    enqueued_at
+                    - scheduled_at
+                )
+                * 1000.0,
+            )
+
+            with stats_lock:
+                stats[
+                    "producer_lags_ms"
+                ].append(
+                    producer_lag_ms
+                )
 
             requested_requests += 1
             requested_spans += batch_count
 
-            request_start = time.perf_counter()
-
-            try:
-                connection.request(
-                    "POST",
-                    args.endpoint,
-                    body=payload,
-                    headers={
-                        "Content-Type": (
-                            "application/json"
-                        ),
-                    },
-                )
-
-                response = connection.getresponse()
-                response.read()
-
-                request_elapsed = (
-                    time.perf_counter()
-                    - request_start
-                )
-
-                latencies_ms.append(
-                    request_elapsed * 1000.0
-                )
-
-                if response.status == 200:
-                    accepted_requests += 1
-                    accepted_spans += batch_count
-                else:
-                    failed_requests += 1
-
-                    print(
-                        "FAILED "
-                        f"request={requested_requests} "
-                        f"status={response.status}"
-                    )
-
-            except Exception as exc:
-                request_elapsed = (
-                    time.perf_counter()
-                    - request_start
-                )
-
-                latencies_ms.append(
-                    request_elapsed * 1000.0
-                )
-
-                failed_requests += 1
-
-                print(
-                    "FAILED "
-                    f"request={requested_requests} "
-                    f"error={exc!r}"
-                )
-
-                connection.close()
-
-                connection = new_connection(
-                    args.host,
-                    args.port,
-                )
-
     finally:
-        connection.close()
+        for _ in workers:
+            task_queue.put(None)
+
+        task_queue.join()
+
+        for worker in workers:
+            worker.join()
 
     nominal_end = (
         benchmark_start
@@ -357,58 +584,115 @@ def main():
         - benchmark_start
     )
 
+    accepted_spans = stats["accepted_spans"]
+    accepted_requests = stats["accepted_requests"]
+    failed_requests = stats["failed_requests"]
+
+    latencies_ms = stats["latencies_ms"]
+
+    producer_lags_ms = stats[
+        "producer_lags_ms"
+    ]
+
+    send_start_lags_ms = stats[
+        "send_start_lags_ms"
+    ]
+
+    producer_backpressure_events = stats[
+        "producer_backpressure_events"
+    ]
+
     observed_rate = (
         accepted_spans / elapsed
         if elapsed > 0
         else 0.0
     )
 
+    rate_error_pct = (
+        abs(
+            observed_rate
+            - args.target_spans_per_sec
+        )
+        / args.target_spans_per_sec
+        * 100.0
+    )
+
+    producer_lag_p99 = percentile(
+        producer_lags_ms,
+        99,
+    )
+
+    send_start_lag_p99 = percentile(
+        send_start_lags_ms,
+        99,
+    )
+
+    delivery_success = (
+        accepted_spans == total_spans
+        and failed_requests == 0
+    )
+
+    sustained_rate_valid = (
+        rate_error_pct
+        <= args.max_rate_error_pct
+        and producer_lag_p99
+        <= max_p99_lag_ms
+        and send_start_lag_p99
+        <= max_p99_lag_ms
+        and producer_backpressure_events == 0
+    )
+
     print()
     print("===== RESULT =====")
 
     print(
-        f"Span prefix:             "
+        "Span prefix:             "
         f"{span_prefix}"
     )
 
     print(
-        f"Requested spans:         "
+        "Requested spans:         "
         f"{requested_spans}"
     )
 
     print(
-        f"Accepted spans:          "
+        "Accepted spans:          "
         f"{accepted_spans}"
     )
 
     print(
-        f"Requested requests:      "
+        "Requested requests:      "
         f"{requested_requests}"
     )
 
     print(
-        f"Accepted requests:       "
+        "Accepted requests:       "
         f"{accepted_requests}"
     )
 
     print(
-        f"Failed requests:         "
+        "Failed requests:         "
         f"{failed_requests}"
     )
 
     print(
-        f"Actual elapsed sec:      "
+        "Actual elapsed sec:      "
         f"{elapsed:.6f}"
     )
 
     print(
-        f"Target spans/sec:        "
+        "Target spans/sec:        "
         f"{args.target_spans_per_sec}"
     )
 
     print(
-        f"Observed accepted spans/sec: "
+        "Observed accepted spans/sec: "
         f"{observed_rate:.2f}"
+    )
+
+    print(
+        "Rate error pct:          "
+        f"{rate_error_pct:.3f}"
     )
 
     print(
@@ -432,30 +716,65 @@ def main():
     )
 
     print(
-        "Schedule lag p50 ms:    "
-        f"{percentile(schedule_lags_ms, 50):.3f}"
+        "Producer lag p50 ms:    "
+        f"{percentile(producer_lags_ms, 50):.3f}"
     )
 
     print(
-        "Schedule lag p95 ms:    "
-        f"{percentile(schedule_lags_ms, 95):.3f}"
+        "Producer lag p95 ms:    "
+        f"{percentile(producer_lags_ms, 95):.3f}"
     )
 
     print(
-        "Schedule lag p99 ms:    "
-        f"{percentile(schedule_lags_ms, 99):.3f}"
+        "Producer lag p99 ms:    "
+        f"{producer_lag_p99:.3f}"
     )
 
     print(
-        "Schedule lag max ms:    "
-        f"{max(schedule_lags_ms, default=0.0):.3f}"
+        "Producer lag max ms:    "
+        f"{max(producer_lags_ms, default=0.0):.3f}"
     )
 
-    if accepted_spans != total_spans:
+    print(
+        "Send-start lag p50 ms:  "
+        f"{percentile(send_start_lags_ms, 50):.3f}"
+    )
+
+    print(
+        "Send-start lag p95 ms:  "
+        f"{percentile(send_start_lags_ms, 95):.3f}"
+    )
+
+    print(
+        "Send-start lag p99 ms:  "
+        f"{send_start_lag_p99:.3f}"
+    )
+
+    print(
+        "Send-start lag max ms:  "
+        f"{max(send_start_lags_ms, default=0.0):.3f}"
+    )
+
+    print(
+        "Producer backpressure events: "
+        f"{producer_backpressure_events}"
+    )
+
+    print(
+        "Delivery success:       "
+        f"{'PASS' if delivery_success else 'FAIL'}"
+    )
+
+    print(
+        "Sustained-rate validity: "
+        f"{'PASS' if sustained_rate_valid else 'FAIL'}"
+    )
+
+    if not delivery_success:
         raise SystemExit(20)
 
-    if failed_requests != 0:
-        raise SystemExit(21)
+    if not sustained_rate_valid:
+        raise SystemExit(22)
 
     print()
     print("Sustained OTLP sender: PASS")
