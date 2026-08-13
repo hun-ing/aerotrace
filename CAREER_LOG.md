@@ -1120,3 +1120,727 @@ TimescaleDB CPU median이 3회 모두 약 89~91% 수준으로 재현됐고, 한 
 - 측정 결과 없이 tuning하지 않고 baseline을 먼저 확보
 - 처리 성공률과 실제 시스템 headroom을 구분
 
+---
+
+# AeroTrace Career Log
+
+> 사용자가 직접 구현을 적용하고 실행·검증·측정한 경험을 이력서, 포트폴리오, 면접, 기술 블로그 소재로 보존한다.
+>
+> 측정하지 않은 숫자는 만들지 않고, 실제 테스트 결과와 보존된 로그를 근거로 작성한다.
+
+---
+
+## 2026-08-13 — pgJDBC Batch 저장 병목 분석 및 최적화
+
+### 경험 요약
+
+AeroTrace의 OpenTelemetry telemetry ingest를 N100 홈서버에서 3,250 spans/s로 sustained load test하던 중 60초 동안 195,000 Span 전량 저장과 failed request 0은 유지했지만 TimescaleDB CPU가 높은 수준까지 증가하는 현상을 확인했다.
+
+단순히 DB가 느리다고 판단하거나 JDBC batch size를 임의로 변경하지 않고 다음 순서로 병목 범위를 좁혔다.
+
+```text
+Collector request distribution 분석
+→ PostgreSQL wait sampling
+→ Controller timing
+→ JDBC writer timing
+→ JSON / row preparation timing
+→ PreparedStatement binding timing
+→ JdbcTemplate.batchUpdate residual 분석
+→ pgJDBC batch rewrite 가설
+→ correctness test
+→ 반복 A/B
+→ 운영 적용
+→ 임시 계측 제거
+```
+
+### 실제로 확인한 Runtime 구조
+
+Sender:
+
+```text
+3,250 spans/s
+50 spans/request
+65 requests/sec
+```
+
+Collector:
+
+```text
+send_batch_size=1024
+```
+
+실제 Backend 요청은 대부분 다음 크기로 형성됐다.
+
+```text
+1,050 Span
+```
+
+Backend JDBC batch size가 1,000이므로 대부분:
+
+```text
+1,000 + 50
+```
+
+두 JDBC chunk로 저장되는 실제 실행 구조를 runtime 로그로 확인했다.
+
+### 초기 병목 현상
+
+3,250 spans/s baseline:
+
+```text
+Requested spans: 195000
+Accepted spans: 195000
+Failed requests: 0
+DB count: 195000/195000
+Final queue: 0
+Final in-flight: 0
+```
+
+DB CPU 대표 run:
+
+```text
+avg=94.29%
+median=94.05%
+max=100.89%
+```
+
+처리 자체는 성공했지만 DB CPU headroom이 거의 남지 않았다.
+
+### PostgreSQL Wait 분석 경험
+
+DB CPU가 높다는 이유만으로 lock 또는 disk I/O 병목이라고 단정하지 않고 PostgreSQL wait event를 별도로 sampling했다.
+
+확인 결과:
+
+```text
+active avg ≈ 0.94
+active max = 1
+대부분 active_no_wait
+lock wait 없음
+지속적인 I/O wait 근거 없음
+```
+
+이를 통해 높은 CPU와 PostgreSQL wait를 별개의 증거로 다루는 경험을 확보했다.
+
+### Java 저장 경로 계측
+
+1,050-span 요청 185개를 분석했다.
+
+```text
+writer_total median       288.75ms
+prepare_rows median         1.64ms
+batch_update median        286.84ms
+bind median                  1.19ms
+batch_after_bind median    285.54ms
+```
+
+`batchUpdate` 전체 중 parameter binding:
+
+```text
+median share = 약 0.40%
+```
+
+bind 이후 residual:
+
+```text
+median share = 약 99.60%
+```
+
+이를 통해 다음을 주요 병목에서 제외했다.
+
+```text
+OTLP JSON parsing
+JSONB serialization
+PreparedSpanRow 생성
+PreparedStatement parameter binding
+```
+
+병목을 JDBC driver / PostgreSQL batch 실행 경로로 좁혔다.
+
+### 잘못된 최적화를 피한 경험
+
+parameter binding이 느릴 것이라는 추측만으로 bind 코드를 최적화했다면 전체 0.4% 수준의 부분을 개선하려 했을 가능성이 있다.
+
+실제 timing을 추가해 병목을 분리함으로써 우선순위가 낮은 Java-side 최적화를 피했다.
+
+### `reWriteBatchedInserts` Correctness 검증
+
+성능 옵션을 바로 운영에 적용하지 않고 데이터 정합성을 먼저 검증했다.
+
+시나리오:
+
+```text
+신규 50개
+동일 50개 재전송
+기존 25개 + 신규 25개
+```
+
+최종 DB:
+
+```text
+75 rows
+```
+
+예상과 정확히 일치했다.
+
+중복 데이터 자체는 추가 저장되지 않았다.
+
+동시에 중요한 trade-off도 발견했다.
+
+신규 50개:
+
+```text
+inserted=0
+duplicates=0
+unknown=50
+```
+
+동일 50개 재전송:
+
+```text
+inserted=0
+duplicates=50
+unknown=0
+```
+
+중복 25 + 신규 25:
+
+```text
+inserted=0
+duplicates=0
+unknown=50
+```
+
+즉 데이터 idempotency는 유지되지만 pgJDBC rewrite 후에는 개별 row의 inserted / duplicate 결과를 정확하게 분류하지 못할 수 있음을 실제 테스트로 확인했다.
+
+### 반복 성능 A/B
+
+한 번의 benchmark를 성과로 사용하지 않고 baseline과 rewrite 조건을 각각 총 3회 측정했다.
+
+조건:
+
+```text
+3,250 spans/s
+60초
+195,000 spans/run
+```
+
+조건별 run 중앙값:
+
+| 지표 | rewrite=false | rewrite=true | 변화 |
+|---|---:|---:|---:|
+| JDBC Writer median | 288.75ms | 107.07ms | -62.9% |
+| BatchUpdate median | 286.84ms | 104.81ms | -63.5% |
+| After-bind median | 285.54ms | 103.47ms | -63.8% |
+| DB CPU avg | 94.36% | 37.55% | -60.2% |
+| DB CPU median | 94.05% | 37.63% | -60.0% |
+
+Collector size-trigger 예상 주기 약 323.08ms를 초과한 writer:
+
+```text
+baseline:
+57 / 555
+
+rewrite:
+0 / 554
+```
+
+모든 sustained run에서:
+
+```text
+195000 / 195000 Span 저장
+failed request = 0
+final queue = 0
+final in-flight = 0
+```
+
+을 확인했다.
+
+### 성능 결과를 과장하지 않는 경험
+
+이번 테스트에서는 최대 처리량을 다시 측정하지 않았다.
+
+따라서 다음 표현은 사용하지 않는다.
+
+```text
+처리량 63% 증가
+최대 ingest 성능 63% 향상
+```
+
+실제 측정으로 말할 수 있는 것은 다음이다.
+
+> 동일한 3,250 spans/s workload에서 JDBC writer 중앙값 약 63%, TimescaleDB CPU 약 60% 감소를 반복 측정으로 확인했다.
+
+### 초기 Benchmark와 다른 결과를 다룬 경험
+
+초기 Windows Docker persistence-only benchmark에서는 `reWriteBatchedInserts=true`가 일관된 성능 개선을 보여주지 않아 적용을 보류했다.
+
+그러나 실제 N100 sustained workload에서는 큰 차이가 확인됐다.
+
+두 실험의 차이:
+
+```text
+초기
+Windows 개발 PC
+Docker Desktop
+Persistence-only
+Collector 없음
+낮은 DB 포화도
+
+후속
+N100 운영 후보 서버
+Collector 포함
+3,250 spans/s sustained load
+1,050-span runtime request 중심
+높은 DB CPU
+```
+
+따라서 이전 결과를 감추거나 잘못된 실험으로 취급하지 않고:
+
+```text
+초기 측정 → 적용 보류
+실제 workload → 병목 발견
+운영 후보 환경 재측정
+→ 결정 변경
+```
+
+과정을 그대로 기록했다.
+
+### 최종 운영 적용
+
+적용:
+
+```text
+reWriteBatchedInserts=true
+```
+
+Commit:
+
+```text
+e8a1408 PostgreSQL 배치 INSERT 재작성 최적화 적용
+```
+
+홈서버 Runtime:
+
+```text
+AEROTRACE_DB_URL=jdbc:postgresql://timescaledb:5432/aerotrace?reWriteBatchedInserts=true
+```
+
+배포 후:
+
+```text
+status=running
+health=healthy
+restart=0
+```
+
+1-span smoke:
+
+```text
+Requested=1
+Accepted=1
+Failed=0
+
+received=1
+inserted=1
+duplicates=0
+unknown=0
+```
+
+### 진단 코드 정리 경험
+
+성능 분석을 위해 운영 요청 경로에 추가했던 `System.nanoTime()` timing instrumentation은 분석 완료 후 제거했다.
+
+제거:
+
+```text
+Controller parse timing
+Controller ingestion timing
+Writer total timing
+prepareRows timing
+batchUpdate timing
+row별 bind timing
+chunk timing
+성능 분석 INFO 로그
+```
+
+Benchmark 전용 timing 코드는 유지했다.
+
+Commit:
+
+```text
+5152cc1 성능 분석용 임시 계측 코드 제거
+```
+
+배포 후에도 ingest가 정상 동작하고 성능 분석용 INFO 로그가 더 이상 발생하지 않는 것을 확인했다.
+
+---
+
+## 이력서 성과 문장 후보
+
+### 상세 버전
+
+OpenTelemetry 기반 APM 수집 파이프라인의 3,250 spans/s sustained workload에서 JDBC 저장 경로를 JSON 직렬화·parameter binding·batch 실행 단계로 계측해 pgJDBC batch 실행 병목을 식별하고, `reWriteBatchedInserts` 적용 및 조건별 3회 반복 A/B 검증을 통해 동일 처리량에서 JDBC writer 중앙값 약 63%, TimescaleDB CPU 약 60% 감소를 확인하면서 매 run 195,000 Span 전량 저장과 중복 방지 정합성을 유지
+
+### 중간 길이 버전
+
+3,250 spans/s OpenTelemetry ingest 환경에서 JDBC 저장 병목을 단계별 계측으로 분석하고 pgJDBC batch rewrite를 적용하여 동일 부하에서 writer 처리시간 약 63%, DB CPU 약 60% 감소를 반복 A/B로 검증
+
+### 짧은 버전
+
+OpenTelemetry ingest JDBC 병목을 계측·분석하고 pgJDBC batch rewrite 적용으로 동일 3,250 spans/s 부하에서 writer 약 63%, DB CPU 약 60% 감소를 반복 검증
+
+---
+
+## 포트폴리오 강조점
+
+### 단순 기술 사용이 아닌 문제 해결
+
+단순히 다음 기술을 사용했다는 것이 핵심이 아니다.
+
+```text
+Spring JDBC
+PostgreSQL
+TimescaleDB
+OpenTelemetry
+```
+
+핵심 경험은:
+
+```text
+높은 DB CPU 발견
+→ 성능 가설 수립
+→ PostgreSQL wait 측정
+→ Java 저장 구간 계측
+→ 병목 범위 축소
+→ pgJDBC 동작 분석
+→ correctness 검증
+→ 반복 A/B
+→ trade-off 결정
+→ 운영 반영
+→ 진단 코드 제거
+```
+
+까지 직접 수행한 것이다.
+
+### 채용 담당자가 평가할 수 있는 부분
+
+- 실제 sustained workload 생성
+- 부하 발생기의 정확도 확인
+- DB CPU와 Collector queue 동시 분석
+- PostgreSQL wait event 분석
+- Java 애플리케이션 내부 timing instrumentation 설계
+- 성능 병목 단계적 축소
+- 추측 기반 최적화 방지
+- correctness-before-performance 접근
+- 동일 조건 반복 A/B
+- 성능과 observability 정확성 trade-off 판단
+- 운영 설정 적용
+- 배포 후 smoke / health 검증
+- temporary instrumentation cleanup
+
+---
+
+## 보존해야 할 증거
+
+### Benchmark 결과
+
+```text
+/home/huning/aerotrace/benchmark-results/rewrite-ab-repeat-20260813T001308Z
+```
+
+### 반드시 보존할 출력
+
+```text
+baseline 3250 spans/s summary
+rewrite 3250 spans/s summary
+ABBA 반복 결과표
+DB CPU summary
+Backend 1050-span timing 통계
+bind share 0.40%
+after-bind share 99.60%
+PostgreSQL wait sampling
+rewrite correctness 로그
+최종 DB count=75
+195000/195000 결과
+Collector queue=0
+Collector in-flight=0
+runtime DB URL
+Backend healthy
+restart=0
+```
+
+### Commit
+
+```text
+e8a1408 PostgreSQL 배치 INSERT 재작성 최적화 적용
+5152cc1 성능 분석용 임시 계측 코드 제거
+```
+
+---
+
+## 예상 면접 질문
+
+### Q1. 왜 DB CPU가 95%라는 사실만 보고 PostgreSQL이 병목이라고 결론 내리지 않았나요?
+
+CPU 수치는 자원 사용 상태를 보여주지만 어느 SQL 단계나 어떤 대기 원인이 문제인지 알려주지 않는다.
+
+따라서 PostgreSQL wait sampling과 애플리케이션 내부 timing을 함께 측정해 lock, persistent I/O wait, Java serialization, binding 등의 후보를 하나씩 제외했다.
+
+### Q2. `batchUpdateNanos`를 PostgreSQL INSERT 실행시간이라고 부르면 안 되는 이유는?
+
+`JdbcTemplate.batchUpdate()`에는 PostgreSQL 서버 실행시간뿐 아니라 다음이 포함될 수 있다.
+
+```text
+JdbcTemplate 내부 처리
+JDBC driver 처리
+parameter batch 관리
+network
+PostgreSQL 실행
+index 검사
+ON CONFLICT
+결과 수신
+update count 변환
+```
+
+따라서 별도 server-side measurement 없이 전체 값을 SQL 실행시간이라고 표현하면 안 된다.
+
+### Q3. parameter binding이 병목이 아니라는 것을 어떻게 확인했나요?
+
+`BatchPreparedStatementSetter.setValues()` 안의 실제 `persistenceSupport.bind()` 호출을 row별로 timing하고 요청 단위로 합산했다.
+
+1,050-span 요청에서:
+
+```text
+bind median = 1.19ms
+batchUpdate median = 286.84ms
+```
+
+로 binding은 약 0.40%였다.
+
+### Q4. `reWriteBatchedInserts`가 어떤 trade-off를 만들었나요?
+
+실제 DB 데이터 중복 방지는 유지됐지만 rewritten batch에서 JDBC driver가 개별 row별 성공 여부를 알 수 없는 경우 `SUCCESS_NO_INFO`가 발생해 inserted / duplicate 분류가 `unknown`으로 변할 수 있었다.
+
+### Q5. 왜 이 상태에서도 rewrite를 채택했나요?
+
+현재 inserted / duplicate count는 외부 OTLP API 계약이 아니고 실제 데이터 correctness는 Unique Index와 `ON CONFLICT DO NOTHING`으로 유지된다.
+
+또한 `unknownSuccessCount`가 이미 모델링되어 있다.
+
+반면 실제 운영 후보 workload에서는 writer 시간과 DB CPU 감소가 반복적으로 매우 크게 확인됐다.
+
+### Q6. 왜 한 번의 A/B 결과로 결정하지 않았나요?
+
+성능 측정은 OS scheduling, cache, background work, DB 상태 등에 영향을 받을 수 있기 때문이다.
+
+최초 A/B 후 ABBA 순서의 추가 반복을 수행해 조건별 총 3회 결과가 같은 방향으로 재현되는지 확인했다.
+
+### Q7. 왜 이번 결과를 처리량 63% 증가라고 표현하면 안 되나요?
+
+측정한 것은 동일 3,250 spans/s 입력에서 writer 실행시간과 CPU 변화다.
+
+최대 안정 ingest rate 자체를 rewrite 적용 후 다시 탐색하지 않았기 때문에 최대 처리량 개선 수치는 알 수 없다.
+
+### Q8. 왜 초기 Windows benchmark와 이번 N100 결과가 다른데 둘 다 유효하다고 보나요?
+
+성능은 실행 환경과 workload에 따라 달라진다.
+
+초기 benchmark는 persistence-only였고 DB 포화도가 낮았지만 이번 테스트는 실제 Collector를 포함한 sustained ingest와 높은 DB CPU 조건이었다.
+
+결과가 다른 것이 모순이라기보다 workload-specific optimization의 사례다.
+
+### Q9. 다음 병목이 발생하면 바로 Kafka를 도입할 건가요?
+
+아니다.
+
+먼저 현재 Collector queue, DB CPU, connection pool, WAL, disk, JDBC/COPY 등의 실제 병목을 측정한다.
+
+Kafka는 현재 구조에서 해결할 수 없는 buffering, decoupling, scale 요구가 실제로 나타났을 때 검토한다.
+
+---
+
+## 기술 블로그 후보
+
+### 제목
+
+**JDBC Batch를 쓰는데 왜 DB CPU가 95%일까? OpenTelemetry 3,250 spans/s 병목을 추적한 과정**
+
+### 해결한 문제
+
+JDBC batch를 이미 사용하고 있음에도 실제 sustained ingest에서 TimescaleDB CPU가 거의 포화되는 문제를 추측이 아니라 계측으로 추적했다.
+
+### 핵심 메시지
+
+```text
+Batch를 사용한다
+≠
+Batch가 효율적으로 실행되고 있다
+```
+
+라이브러리 기능을 사용했다는 사실보다 실제 runtime에서 어떻게 실행되는지 측정하는 것이 중요하다.
+
+### 글 구성
+
+```text
+1. 3,250 spans/s까지 부하를 올린 이유
+2. 195,000 Span은 저장됐는데 DB CPU가 95%
+3. Queue가 0이라고 병목이 없는 것은 아니다
+4. Collector size-trigger cadence 계산
+5. PostgreSQL wait sampling
+6. Controller timing
+7. JDBC writer timing
+8. JSON serialization 병목 제외
+9. PreparedStatement binding 병목 제외
+10. pgJDBC batch 실행 경로 가설
+11. reWriteBatchedInserts correctness test
+12. SUCCESS_NO_INFO 발견
+13. 단일 A/B
+14. ABBA 반복 검증
+15. 약 63% writer / 60% CPU 감소
+16. 왜 처리량 63% 증가라고 쓰지 않는가
+17. 초기 Windows benchmark와 결과가 달랐던 이유
+18. 운영 반영
+19. 진단 코드 제거
+20. 다음 병목에서 측정할 것
+```
+
+### 포함할 그래프
+
+#### Writer median
+
+```text
+baseline ≈ 289ms
+rewrite  ≈ 107ms
+```
+
+#### DB CPU
+
+```text
+baseline ≈ 94%
+rewrite  ≈ 38%
+```
+
+#### Collector cadence 초과 요청
+
+```text
+baseline 57 / 555
+rewrite   0 / 554
+```
+
+### 포함할 코드
+
+```text
+JdbcTemplate.batchUpdate
+BatchPreparedStatementSetter
+SpanWriteResult unknownSuccessCount
+reWriteBatchedInserts JDBC URL
+ON CONFLICT DO NOTHING
+```
+
+### 독자가 얻을 실무적 교훈
+
+- 성능 문제가 생겼을 때 작은 설정부터 무작정 바꾸지 않는다.
+- application timing과 DB wait를 함께 봐야 한다.
+- framework method 전체 시간을 SQL 실행시간으로 착각하지 않는다.
+- 성능 옵션은 correctness semantics를 바꿀 수 있다.
+- micro benchmark와 실제 sustained workload는 결과가 다를 수 있다.
+- 반복 측정 없이 성능 수치를 확정하지 않는다.
+- 측정하지 않은 최대 처리량 향상을 이력서에 쓰지 않는다.
+
+---
+
+# Portfolio Checkpoint — JDBC Ingest 병목 분석과 최적화
+
+## 직접 얻은 실무 경험
+
+이번 단계에서 직접 경험한 것은 단순한 `reWriteBatchedInserts` 옵션 사용법이 아니다.
+
+다음 전체 성능 분석 사이클을 경험했다.
+
+```text
+성능 이상 징후 발견
+→ workload 재현
+→ 측정 지표 정의
+→ 병목 후보 분리
+→ instrumentation 추가
+→ 통계 분석
+→ 가설 수정
+→ correctness 검증
+→ A/B benchmark
+→ 반복 재현성 검증
+→ trade-off 결정
+→ 운영 설정 반영
+→ smoke / health 확인
+→ 임시 instrumentation 제거
+```
+
+## 면접관이 평가할 부분
+
+- 성능 수치를 과대해석하지 않음
+- 원인을 모르고 설정부터 변경하지 않음
+- 하나의 CPU 수치가 아니라 여러 증거를 결합
+- application과 DB의 경계를 이해
+- idempotency를 성능보다 먼저 보호
+- 라이브러리 최적화가 반환 semantics를 바꿀 수 있음을 검증
+- 한 번의 benchmark가 아닌 반복 A/B 수행
+- 실제 운영 후보 장비에서 재측정
+- 성능 개선 뒤 코드 cleanup까지 수행
+
+## 현재 증명 가능한 성과
+
+다음 표현은 실제 측정 자료로 증명할 수 있다.
+
+> 3,250 spans/s의 동일 sustained workload에서 pgJDBC batch rewrite 적용 후 JDBC writer 중앙값 약 63%, TimescaleDB CPU 약 60% 감소를 조건별 3회 반복 측정으로 확인했다.
+
+또한 모든 테스트에서:
+
+```text
+195,000 Span/run
+failed request 0
+최종 Collector queue 0
+최종 in-flight 0
+```
+
+을 확인했다.
+
+## 아직 주장하면 안 되는 것
+
+아직 다음은 측정하지 않았다.
+
+```text
+rewrite 적용 후 최대 처리량
+최대 안정 spans/s
+일일 최대 ingest capacity
+실사용자 workload에서 동일한 60% 개선
+Oracle Cloud에서도 동일한 개선
+```
+
+따라서 포트폴리오나 이력서에서 해당 수치를 추측하지 않는다.
+
+## 다음 한 단계 높은 과제
+
+다음 성능 단계에서는 단순히 더 높은 rate만 테스트하기보다 다음을 판단할 수 있다.
+
+```text
+rewrite 적용 후 새로운 sustained 처리 경계
+Collector backlog가 지속 증가하기 시작하는 지점
+DB CPU headroom 감소 지점
+Hikari connection 사용량
+동시 Trace 조회 + ingest 영향
+WAL / disk write 변화
+batch rewrite 적용 후 COPY 비교 필요성
+```
+
+현재는 rewrite 적용으로 기존에 확인한 주요 DB/JDBC 병목이 크게 완화된 상태이므로 새로운 경계를 별도의 측정으로 찾아야 한다.
+
+---
+
+## 학습 확인 질문
+
+1. 왜 `batchAfterBindNanos`를 PostgreSQL INSERT 시간이라고 부르면 안 되는가?
+2. 왜 `reWriteBatchedInserts=true`에서도 실제 duplicate 데이터는 안전하지만 `insertedCount`는 정확하지 않을 수 있는가?
+3. 왜 이번 결과를 처리량 63% 증가라고 표현하면 안 되는가?
+4. 왜 초기 Windows benchmark에서 rewrite를 보류하고 이번 N100 benchmark에서는 채택한 것이 모순이 아닌가?
+5. Collector의 약 323ms cadence보다 writer가 오래 걸리는 요청이 반복되면 어떤 운영 문제가 발생할 수 있는가?
+

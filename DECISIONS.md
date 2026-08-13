@@ -1185,3 +1185,457 @@ DNS 갱신 주기 동안 짧은 복구 지연이 발생할 수 있다.
 #### 재검토 조건
 
 향후 Kubernetes, Service Discovery 시스템, 외부 Load Balancer 등 Docker Compose가 아닌 배포 환경으로 변경할 경우 upstream discovery 방식을 다시 검토한다.
+
+---
+
+---
+
+## ADR — pgJDBC `reWriteBatchedInserts`를 Telemetry 저장 경로에 활성화
+
+### 상태
+
+채택
+
+### 결정일
+
+2026-08-13
+
+### 해결하려는 문제
+
+N100 홈서버에서 3,250 spans/s sustained telemetry ingest를 처리할 때 60초 동안 195,000 Span 전량 저장과 failed request 0은 유지했지만 TimescaleDB CPU 사용률이 높은 수준까지 증가했다.
+
+또한 일부 1,050-span Backend JDBC writer 실행시간이 Collector의 다음 size-trigger batch가 도착할 것으로 예상되는 약 323.08ms보다 길었다.
+
+단순히 JDBC batch size를 변경하거나 더 복잡한 인프라를 도입하기 전에 실제 병목이 다음 중 어디에 있는지 확인해야 했다.
+
+```text
+OTLP parsing
+JSON serialization
+PreparedSpanRow 생성
+PreparedStatement parameter binding
+JdbcTemplate
+pgJDBC
+PostgreSQL INSERT
+Unique Index / ON CONFLICT
+TimescaleDB 저장
+```
+
+### 검토한 대안
+
+#### 대안 1 — 현재 pgJDBC batch 실행 방식 유지
+
+장점:
+
+- 기존 inserted / duplicate update count 의미 유지
+- 변경 위험 없음
+- 현재 데이터 정합성 이미 검증됨
+
+단점:
+
+- 3,250 spans/s에서 DB CPU headroom이 매우 작음
+- 일부 writer가 Collector batch cadence보다 느림
+- 더 높은 실제 사용자 부하에 대한 여유가 작음
+
+#### 대안 2 — JDBC batch size 변경
+
+장점:
+
+- 현재 구조를 그대로 유지 가능
+- 구현 변경이 작음
+
+단점:
+
+- 기존 batch-size benchmark에서 500~5,000 사이 차이가 크지 않았음
+- 현재 계측 결과는 JSON preparation이나 chunk 분할보다 `batchUpdate` 내부 bind 이후 구간이 병목임을 보여줌
+- 원인을 확인하지 않은 batch-size 조정은 추측 기반 tuning이 됨
+
+#### 대안 3 — JSON 직렬화 / PreparedStatement binding 최적화
+
+장점:
+
+- Java 코드 안에서 해결 가능
+- DB 설정 변경 없음
+
+단점:
+
+측정 결과 주요 병목이 아니었다.
+
+1,050-span baseline 요청:
+
+```text
+prepareRows median = 1.64ms
+bind median        = 1.19ms
+batchUpdate median = 286.84ms
+```
+
+parameter binding 비중:
+
+```text
+batchUpdate median 기준 약 0.40%
+```
+
+따라서 우선순위가 낮다.
+
+#### 대안 4 — pgJDBC `reWriteBatchedInserts=true`
+
+장점:
+
+- 기존 Spring JDBC 구조 유지
+- 별도 인프라 불필요
+- 애플리케이션 API 구조 변경 없음
+- 실제 N100 sustained workload에서 큰 성능 개선 가능성 확인
+
+단점:
+
+- rewritten batch의 개별 update count를 항상 정확하게 복원할 수 없음
+- 신규와 duplicate가 섞인 batch가 `SUCCESS_NO_INFO`로 분류될 수 있음
+- `insertedCount` / `duplicateCount` 정확성이 낮아질 수 있음
+
+#### 대안 5 — PostgreSQL COPY
+
+장점:
+
+- 대량 삽입에서 높은 처리량 가능성
+
+단점:
+
+- 현재 `ON CONFLICT DO NOTHING` 기반 idempotency 구조와 직접 동일하지 않음
+- 중복 처리 전략을 다시 설계해야 함
+- 현재 문제를 해결하기 위해 즉시 필요한 복잡도보다 큼
+- 먼저 더 단순한 JDBC 최적화를 검증하는 것이 합리적임
+
+#### 대안 6 — Kafka 또는 별도 비동기 ingestion 계층
+
+장점:
+
+- Backend와 DB write 부하 분리 가능
+- buffering과 비동기 처리 확장 가능
+
+단점:
+
+- 현재 규모에서 과도한 운영 복잡도
+- Collector persistent queue가 이미 장애 buffering 역할을 수행
+- 실제 측정된 병목을 단순 설정으로 크게 개선할 수 있는 상황에서 도입 근거 부족
+
+### 병목 분석
+
+1,050-span baseline 요청 185개에서:
+
+```text
+writer_total median       = 288.75ms
+prepare_rows median         = 1.64ms
+batch_update median        = 286.84ms
+bind median                  = 1.19ms
+batch_after_bind median    = 285.54ms
+```
+
+`batchUpdate` 내부 비율:
+
+```text
+bind share median        = 0.40%
+after-bind share median = 99.60%
+```
+
+따라서 주요 병목은 다음 범위로 좁혀졌다.
+
+```text
+JdbcTemplate.batchUpdate
+└── parameter binding 이후
+    ├── JdbcTemplate batch 처리
+    ├── pgJDBC batch 처리
+    ├── PostgreSQL protocol / network
+    ├── INSERT
+    ├── Unique Index
+    ├── ON CONFLICT
+    ├── TimescaleDB write
+    └── update count 처리
+```
+
+### 성능 적용 전 Correctness 검증
+
+`reWriteBatchedInserts=true`를 임시로 활성화한 뒤 다음 시나리오를 검증했다.
+
+```text
+1. 신규 Span 50개
+2. 같은 50개 재전송
+3. 기존 25개 + 신규 25개
+```
+
+결과:
+
+```text
+신규 50개
+received=50
+inserted=0
+duplicates=0
+unknown=50
+
+동일 50개 재전송
+received=50
+inserted=0
+duplicates=50
+unknown=0
+
+기존 25 + 신규 25
+received=50
+inserted=0
+duplicates=0
+unknown=50
+```
+
+최종 DB row:
+
+```text
+75
+```
+
+예상값과 정확히 일치했다.
+
+따라서 다음은 유지된다.
+
+```text
+Unique Index 기반 중복 방지
+ON CONFLICT DO NOTHING
+Collector retry idempotency
+실제 DB 데이터 정합성
+```
+
+반면 다음 내부 분류의 정확성은 항상 유지되지 않는다.
+
+```text
+insertedCount
+duplicateCount
+```
+
+rewritten batch에서 JDBC driver가 row별 결과를 정확히 알 수 없는 경우 `Statement.SUCCESS_NO_INFO`가 반환될 수 있기 때문이다.
+
+AeroTrace는 이미 이를 다음 값으로 표현한다.
+
+```text
+unknownSuccessCount
+```
+
+### 성능 A/B
+
+동일 조건:
+
+```text
+Target = 3,250 spans/s
+Duration = 60초
+Expected = 195,000 spans
+Sender batch = 50
+JDBC batch = 1,000
+주요 Backend request = 1,050 spans
+```
+
+에서 baseline과 rewrite를 각각 총 3회 측정했다.
+
+조건별 run 중앙값:
+
+| 지표 | rewrite=false | rewrite=true | 변화 |
+|---|---:|---:|---:|
+| Writer median | 288.75ms | 107.07ms | -62.9% |
+| BatchUpdate median | 286.84ms | 104.81ms | -63.5% |
+| After-bind median | 285.54ms | 103.47ms | -63.8% |
+| DB CPU avg | 94.36% | 37.55% | -60.2% |
+| DB CPU median | 94.05% | 37.63% | -60.0% |
+
+Collector size-trigger 예상 주기:
+
+```text
+≈ 323.08ms
+```
+
+이를 초과한 1,050-span writer:
+
+```text
+rewrite=false
+57 / 555
+
+rewrite=true
+0 / 554
+```
+
+모든 sustained run에서:
+
+```text
+195000 / 195000 Span 저장
+failed request = 0
+final Collector queue = 0
+final in-flight = 0
+```
+
+을 확인했다.
+
+### 선택
+
+Telemetry 저장용 PostgreSQL JDBC URL에 다음 옵션을 활성화한다.
+
+```text
+reWriteBatchedInserts=true
+```
+
+적용 위치:
+
+```text
+backend/src/main/resources/application.yaml
+docker-compose.yaml
+```
+
+### 선택 이유
+
+- 실제 운영 후보 N100 환경에서 반복 가능한 개선이 확인됐다.
+- 동일 3,250 spans/s workload에서 JDBC writer 중앙값이 약 63% 감소했다.
+- 동일 workload에서 TimescaleDB CPU가 약 60% 감소했다.
+- Collector batch cadence를 초과하던 writer가 반복 rewrite run에서 관찰되지 않았다.
+- 새로운 DB나 메시지 브로커를 추가하지 않고 기존 Spring JDBC 구조를 유지할 수 있다.
+- Collector persistent queue, JDBC batch, TimescaleDB라는 현재 단순한 아키텍처를 유지하면서 병목을 크게 완화한다.
+- 현재 AeroTrace의 MVP 규모와 제한된 홈서버 환경에서 비용 대비 효과가 가장 크다.
+
+### Trade-off
+
+`reWriteBatchedInserts=true`에서는 다음 값이 정확한 row-level 통계가 아닐 수 있다.
+
+```text
+insertedCount
+duplicateCount
+```
+
+특히 신규 row가 하나 이상 포함된 rewritten batch에서 여러 row가 `unknownSuccessCount`로 분류될 수 있다.
+
+하지만 현재:
+
+```text
+DB Unique Index가 실제 중복을 차단
+ON CONFLICT DO NOTHING으로 idempotency 유지
+correctness 테스트에서 최종 DB row 정확성 검증
+OTLP HTTP response에는 inserted / duplicate count 미노출
+SpanWriteResult에 unknownSuccessCount 존재
+```
+
+하므로 이 trade-off를 허용한다.
+
+### 외부 API 계약에 미치는 영향
+
+현재 OTLP ingest API는 성공 시 빈 JSON body를 반환한다.
+
+```json
+{}
+```
+
+따라서 다음 내부 통계는 사용자 API 계약이 아니다.
+
+```text
+inserted
+duplicates
+unknown
+```
+
+현재는 운영 로그와 내부 저장 결과 분석에만 사용한다.
+
+### 이전 Rewrite 보류 결정과의 관계
+
+초기 Windows Docker persistence-only benchmark에서는 `reWriteBatchedInserts=true`가 일관된 개선을 보여주지 않았기 때문에 당시에는 적용을 보류했다.
+
+이번 결정은 이전 측정을 무시하거나 잘못됐다고 판단한 것이 아니다.
+
+측정 환경이 달랐다.
+
+초기:
+
+```text
+Windows 개발 PC
+Docker Desktop
+Persistence-only benchmark
+Collector 없음
+실제 sustained ingest 아님
+DB saturation 낮음
+```
+
+이번:
+
+```text
+N100 운영 후보 서버
+Collector 포함
+3,250 spans/s sustained ingest
+실제 1,050-span Backend request 분포
+높은 TimescaleDB CPU
+반복 A/B
+```
+
+따라서 성능 결정은 실제 운영 후보 workload에서 다시 측정한 결과를 우선했다.
+
+이는 측정 환경과 workload가 달라지면 최적화 효과도 달라질 수 있다는 사례로 기록한다.
+
+### 성능 수치 표현 원칙
+
+이번 테스트로 최대 처리량을 다시 측정하지 않았기 때문에 다음처럼 표현하지 않는다.
+
+```text
+처리량 63% 증가
+최대 처리량 63% 향상
+```
+
+대신 다음처럼 표현한다.
+
+> 동일한 3,250 spans/s sustained workload에서 JDBC writer 중앙값 약 63%, TimescaleDB CPU 약 60% 감소를 조건별 3회 반복 측정으로 확인했다.
+
+### 운영 적용 검증
+
+정식 적용 후 Runtime JDBC URL:
+
+```text
+AEROTRACE_DB_URL=jdbc:postgresql://timescaledb:5432/aerotrace?reWriteBatchedInserts=true
+```
+
+1-span smoke:
+
+```text
+Requested spans: 1
+Accepted spans: 1
+Failed requests: 0
+```
+
+Backend 저장:
+
+```text
+received=1
+inserted=1
+duplicates=0
+unknown=0
+```
+
+Backend:
+
+```text
+status=running
+health=healthy
+restart=0
+```
+
+### 임시 계측 제거
+
+성능 분석을 위해 추가했던 요청 경로의 `System.nanoTime()`과 timing INFO 로그는 원인 분석 완료 후 제거했다.
+
+Benchmark 클래스의 timing 코드는 benchmark 목적이므로 유지했다.
+
+관련 Commit:
+
+```text
+e8a1408 PostgreSQL 배치 INSERT 재작성 최적화 적용
+5152cc1 성능 분석용 임시 계측 코드 제거
+```
+
+### 재검토 조건
+
+다음 조건 중 하나가 발생하면 이 결정을 다시 검토한다.
+
+- Billing이 실제 inserted row 수에 의존
+- Tenant quota 계산이 실제 inserted row 수에 의존
+- 사용자 API에 inserted / duplicate 수를 노출
+- 정확한 row-level ingestion metric이 필요
+- pgJDBC upgrade 후 batch rewrite 또는 update count semantics 변경
+- 데이터 중복 형태가 현재 Unique Identity로 처리되지 않음
+- PostgreSQL COPY가 동일 correctness 조건에서 더 높은 효율을 보인다는 측정 결과 확보
+- 현재 단일 TimescaleDB 저장 구조가 지속적인 bottleneck으로 확인
+- 더 높은 ingest rate에서 Collector backlog가 지속적으로 증가

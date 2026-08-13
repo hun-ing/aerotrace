@@ -5716,3 +5716,746 @@ DB headroom이 상당히 감소했고 사전에 정의한 queue 경계 조건이
 
 측정 전 설정 tuning은 수행하지 않는다.
 
+---
+
+---
+
+## 2026-08-13 — PostgreSQL JDBC Batch 저장 병목 분석과 `reWriteBatchedInserts` 최적화
+
+### 목적
+
+3,250 spans/s sustained telemetry ingest에서 60초 동안 195,000 Span 전량 저장에는 성공했지만 TimescaleDB CPU 사용률이 높은 수준까지 증가하고 일부 Backend 저장 요청이 다음 Collector batch 도착 주기보다 오래 걸리는 현상을 분석했다.
+
+단순히 JDBC batch size나 DB 설정을 변경하지 않고 실제 저장 경로에서 시간이 어디에 소비되는지 단계적으로 계측한 뒤 최적화 후보를 검증했다.
+
+### 테스트 환경
+
+- Java 21
+- Spring Boot 4.1
+- Spring JDBC
+- PostgreSQL 15.18
+- TimescaleDB
+- OpenTelemetry Collector
+- N100 Ubuntu 홈서버
+- Backend JDBC batch size: 1,000
+- Sender batch size: 50
+- Collector `send_batch_size`: 1,024
+- Collector batch timeout: 1초
+- Collector exporter consumers: 2
+- Collector persistent queue size: 50,000
+
+### 주요 테스트 조건
+
+```text
+Target ingest rate: 3,250 spans/s
+Duration: 60초
+Expected spans: 195,000
+Sender batch size: 50
+Backend JDBC batch size: 1,000
+주요 Backend request size: 1,050 Span
+Collector size-trigger 예상 주기: 약 323.08ms
+```
+
+Sender가 초당 65개의 50-span request를 전송하고 Collector batch threshold가 1,024이므로 일반적인 size-trigger 조건에서는 21개의 sender batch가 모인 1,050 Span이 Backend로 전달되는 구조가 확인됐다.
+
+따라서 대부분의 Backend 요청은 JDBC batch size 1,000에 의해 다음 두 chunk로 저장됐다.
+
+```text
+1,050 Span request
+├── 1,000 Span JDBC batch
+└──    50 Span JDBC batch
+```
+
+### 3,250 spans/s sustained baseline
+
+대표 baseline run:
+
+```text
+Target spans/sec: 3250
+Duration sec: 60
+Expected spans: 195000
+
+Requested spans: 195000
+Accepted spans: 195000
+Failed requests: 0
+
+Actual elapsed sec: 60.000071
+Observed accepted spans/sec: 3250.00
+
+DB count: 195000/195000
+Queue: 0
+In flight: 0
+```
+
+Backend request distribution:
+
+```text
+1 x 750 Span
+185 x 1,050 Span
+```
+
+DB CPU:
+
+```text
+full_rate_samples=11
+db_cpu_avg=94.29%
+db_cpu_median=94.05%
+db_cpu_min=86.72%
+db_cpu_max=100.89%
+```
+
+데이터 유실이나 최종 backlog는 없었지만 DB CPU headroom이 매우 작았다.
+
+### PostgreSQL Wait 분석
+
+높은 DB CPU가 lock contention이나 지속적인 storage I/O wait 때문인지 구분하기 위해 PostgreSQL active session과 wait event를 별도로 sampling했다.
+
+3,250 spans/s 조건에서 확인된 주요 값:
+
+```text
+active avg ≈ 0.94
+active max = 1
+
+대부분 active_no_wait
+lock wait 관찰되지 않음
+지속적인 I/O wait 관찰되지 않음
+```
+
+따라서 lock contention이나 persistent I/O wait를 주요 원인으로 볼 근거는 확인되지 않았다.
+
+단, `active_no_wait` 자체는 PostgreSQL 프로세스가 CPU를 실제로 계속 점유하고 있다는 직접 증거가 아니므로 Docker DB CPU 측정값과 함께 해석했다.
+
+### 저장 경로 계측
+
+병목 위치를 좁히기 위해 다음 단계에 임시 timing instrumentation을 추가했다.
+
+```text
+OTLP JSON parsing
+→ PreparedSpanRow 생성 / JSON 직렬화
+→ PreparedStatement parameter binding
+→ JdbcTemplate.batchUpdate
+→ Transaction envelope
+```
+
+Controller에서는 다음을 측정했다.
+
+```text
+parseNanos
+ingestEnvelopeNanos
+```
+
+`JdbcSpanWriter`에서는 다음을 측정했다.
+
+```text
+writerTotalNanos
+prepareRowsNanos
+batchUpdateNanos
+bindNanos
+batchAfterBindNanos
+writerOtherNanos
+```
+
+Chunk별로도 다음을 분리했다.
+
+```text
+chunkPrepareRowsNanos
+chunkBatchUpdateNanos
+chunkBindNanos
+```
+
+### 1,050-span 요청 전체 분석
+
+baseline의 1,050-span 요청 185개를 분석했다.
+
+```text
+writer_total:
+avg=299.91ms
+median=288.75ms
+p95=393.07ms
+p99=449.00ms
+
+prepare_rows:
+avg=2.07ms
+median=1.64ms
+p95=4.35ms
+p99=16.94ms
+
+batch_update:
+avg=297.81ms
+median=286.84ms
+p95=389.16ms
+p99=435.89ms
+
+bind:
+avg=1.39ms
+median=1.19ms
+p95=2.10ms
+p99=5.33ms
+
+batch_after_bind:
+avg=296.42ms
+median=285.54ms
+p95=382.81ms
+p99=431.22ms
+```
+
+`batchUpdate` 내부 비중:
+
+```text
+bind_share_of_batch_update:
+avg=0.45%
+median=0.40%
+p95=0.74%
+
+after_bind_share_of_batch_update:
+avg=99.55%
+median=99.60%
+p95=99.74%
+```
+
+### 1,000-row / 50-row Chunk 분석
+
+1,000-row chunk:
+
+```text
+batch_update median = 272.32ms
+bind median         =   1.13ms
+after_bind median   = 271.15ms
+```
+
+50-row chunk:
+
+```text
+batch_update median = 13.67ms
+bind median         =  0.06ms
+after_bind median   = 13.61ms
+```
+
+두 chunk의 단순 per-row 비용도 크게 다르지 않았다.
+
+다만 50-row chunk는 독립적인 batch-size benchmark가 아니라 동일 Transaction 안의 두 번째 chunk이므로 batch size 50과 1,000의 독립 A/B 결과로 해석하지 않았다.
+
+### 병목 범위 축소
+
+측정 결과 다음 항목은 주요 병목에서 제외했다.
+
+```text
+OTLP JSON parsing
+JSONB 직렬화
+PreparedSpanRow 생성
+PreparedStatement parameter binding
+```
+
+특히 parameter binding은 `batchUpdate` 전체 시간의 중앙값 기준 약 0.40%였다.
+
+병목 범위는 다음으로 좁혀졌다.
+
+```text
+JdbcTemplate.batchUpdate
+└── parameter binding 이후
+    ├── JdbcTemplate batch 처리
+    ├── pgJDBC batch 처리
+    ├── PostgreSQL protocol / network
+    ├── INSERT 실행
+    ├── Unique Index 검사
+    ├── ON CONFLICT 처리
+    ├── TimescaleDB 저장
+    └── update count 결과 처리
+```
+
+`batchAfterBindNanos`는 위 항목을 모두 포함하는 residual이므로 PostgreSQL INSERT 자체의 실행시간이라고 표현하지 않았다.
+
+### Collector Batch Cadence와 Writer 시간 비교
+
+Sender 조건:
+
+```text
+3,250 spans/s
+50 spans/request
+= 65 sender requests/sec
+```
+
+Collector size-trigger는 일반적으로 21개의 sender request가 모이는 시점이다.
+
+```text
+21 / 65 × 1000
+≈ 323.08ms
+```
+
+baseline에서:
+
+```text
+writer > 323.08ms:
+19 / 185
+
+batchAfterBind > 323.08ms:
+18 / 185
+```
+
+일부 Backend writer가 다음 Collector size-trigger 예상 시점보다 오래 걸리고 있었다.
+
+이는 즉시 데이터 유실을 의미하지는 않지만 입력 cadence보다 저장 작업이 느린 요청이 반복될 경우 queue와 backlog 증가 가능성을 높인다.
+
+---
+
+### `reWriteBatchedInserts=true` 후보 검토
+
+현재 JDBC URL에는 `reWriteBatchedInserts` 설정이 없었다.
+
+초기 Windows Docker persistence-only benchmark에서는 rewrite 옵션이 일관된 개선을 보여주지 않아 적용을 보류한 상태였다.
+
+그러나 실제 N100 sustained workload에서는 JDBC/DB 경로가 병목 범위로 좁혀졌기 때문에 운영 후보 환경에서 다시 검증했다.
+
+성능 테스트 전에 먼저 data correctness와 JDBC update count semantics를 검증했다.
+
+### Rewrite correctness 테스트
+
+임시 Docker Compose override로 다음을 적용했다.
+
+```text
+reWriteBatchedInserts=true
+```
+
+테스트 데이터:
+
+```text
+1차 요청
+신규 Span 0..49
+→ 신규 50개
+
+2차 요청
+동일 Span 0..49
+→ 중복 50개
+
+3차 요청
+Span 0..24 + 50..74
+→ 기존 25개 + 신규 25개
+```
+
+첫 신규 50개 결과:
+
+```text
+received=50
+inserted=0
+duplicates=0
+unknown=50
+```
+
+동일 50개 재전송:
+
+```text
+received=50
+inserted=0
+duplicates=50
+unknown=0
+```
+
+기존 25 + 신규 25:
+
+```text
+received=50
+inserted=0
+duplicates=0
+unknown=50
+```
+
+최종 DB:
+
+```text
+75
+```
+
+예상 데이터:
+
+```text
+첫 요청      +50
+두 번째       +0
+mixed        +25
+----------------
+최종          75
+```
+
+와 정확히 일치했다.
+
+### Correctness 결론
+
+확인된 사실:
+
+```text
+DB idempotency                  유지
+중복 Span 추가 저장             없음
+최종 DB row 수                  정확함
+ON CONFLICT 기반 중복 방지       유지
+```
+
+반면 rewritten batch에 신규 row가 포함되면 JDBC driver가 개별 row 결과를 정확히 구분하지 못하고 `Statement.SUCCESS_NO_INFO`를 반환할 수 있었다.
+
+따라서 다음 내부 통계는 항상 정확하지 않게 된다.
+
+```text
+insertedCount
+duplicateCount
+```
+
+현재 `SpanWriteResult`는 이를 위해 이미 다음 필드를 가지고 있다.
+
+```text
+unknownSuccessCount
+```
+
+그리고 OTLP HTTP 응답은 inserted / duplicate / unknown 값을 외부 응답 계약으로 제공하지 않고 `{}`를 반환한다.
+
+따라서 데이터 저장 정합성을 유지하면서 내부 분류 정확성 일부를 성능과 교환하는 것이 현재 MVP에서는 허용 가능한 trade-off라고 판단했다.
+
+---
+
+### Rewrite 단일 A/B 성능 테스트
+
+동일한 3,250 spans/s × 60초 조건에서 rewrite를 활성화했다.
+
+결과:
+
+```text
+Requested spans: 195000
+Accepted spans: 195000
+Failed requests: 0
+Observed accepted spans/sec: 3250.00
+
+DB count: 195000/195000
+Queue: 0
+In flight: 0
+```
+
+DB CPU:
+
+```text
+full_rate_samples=11
+db_cpu_avg=40.88%
+db_cpu_median=42.23%
+db_cpu_min=26.73%
+db_cpu_max=48.43%
+```
+
+rewrite=true의 1,050-span 요청 전체 분석:
+
+```text
+writer_total:
+avg=120.15ms
+median=115.09ms
+p95=145.09ms
+p99=207.85ms
+
+batch_update:
+avg=117.71ms
+median=113.07ms
+p95=142.73ms
+p99=199.95ms
+
+bind:
+avg=1.70ms
+median=1.44ms
+p95=4.22ms
+p99=7.13ms
+
+batch_after_bind:
+avg=116.01ms
+median=111.59ms
+p95=140.11ms
+p99=196.14ms
+```
+
+단일 A/B 중앙값 변화:
+
+```text
+writer_total:
+288.75ms → 115.09ms
+-60.14%
+
+batch_update:
+286.84ms → 113.07ms
+-60.58%
+
+batch_after_bind:
+285.54ms → 111.59ms
+-60.92%
+
+1000-row batch:
+272.32ms → 106.77ms
+-60.79%
+
+1000-row after-bind:
+271.15ms → 105.32ms
+-61.16%
+```
+
+Collector cadence 초과:
+
+```text
+writer > 323.08ms:
+0 / 184
+
+batchAfterBind > 323.08ms:
+0 / 184
+```
+
+단일 실행만으로 개선 수치를 확정하지 않고 반복 A/B를 추가 수행했다.
+
+---
+
+### 반복 A/B 재현성 검증
+
+최초 baseline/rewrite 각 1회에 더해 다음 순서로 추가 실험했다.
+
+```text
+baseline-2
+rewrite-2
+rewrite-3
+baseline-3
+```
+
+한 조건이 항상 먼저 또는 나중에 실행되어 DB cache, 시간 경과, 데이터 증가 영향을 독점하지 않도록 ABBA 형태로 배치했다.
+
+추가 반복 결과:
+
+| Run | Mode | 1050 request | Writer median | Batch median | Bind median | After-bind median | Writer > 323ms | DB CPU avg | DB CPU median |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline-2 | baseline | 185 | 287.77ms | 286.10ms | 1.15ms | 284.82ms | 12 | 94.36% | 90.36% |
+| rewrite-2 | rewrite | 185 | 104.84ms | 102.83ms | 1.40ms | 101.32ms | 0 | 31.74% | 31.52% |
+| rewrite-3 | rewrite | 185 | 107.07ms | 104.81ms | 1.41ms | 103.47ms | 0 | 37.55% | 37.63% |
+| baseline-3 | baseline | 185 | 297.64ms | 296.19ms | 1.09ms | 294.42ms | 26 | 95.40% | 94.84% |
+
+최초 실행까지 포함한 조건별 3회 결과의 run 중앙값:
+
+| 지표 | rewrite=false | rewrite=true | 변화 |
+|---|---:|---:|---:|
+| Writer median | 288.75ms | 107.07ms | -62.9% |
+| BatchUpdate median | 286.84ms | 104.81ms | -63.5% |
+| After-bind median | 285.54ms | 103.47ms | -63.8% |
+| DB CPU avg | 94.36% | 37.55% | -60.2% |
+| DB CPU median | 94.05% | 37.63% | -60.0% |
+
+Collector size-trigger 예상 주기 323.08ms를 초과한 writer:
+
+```text
+rewrite=false
+57 / 555
+
+rewrite=true
+0 / 554
+```
+
+각 sustained run에서 다음을 확인했다.
+
+```text
+Target rate = 3250 spans/s
+Duration = 60초
+Expected = 195000 spans
+
+DB count = 195000/195000
+Failed requests = 0
+Final queue = 0
+Final in-flight = 0
+```
+
+### 성능 결과 해석
+
+이번 결과는 최대 처리량이 63% 증가했다는 의미가 아니다.
+
+최대 안정 처리량을 별도로 다시 탐색하지 않았기 때문이다.
+
+정확한 결론은 다음과 같다.
+
+> 동일한 3,250 spans/s sustained workload에서 `reWriteBatchedInserts=true` 적용 후 JDBC writer 중앙값 약 63%, TimescaleDB CPU 약 60% 감소를 조건별 3회 반복 측정으로 확인했다.
+
+또한 기존에는 일부 writer 실행이 Collector size-trigger 예상 주기보다 길었지만 rewrite 조건에서는 반복 측정 전체에서 해당 cadence를 초과한 1,050-span writer가 관찰되지 않았다.
+
+### 초기 Windows Benchmark와 결과가 달랐던 이유에 대한 판단
+
+초기 benchmark:
+
+```text
+Windows 개발 PC
+Docker Desktop
+Persistence-only
+동시 sustained workload 없음
+Collector 없음
+낮은 DB 포화도
+```
+
+이번 benchmark:
+
+```text
+N100 실제 운영 후보 서버
+Collector 포함
+3,250 spans/s sustained workload
+1,050-span Backend request 중심
+높은 DB CPU
+실제 runtime request distribution
+```
+
+따라서 초기 결과를 잘못된 실험으로 폐기하지 않았다.
+
+대신 다음 교훈을 얻었다.
+
+> 성능 최적화의 효과는 workload와 실행 환경에 따라 달라질 수 있으므로 개발 PC의 micro/persistence benchmark만으로 운영 설정을 결정하면 안 된다.
+
+초기에는 측정 결과에 따라 rewrite를 보류했고, 실제 운영 후보 workload에서 병목이 확인된 뒤 다시 측정하여 결정을 변경했다.
+
+### 최종 결정
+
+Telemetry 저장용 PostgreSQL JDBC URL에 다음을 정식 적용했다.
+
+```text
+reWriteBatchedInserts=true
+```
+
+변경 파일:
+
+```text
+backend/src/main/resources/application.yaml
+docker-compose.yaml
+```
+
+Commit:
+
+```text
+e8a1408 PostgreSQL 배치 INSERT 재작성 최적화 적용
+```
+
+홈서버 실제 Runtime:
+
+```text
+AEROTRACE_DB_URL=jdbc:postgresql://timescaledb:5432/aerotrace?reWriteBatchedInserts=true
+```
+
+### 배포 후 Smoke 검증
+
+최적화 적용 후 1-span:
+
+```text
+Requested spans: 1
+Accepted spans: 1
+Failed requests: 0
+```
+
+Backend:
+
+```text
+received=1
+inserted=1
+duplicates=0
+unknown=0
+```
+
+최종 Backend 상태:
+
+```text
+status=running
+health=healthy
+restart=0
+```
+
+### 임시 성능 계측 코드 제거
+
+병목 분석 완료 후 운영 요청 경로에 추가했던 임시 timing instrumentation을 제거했다.
+
+제거 대상:
+
+```text
+Controller parse timing
+Controller ingestion envelope timing
+Writer total timing
+prepareRows timing
+batchUpdate timing
+row별 bind timing
+chunk별 timing list
+성능 분석용 INFO 로그
+```
+
+Benchmark 전용 클래스의 `System.nanoTime()`은 benchmark 목적이므로 유지했다.
+
+Commit:
+
+```text
+5152cc1 성능 분석용 임시 계측 코드 제거
+```
+
+배포 후 smoke에서 다음 성능 분석용 로그가 더 이상 발생하지 않는 것을 확인했다.
+
+```text
+JDBC Span writer timing
+OTLP trace timing
+```
+
+운영 저장 결과 로그는 유지했다.
+
+```text
+OTLP trace request stored
+```
+
+### 남은 Trade-off
+
+`reWriteBatchedInserts=true`에서는 rewritten batch의 개별 INSERT 결과를 항상 정확하게 구분할 수 없으므로 다음 값은 운영상 정확한 통계로 사용할 수 없다.
+
+```text
+insertedCount
+duplicateCount
+```
+
+특히 신규 row가 포함된 rewritten batch에서는 `unknownSuccessCount`가 증가할 수 있다.
+
+현재는 다음 이유로 해당 trade-off를 허용한다.
+
+```text
+DB Unique Index가 중복 저장 최종 방어
+ON CONFLICT DO NOTHING으로 idempotency 유지
+실제 correctness test에서 최종 row 수 검증
+OTLP API가 inserted/duplicate count를 외부 계약으로 노출하지 않음
+unknownSuccessCount가 이미 모델링되어 있음
+```
+
+다음 요구가 생기면 반드시 재검토한다.
+
+```text
+Billing이 실제 inserted row 수에 의존
+Tenant quota가 실제 inserted row 수에 의존
+사용자에게 inserted / duplicate 결과를 제공
+정확한 row 단위 ingest metric이 필요
+pgJDBC upgrade로 rewrite semantics가 변경
+```
+
+### 보존해야 할 측정 자료
+
+반복 A/B:
+
+```text
+/home/huning/aerotrace/benchmark-results/rewrite-ab-repeat-20260813T001308Z
+```
+
+추가 보존 자료:
+
+```text
+최초 3250 spans/s baseline sender 결과
+최초 rewrite sender 결과
+baseline/rewrite resources.tsv
+Backend timing 로그
+PostgreSQL wait sampling 결과
+rewrite correctness 테스트 로그
+DB 최종 count=75 출력
+195000/195000 sustained 결과
+runtime JDBC URL 확인 출력
+Backend healthy / restart=0 출력
+```
+
+### 실무적 교훈
+
+- 높은 DB CPU 하나만으로 원인을 단정하지 않는다.
+- 성능 병목은 큰 구간에서 작은 구간으로 단계적으로 분리한다.
+- `JdbcTemplate.batchUpdate()` 시간 전체를 PostgreSQL SQL 실행시간이라고 부르면 안 된다.
+- parameter binding과 DB/JDBC 실행 비용을 분리하면 잘못된 Java-side 최적화를 피할 수 있다.
+- 성능 옵션 적용 전에 데이터 정합성과 API semantics를 별도로 검증해야 한다.
+- 한 번의 benchmark 결과가 아니라 반복 A/B로 재현성을 확인해야 한다.
+- micro benchmark 결과보다 실제 운영 후보 workload의 측정 결과가 최종 설정 결정에 더 중요하다.
+- 성능 진단용 instrumentation은 분석이 끝난 뒤 운영 코드에서 제거한다.
+- 최적화 결과는 측정한 범위만 표현하고 최대 처리량 증가처럼 측정하지 않은 성과를 과장하지 않는다.
+
