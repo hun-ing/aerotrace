@@ -16,6 +16,11 @@ duration_sec="${DURATION_SEC:-60}"
 batch_size="${BATCH_SIZE:-50}"
 monitor_interval="${MONITOR_INTERVAL_SEC:-5}"
 
+sender_workers="${SENDER_WORKERS:-4}"
+sender_queue_capacity="${SENDER_QUEUE_CAPACITY:-32}"
+max_rate_error_pct="${MAX_RATE_ERROR_PCT:-1.0}"
+max_p99_lag_intervals="${MAX_P99_LAG_INTERVALS:-2.0}"
+
 pre_load_sec=5
 post_load_sec=5
 
@@ -106,7 +111,9 @@ for value in \
   "${target_rate}" \
   "${duration_sec}" \
   "${batch_size}" \
-  "${monitor_interval}"
+  "${monitor_interval}" \
+  "${sender_workers}" \
+  "${sender_queue_capacity}"
 do
   if ! positive_integer "${value}"; then
     echo "All numeric parameters must be positive integers."
@@ -131,6 +138,18 @@ printf 'Duration sec:     %s\n' \
 
 printf 'Batch size:       %s\n' \
   "${batch_size}"
+
+printf 'Sender workers:   %s\n' \
+  "${sender_workers}"
+
+printf 'Sender queue:     %s\n' \
+  "${sender_queue_capacity}"
+
+printf 'Max rate error:   %s%%\n' \
+  "${max_rate_error_pct}"
+
+printf 'Max p99 lag:      %s intervals\n' \
+  "${max_p99_lag_intervals}"
 
 printf 'Total spans:      %s\n' \
   "${total_spans}"
@@ -258,6 +277,10 @@ python3 \
   --target-spans-per-sec "${target_rate}" \
   --duration-sec "${duration_sec}" \
   --batch-size "${batch_size}" \
+  --workers "${sender_workers}" \
+  --queue-capacity "${sender_queue_capacity}" \
+  --max-rate-error-pct "${max_rate_error_pct}" \
+  --max-p99-lag-intervals "${max_p99_lag_intervals}" \
   2>&1 |
 tee \
   "${sender_log}"
