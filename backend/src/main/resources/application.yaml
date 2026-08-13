@@ -10,7 +10,7 @@ spring:
     keep-alive: true
 
   datasource:
-    url: ${AEROTRACE_DB_URL:jdbc:postgresql://localhost:5432/aerotrace}
+    url: ${AEROTRACE_DB_URL:jdbc:postgresql://localhost:5432/aerotrace?reWriteBatchedInserts=true}
     username: ${AEROTRACE_DB_USERNAME:postgres}
     password: ${AEROTRACE_DB_PASSWORD}
 

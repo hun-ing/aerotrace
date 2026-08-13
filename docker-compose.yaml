@@ -85,7 +85,7 @@ services:
 
     environment:
       AEROTRACE_DB_URL: >-
-        jdbc:postgresql://timescaledb:5432/${AEROTRACE_DB_NAME}
+        jdbc:postgresql://timescaledb:5432/${AEROTRACE_DB_NAME}?reWriteBatchedInserts=true
       AEROTRACE_DB_USERNAME: ${AEROTRACE_DB_USERNAME}
       AEROTRACE_DB_PASSWORD: ${AEROTRACE_DB_PASSWORD}
 
