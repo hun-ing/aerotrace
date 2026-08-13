@@ -13,7 +13,6 @@ import org.springframework.stereotype.Repository;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -56,28 +55,6 @@ public class JdbcSpanWriter implements SpanWriter {
       return SpanWriteResult.empty();
     }
 
-    long writerStartedAt =
-            System.nanoTime();
-
-    long totalPrepareRowsNanos = 0L;
-    long totalBatchUpdateNanos = 0L;
-    long totalBindNanos = 0L;
-
-    List<Integer> chunkSizes =
-            new ArrayList<>();
-
-    List<Integer> rowCounts =
-            new ArrayList<>();
-
-    List<Long> chunkPrepareRowsNanos =
-            new ArrayList<>();
-
-    List<Long> chunkBatchUpdateNanos =
-            new ArrayList<>();
-
-    List<Long> chunkBindNanos =
-            new ArrayList<>();
-
     int insertedCount = 0;
     int duplicateCount = 0;
     int unknownSuccessCount = 0;
@@ -104,9 +81,6 @@ public class JdbcSpanWriter implements SpanWriter {
                       toIndex
               );
 
-      long prepareRowsStartedAt =
-              System.nanoTime();
-
       List<JdbcSpanPersistenceSupport.PreparedSpanRow> rows =
               persistenceSupport.prepareRows(
                       tenantId,
@@ -114,34 +88,8 @@ public class JdbcSpanWriter implements SpanWriter {
                       chunk
               );
 
-      long prepareRowsNanos =
-              System.nanoTime()
-                      - prepareRowsStartedAt;
-
-      totalPrepareRowsNanos +=
-              prepareRowsNanos;
-
-      long batchUpdateStartedAt =
-              System.nanoTime();
-
-      BatchExecutionResult batchExecutionResult =
-              executeBatch(rows);
-
-      long batchUpdateNanos =
-              System.nanoTime()
-                      - batchUpdateStartedAt;
-
       int[] updateCounts =
-              batchExecutionResult.updateCounts();
-
-      long bindNanos =
-              batchExecutionResult.bindNanos();
-
-      totalBindNanos +=
-              bindNanos;
-
-      totalBatchUpdateNanos +=
-              batchUpdateNanos;
+              executeBatch(rows);
 
       SpanWriteResult chunkResult =
               classifyResult(
@@ -158,26 +106,6 @@ public class JdbcSpanWriter implements SpanWriter {
       unknownSuccessCount +=
               chunkResult.unknownSuccessCount();
 
-      chunkSizes.add(
-              currentBatchSize
-      );
-
-      rowCounts.add(
-              rows.size()
-      );
-
-      chunkPrepareRowsNanos.add(
-              prepareRowsNanos
-      );
-
-      chunkBatchUpdateNanos.add(
-              batchUpdateNanos
-      );
-
-      chunkBindNanos.add(
-              bindNanos
-      );
-
       batchExecutionCount++;
       fromIndex = toIndex;
     }
@@ -189,36 +117,6 @@ public class JdbcSpanWriter implements SpanWriter {
                     duplicateCount,
                     unknownSuccessCount
             );
-
-    long writerTotalNanos =
-            System.nanoTime()
-                    - writerStartedAt;
-
-    long writerOtherNanos =
-            writerTotalNanos
-                    - totalPrepareRowsNanos
-                    - totalBatchUpdateNanos;
-
-    long batchAfterBindNanos =
-            totalBatchUpdateNanos
-                    - totalBindNanos;
-
-    log.info(
-            "JDBC Span writer timing: requested={}, executions={}, writerTotalNanos={}, prepareRowsNanos={}, batchUpdateNanos={}, bindNanos={}, batchAfterBindNanos={}, writerOtherNanos={}, chunkSizes={}, rowCounts={}, chunkPrepareRowsNanos={}, chunkBatchUpdateNanos={}, chunkBindNanos={}",
-            result.requestedCount(),
-            batchExecutionCount,
-            writerTotalNanos,
-            totalPrepareRowsNanos,
-            totalBatchUpdateNanos,
-            totalBindNanos,
-            batchAfterBindNanos,
-            writerOtherNanos,
-            chunkSizes,
-            rowCounts,
-            chunkPrepareRowsNanos,
-            chunkBatchUpdateNanos,
-            chunkBindNanos
-    );
 
     log.debug(
             "JDBC Span batch completed: requested={}, batchSize={}, executions={}, inserted={}, duplicates={}, unknown={}",
@@ -233,44 +131,29 @@ public class JdbcSpanWriter implements SpanWriter {
     return result;
   }
 
-  private BatchExecutionResult executeBatch(
+  private int[] executeBatch(
           List<JdbcSpanPersistenceSupport.PreparedSpanRow> rows
   ) {
-    long[] bindNanos = {0L};
+    return jdbcTemplate.batchUpdate(
+            JdbcSpanPersistenceSupport.INSERT_SQL,
+            new BatchPreparedStatementSetter() {
 
-    int[] updateCounts =
-            jdbcTemplate.batchUpdate(
-                    JdbcSpanPersistenceSupport.INSERT_SQL,
-                    new BatchPreparedStatementSetter() {
+              @Override
+              public void setValues(
+                      PreparedStatement statement,
+                      int index
+              ) throws SQLException {
+                persistenceSupport.bind(
+                        statement,
+                        rows.get(index)
+                );
+              }
 
-                      @Override
-                      public void setValues(
-                              PreparedStatement statement,
-                              int index
-                      ) throws SQLException {
-                        long bindStartedAt =
-                                System.nanoTime();
-
-                        persistenceSupport.bind(
-                                statement,
-                                rows.get(index)
-                        );
-
-                        bindNanos[0] +=
-                                System.nanoTime()
-                                        - bindStartedAt;
-                      }
-
-                      @Override
-                      public int getBatchSize() {
-                        return rows.size();
-                      }
-                    }
-            );
-
-    return new BatchExecutionResult(
-            updateCounts,
-            bindNanos[0]
+              @Override
+              public int getBatchSize() {
+                return rows.size();
+              }
+            }
     );
   }
 
@@ -316,11 +199,5 @@ public class JdbcSpanWriter implements SpanWriter {
             duplicateCount,
             unknownSuccessCount
     );
-  }
-
-  private record BatchExecutionResult(
-          int[] updateCounts,
-          long bindNanos
-  ) {
   }
 }
