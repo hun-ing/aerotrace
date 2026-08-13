@@ -146,11 +146,35 @@ def sender_worker(
                 if task is None:
                     return
 
+                dequeued_at = time.perf_counter()
+
+                worker_dequeue_lag_ms = max(
+                    0.0,
+                    (
+                        dequeued_at
+                        - task.scheduled_at
+                    )
+                    * 1000.0,
+                )
+
+                payload_wall_start = time.perf_counter()
+                payload_cpu_start = time.thread_time()
+
                 payload = build_payload(
                     span_prefix,
                     task.first_span_number,
                     task.span_count,
                 )
+
+                payload_cpu_ms = (
+                    time.thread_time()
+                    - payload_cpu_start
+                ) * 1000.0
+
+                payload_wall_ms = (
+                    time.perf_counter()
+                    - payload_wall_start
+                ) * 1000.0
 
                 request_start = time.perf_counter()
 
@@ -194,6 +218,24 @@ def sender_worker(
                             send_start_lag_ms
                         )
 
+                        stats[
+                            "worker_dequeue_lags_ms"
+                        ].append(
+                            worker_dequeue_lag_ms
+                        )
+
+                        stats[
+                            "payload_build_wall_ms"
+                        ].append(
+                            payload_wall_ms
+                        )
+
+                        stats[
+                            "payload_build_cpu_ms"
+                        ].append(
+                            payload_cpu_ms
+                        )
+
                         if response.status == 200:
                             stats[
                                 "accepted_requests"
@@ -231,6 +273,24 @@ def sender_worker(
                             "send_start_lags_ms"
                         ].append(
                             send_start_lag_ms
+                        )
+
+                        stats[
+                            "worker_dequeue_lags_ms"
+                        ].append(
+                            worker_dequeue_lag_ms
+                        )
+
+                        stats[
+                            "payload_build_wall_ms"
+                        ].append(
+                            payload_wall_ms
+                        )
+
+                        stats[
+                            "payload_build_cpu_ms"
+                        ].append(
+                            payload_cpu_ms
                         )
 
                         stats[
@@ -454,6 +514,10 @@ def main():
         "producer_lags_ms": [],
         "send_start_lags_ms": [],
         "producer_backpressure_events": 0,
+        "worker_dequeue_lags_ms": [],
+        "payload_build_wall_ms": [],
+        "payload_build_cpu_ms": [],
+        "producer_backpressure_wait_ms": [],
     }
 
     workers = []
@@ -524,16 +588,31 @@ def main():
                 scheduled_at=scheduled_at,
             )
 
+            backpressure_wait_ms = 0.0
+
             try:
                 task_queue.put_nowait(task)
 
             except queue.Full:
+                backpressure_start = time.perf_counter()
+
+                task_queue.put(task)
+
+                backpressure_wait_ms = (
+                    time.perf_counter()
+                    - backpressure_start
+                ) * 1000.0
+
                 with stats_lock:
                     stats[
                         "producer_backpressure_events"
                     ] += 1
 
-                task_queue.put(task)
+                    stats[
+                        "producer_backpressure_wait_ms"
+                    ].append(
+                        backpressure_wait_ms
+                    )
 
             enqueued_at = time.perf_counter()
 
@@ -596,6 +675,22 @@ def main():
 
     send_start_lags_ms = stats[
         "send_start_lags_ms"
+    ]
+
+    worker_dequeue_lags_ms = stats[
+        "worker_dequeue_lags_ms"
+    ]
+
+    payload_build_wall_ms = stats[
+        "payload_build_wall_ms"
+    ]
+
+    payload_build_cpu_ms = stats[
+        "payload_build_cpu_ms"
+    ]
+
+    producer_backpressure_wait_ms = stats[
+        "producer_backpressure_wait_ms"
     ]
 
     producer_backpressure_events = stats[
@@ -753,6 +848,86 @@ def main():
     print(
         "Send-start lag max ms:  "
         f"{max(send_start_lags_ms, default=0.0):.3f}"
+    )
+
+    print(
+        "Worker dequeue lag p50 ms: "
+        f"{percentile(worker_dequeue_lags_ms, 50):.3f}"
+    )
+
+    print(
+        "Worker dequeue lag p95 ms: "
+        f"{percentile(worker_dequeue_lags_ms, 95):.3f}"
+    )
+
+    print(
+        "Worker dequeue lag p99 ms: "
+        f"{percentile(worker_dequeue_lags_ms, 99):.3f}"
+    )
+
+    print(
+        "Worker dequeue lag max ms: "
+        f"{max(worker_dequeue_lags_ms, default=0.0):.3f}"
+    )
+
+    print(
+        "Payload build wall p50 ms: "
+        f"{percentile(payload_build_wall_ms, 50):.3f}"
+    )
+
+    print(
+        "Payload build wall p95 ms: "
+        f"{percentile(payload_build_wall_ms, 95):.3f}"
+    )
+
+    print(
+        "Payload build wall p99 ms: "
+        f"{percentile(payload_build_wall_ms, 99):.3f}"
+    )
+
+    print(
+        "Payload build wall max ms: "
+        f"{max(payload_build_wall_ms, default=0.0):.3f}"
+    )
+
+    print(
+        "Payload build CPU p50 ms:  "
+        f"{percentile(payload_build_cpu_ms, 50):.3f}"
+    )
+
+    print(
+        "Payload build CPU p95 ms:  "
+        f"{percentile(payload_build_cpu_ms, 95):.3f}"
+    )
+
+    print(
+        "Payload build CPU p99 ms:  "
+        f"{percentile(payload_build_cpu_ms, 99):.3f}"
+    )
+
+    print(
+        "Payload build CPU max ms:  "
+        f"{max(payload_build_cpu_ms, default=0.0):.3f}"
+    )
+
+    print(
+        "Backpressure wait total ms: "
+        f"{sum(producer_backpressure_wait_ms):.3f}"
+    )
+
+    print(
+        "Backpressure wait p95 ms:  "
+        f"{percentile(producer_backpressure_wait_ms, 95):.3f}"
+    )
+
+    print(
+        "Backpressure wait p99 ms:  "
+        f"{percentile(producer_backpressure_wait_ms, 99):.3f}"
+    )
+
+    print(
+        "Backpressure wait max ms:  "
+        f"{max(producer_backpressure_wait_ms, default=0.0):.3f}"
     )
 
     print(
