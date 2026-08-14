@@ -3077,3 +3077,305 @@ metric/config/threshold를 신뢰할 수 없는 경우
 - Backend 처리량 변경
 - Collector batch 또는 consumer 설정 변경
 - 실제 WARNING/CRITICAL 발생 이력 축적
+
+---
+
+## Collector Queue Alert 상태 전이 및 중복 억제 정책
+
+### 해결하려는 문제
+
+Collector queue 상태를 주기적으로 검사할 경우 동일한 장애 상태가 지속되는 동안 매 실행마다 알림을 전송하면 alert storm이 발생한다.
+
+예를 들어 5초마다 queue 상태를 확인하고 CRITICAL 상태가 1분 지속되면 단순 구현에서는 동일한 CRITICAL 알림이 약 12회 발생할 수 있다.
+
+따라서 queue 상태 판정과 실제 알림 발생 여부를 분리한다.
+
+구조:
+
+```text
+Collector metrics
+    ↓
+check-collector-queue.py
+    ↓
+evaluate-collector-queue-alert.py
+    ↓
+향후 notification adapter
+```
+
+`check-collector-queue.py`는 현재 상태를 판정하고, `evaluate-collector-queue-alert.py`는 이전 상태와 비교해 알림 이벤트가 필요한지를 결정한다.
+
+### 상태 전이 정책
+
+기본 상태:
+
+```text
+OK
+WARNING
+CRITICAL
+UNKNOWN
+```
+
+상태 전이별 이벤트:
+
+```text
+최초 OK
+→ NONE
+
+최초 non-OK
+→ ALERT
+
+OK → WARNING
+→ ALERT
+
+WARNING → WARNING
+→ NONE
+
+WARNING → CRITICAL
+→ STATUS_CHANGE
+
+CRITICAL → CRITICAL
+→ NONE
+→ repeat interval 이후 REMINDER 가능
+
+WARNING/CRITICAL/UNKNOWN → OK
+→ RECOVERY
+
+Collector/checker 상태 확인 불가
+→ UNKNOWN
+```
+
+동일 상태가 지속될 때는 기본적으로 중복 알림을 발생시키지 않는다.
+
+### Persistent Alert State
+
+상태 전이를 판단하려면 이전 실행 상태가 필요하다.
+
+기본 state file:
+
+```text
+~/.local/state/aerotrace/collector-queue-alert.json
+```
+
+`XDG_STATE_HOME`이 설정된 환경에서는 해당 경로를 사용한다.
+
+state에는 다음 정보를 저장한다.
+
+```text
+current_status
+last_evaluated_at
+last_changed_at
+last_notification_at
+last_notification_epoch
+```
+
+state file은 임시 파일에 먼저 기록하고 flush + fsync 후 rename하는 방식으로 교체해 부분 기록 가능성을 줄인다.
+
+### Reminder 정책
+
+non-OK 상태가 장시간 지속될 경우 최초 알림만 발생하고 이후 영원히 조용한 것도 운영상 문제가 될 수 있다.
+
+따라서:
+
+```text
+--repeat-after-sec
+```
+
+를 지원한다.
+
+기본값:
+
+```text
+300 sec
+```
+
+동일 WARNING, CRITICAL 또는 UNKNOWN 상태가 계속되더라도 마지막 notification 이후 지정 시간이 지나면:
+
+```text
+REMINDER
+```
+
+이벤트를 다시 발생시킬 수 있다.
+
+실제 notification adapter가 연결된 뒤 운영 상황을 보고 reminder interval을 재조정한다.
+
+### Evaluator Exit Code 정책
+
+queue checker는 상태 자체를 exit code에 표현한다.
+
+```text
+OK       = 0
+WARNING  = 1
+CRITICAL = 2
+UNKNOWN  = 3
+```
+
+하지만 evaluator가 같은 값을 그대로 반환하면 systemd 같은 scheduler가 WARNING 또는 CRITICAL을 evaluator process failure로 오인할 수 있다.
+
+따라서 evaluator는 다음 정책을 사용한다.
+
+```text
+상태 평가 자체 성공
+→ exit 0
+
+evaluator 자체 설정/state 처리 실패
+→ exit 4
+```
+
+WARNING/CRITICAL/UNKNOWN 여부는 process exit code가 아니라:
+
+```text
+current_status
+alert_required
+event
+```
+
+출력으로 전달한다.
+
+### UNKNOWN과 Evaluator Failure 구분
+
+두 상태는 반드시 구분한다.
+
+#### 운영 상태 UNKNOWN
+
+예:
+
+```text
+Collector metrics endpoint 접근 실패
+checker 실행 파일 없음
+checker timeout
+checker exit/status 불일치
+```
+
+이 경우 evaluator 자체는 정상적으로 문제를 감지했다.
+
+결과:
+
+```text
+current_status=UNKNOWN
+alert_required=true
+evaluator exit=0
+```
+
+#### Evaluator 자체 실패
+
+예:
+
+```text
+잘못된 evaluator argument
+손상된 state JSON
+state file write 실패
+```
+
+이 경우 evaluator가 정상적인 상태 판정을 수행하지 못했다.
+
+결과:
+
+```text
+evaluator exit=4
+```
+
+### 실제 상태 전이 검증
+
+실제 Collector 정상 상태:
+
+```text
+previous_status=NONE
+current_status=OK
+
+event=NONE
+alert_required=false
+checker_exit_code=0
+evaluator_rc=0
+```
+
+가짜 checker를 사용해 상태 머신을 독립적으로 검증했다.
+
+```text
+OK → WARNING
+
+event=ALERT
+alert_required=true
+checker_exit_code=1
+evaluator_rc=0
+```
+
+동일 WARNING 반복:
+
+```text
+WARNING → WARNING
+
+event=NONE
+alert_required=false
+evaluator_rc=0
+```
+
+WARNING에서 CRITICAL 승격:
+
+```text
+WARNING → CRITICAL
+
+event=STATUS_CHANGE
+alert_required=true
+checker_exit_code=2
+```
+
+CRITICAL 복구:
+
+```text
+CRITICAL → OK
+
+event=RECOVERY
+alert_required=true
+checker_exit_code=0
+```
+
+최초 UNKNOWN:
+
+```text
+previous_status=NONE
+current_status=UNKNOWN
+
+event=ALERT
+alert_required=true
+checker_exit_code=3
+evaluator_rc=0
+```
+
+checker 실행 파일이 존재하지 않는 경우:
+
+```text
+current_status=UNKNOWN
+checker_exit_code=N/A
+alert_required=true
+evaluator_rc=0
+```
+
+Evaluator 자체 argument 오류:
+
+```text
+--repeat-after-sec -1
+
+evaluator_error=--repeat-after-sec must be >= 0
+evaluator_rc=4
+```
+
+### 최종 결정
+
+AeroTrace Collector queue alert는 매 실행마다 직접 알림을 전송하지 않는다.
+
+다음 두 단계를 분리한다.
+
+```text
+1. 현재 queue 상태 판정
+2. 이전 상태와 비교해 notification event 결정
+```
+
+향후 systemd, cron 또는 온프레미스 scheduler는 동일 evaluator를 실행할 수 있으며 실제 Slack, email 등의 notification adapter는 evaluator가:
+
+```text
+alert_required=true
+```
+
+를 반환한 경우에만 동작하도록 구성한다.
+
+이를 통해 실행 환경과 alert state machine을 분리하고 alert storm을 방지한다.

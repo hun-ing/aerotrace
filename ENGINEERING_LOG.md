@@ -8312,3 +8312,310 @@ Collector 자체가 죽어 metrics를 읽을 수 없는 UNKNOWN은 어떻게 처
 ```
 
 를 설계한다.
+
+---
+
+## Collector Queue Alert 상태 전이 및 중복 알림 억제 구현
+
+### 목적
+
+`check-collector-queue.py`를 반복 실행할 수 있게 된 뒤 실제 운영 자동화를 위해 다음 문제가 남았다.
+
+```text
+동일 WARNING/CRITICAL이 반복될 때 중복 알림 방지
+상태가 악화될 때 재알림
+복구 시 recovery 알림
+Collector 자체 장애 감지
+scheduler와 alert 상태 판정 분리
+```
+
+이를 위해 다음 파일을 추가했다.
+
+```text
+scripts/evaluate-collector-queue-alert.py
+```
+
+### 구성
+
+```text
+Collector metrics
+    ↓
+scripts/check-collector-queue.py
+    ↓
+scripts/evaluate-collector-queue-alert.py
+```
+
+queue checker는 현재 상태만 판정한다.
+
+```text
+OK       → exit 0
+WARNING  → exit 1
+CRITICAL → exit 2
+UNKNOWN  → exit 3
+```
+
+Evaluator는 이전 상태를 state file에 저장하고 상태 전이 여부를 판단한다.
+
+### Evaluator Event
+
+지원 event:
+
+```text
+NONE
+ALERT
+STATUS_CHANGE
+RECOVERY
+REMINDER
+```
+
+의미:
+
+```text
+NONE
+→ notification 필요 없음
+
+ALERT
+→ 정상에서 장애 상태로 전환되었거나 최초 non-OK 상태
+
+STATUS_CHANGE
+→ WARNING → CRITICAL 등 non-OK 상태 사이의 변화
+
+RECOVERY
+→ non-OK → OK
+
+REMINDER
+→ 동일 장애 상태가 repeat interval 이상 지속
+```
+
+### 실제 Collector 정상 상태 테스트
+
+실제 Collector queue가 비어 있는 상태에서:
+
+```text
+event=NONE
+alert_required=false
+previous_status=NONE
+current_status=OK
+checker_exit_code=0
+evaluator_rc=0
+```
+
+state file:
+
+```json
+{
+  "current_status": "OK",
+  "last_changed_at": "2026-08-14T06:09:15+00:00",
+  "last_evaluated_at": "2026-08-14T06:09:15+00:00"
+}
+```
+
+가 생성됐다.
+
+### 상태 머신 테스트
+
+실제 queue를 반복적으로 채우는 대신 임시 fake checker를 사용해 evaluator의 상태 전이 로직을 독립적으로 검증했다.
+
+#### 최초 OK
+
+```text
+event=NONE
+alert_required=false
+previous_status=NONE
+current_status=OK
+checker_exit_code=0
+```
+
+#### OK → WARNING
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=WARNING
+checker_exit_code=1
+
+evaluator_rc=0
+```
+
+#### WARNING 지속
+
+```text
+event=NONE
+alert_required=false
+previous_status=WARNING
+current_status=WARNING
+
+evaluator_rc=0
+```
+
+동일 WARNING이 반복돼도 새로운 alert event가 발생하지 않았다.
+
+#### WARNING → CRITICAL
+
+```text
+event=STATUS_CHANGE
+alert_required=true
+previous_status=WARNING
+current_status=CRITICAL
+checker_exit_code=2
+```
+
+장애 수준이 상승하면 새로운 notification event가 발생한다.
+
+#### CRITICAL → OK
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=CRITICAL
+current_status=OK
+checker_exit_code=0
+```
+
+복구 상태 역시 notification 대상으로 분류된다.
+
+#### 최초 UNKNOWN
+
+```text
+event=ALERT
+alert_required=true
+previous_status=NONE
+current_status=UNKNOWN
+checker_exit_code=3
+
+evaluator_rc=0
+```
+
+UNKNOWN을 단순 무시하지 않는다.
+
+### Checker 자체 실행 실패
+
+존재하지 않는 checker 경로:
+
+```text
+/tmp/aerotrace-does-not-exist.py
+```
+
+를 사용했다.
+
+결과:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=NONE
+current_status=UNKNOWN
+checker_exit_code=N/A
+
+checker_stderr=
+checker execution failed:
+No such file or directory
+
+missing_checker_rc=0
+```
+
+즉 checker/Collector 계층의 문제는 운영 상태 UNKNOWN으로 정상 분류했다.
+
+Evaluator 자체는 정상적으로 한 번의 평가를 수행했으므로 exit code는 0이다.
+
+### Evaluator 자체 실패
+
+잘못된 설정:
+
+```text
+--repeat-after-sec -1
+```
+
+결과:
+
+```text
+evaluator_error=
+--repeat-after-sec must be >= 0
+
+evaluator_error_rc=4
+```
+
+따라서 다음을 구분할 수 있다.
+
+```text
+Collector/checker 문제
+→ UNKNOWN
+→ evaluator exit 0
+
+Evaluator 자체 문제
+→ evaluator exit 4
+```
+
+### Alert Storm 방지
+
+향후 evaluator를 5초마다 실행하더라도 상태가 변하지 않으면:
+
+```text
+WARNING → WARNING
+CRITICAL → CRITICAL
+```
+
+에서는 `event=NONE`이므로 매 실행마다 알림을 보내지 않는다.
+
+단, 장시간 장애를 완전히 잊는 것을 막기 위해:
+
+```text
+--repeat-after-sec
+```
+
+기능을 제공한다.
+
+기본:
+
+```text
+300 sec
+```
+
+이후 실제 alert sender가 추가되면 REMINDER 경로도 함께 검증한다.
+
+### Persistent State
+
+기본 state file:
+
+```text
+~/.local/state/aerotrace/collector-queue-alert.json
+```
+
+state 기록은:
+
+```text
+temporary file write
+→ flush
+→ fsync
+→ rename
+```
+
+순서로 처리해 일부만 기록된 state를 읽을 위험을 줄였다.
+
+### 실무적 교훈
+
+- 상태 판정과 notification 발생 여부는 서로 다른 책임이다.
+- polling 주기가 짧다고 동일 장애 알림도 같은 빈도로 전송하면 안 된다.
+- WARNING에서 CRITICAL로 악화되는 상태 변화는 새로운 이벤트로 취급해야 한다.
+- 장애 발생 알림만큼 복구 알림도 중요하다.
+- UNKNOWN은 정상 상태가 아니며 monitoring path 자체의 장애일 수 있다.
+- scheduler가 해석하는 process failure와 실제 서비스 WARNING/CRITICAL을 분리해야 한다.
+- state machine을 실제 대규모 장애 실험 없이 fake checker로 독립 검증하면 테스트 비용과 위험을 낮출 수 있다.
+- 상태를 파일에 저장할 경우 partial write 가능성을 고려해야 한다.
+
+### 다음 작업
+
+현재 evaluator는 수동 실행 방식이다.
+
+다음 단계에서는 SaaS host에서:
+
+```text
+systemd service
++
+systemd timer
+```
+
+를 이용해 주기 실행한다.
+
+판정 로직은 Python script에 유지하고 systemd는 실행 scheduling만 담당하도록 해 향후 온프레미스 환경에서 다른 scheduler로 교체할 수 있게 한다.
