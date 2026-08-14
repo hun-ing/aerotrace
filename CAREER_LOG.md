@@ -2126,3 +2126,119 @@ disk/storage 한계 접근 시 운영 동작
 
 특히 실제 운영에서는 queue가 100%에 도달하기 전에 감지할 수 있도록 queue utilization과 persistent storage 사용량에 대한 monitoring/alerting 정책까지 연결해야 한다.
 
+---
+
+### Portfolio Checkpoint 추가 — Persistent Queue 완전 포화 Backpressure 검증
+
+`queue_size=200000`을 운영 기본값으로 결정한 뒤 실제 운영 후보 workload인 3,250 spans/s에서 queue를 완전히 포화시키는 장애 실험을 수행했다.
+
+실제 effective saturation:
+
+```text
+configured queue = 200,000
+actual plateau    = 199,500
+saturation time   = 62.622 sec
+```
+
+설계 시 계산했던:
+
+```text
+200,000 / 3,250
+≈ 61.5 sec
+```
+
+와 실제 결과가 근접해 약 1분의 Backend 완전 장애 buffer가 실제 workload에서도 동작함을 검증했다.
+
+queue 포화 이후 telemetry를 버리는 대신 upstream backpressure가 발생했다.
+
+```text
+Backpressure wait total      = 6,953.442 ms
+Producer backpressure events = 155
+Producer lag p99             = 5,503.897 ms
+Send-start lag p99           = 5,996.734 ms
+```
+
+이 영향으로 목표 rate 유지에는 실패했지만:
+
+```text
+Requested spans = 211,250
+Accepted spans  = 211,250
+Failed requests = 0
+
+Delivery success        = PASS
+Sustained-rate validity = FAIL
+```
+
+이었다.
+
+Backend 복구 후:
+
+```text
+DB        = 211,250 / 211,250
+queue     = 0
+in_flight = 0
+```
+
+으로 전체 데이터 보존을 확인했다.
+
+Collector raw metric에서도 이전 200 Span smoke를 제외한 실험 delta가:
+
+```text
+accepted delta = 211,250
+sent delta     = 211,250
+refused        = 0
+```
+
+으로 확인됐다.
+
+실험 과정에서 Collector metric helper가 모든 metric에 `data_type="traces"` label을 요구하면서 span counter를 읽지 못하고 빈 값을 0으로 처리하는 계측 오류도 발견했다.
+
+Raw Prometheus metric을 직접 확인하여:
+
+```text
+queue gauge에는 data_type label이 존재하지만
+span counter에는 해당 label이 존재하지 않는다
+```
+
+는 차이를 확인하고 잘못된 계측 결과와 실제 시스템 동작을 분리했다.
+
+#### 이력서 성과 문장 보강
+
+- OpenTelemetry Collector persistent queue를 3,250 spans/s workload에서 완전 포화시켜 199,500 Span effective capacity와 62.6초의 장애 buffer를 실측하고, 포화 후 upstream backpressure가 발생하는 동안에도 211,250/211,250 Span이 최종 저장되는 것을 검증
+- Collector 내부 metric label 차이로 발생한 잘못된 zero metric을 raw Prometheus 데이터로 추적해 계측 오류를 식별하고, Collector counter와 최종 DB row를 교차 검증하여 실제 telemetry 유실 여부를 판단
+
+#### 면접에서 설명할 포인트
+
+```text
+왜 queue_size=200000으로 결정했는가?
+이론상 61.5초와 실제 62.6초 차이는 왜 발생했는가?
+왜 실제 queue가 200000이 아니라 199500에서 멈췄는가?
+Delivery PASS인데 sustained-rate FAIL인 이유는?
+backpressure가 데이터 유실 문제를 어떤 문제로 바꾸는가?
+sender_rc=22를 왜 전송 실패로 보지 않았는가?
+internal metric이 잘못 측정된 것을 어떻게 발견했는가?
+왜 DB row count까지 함께 검증했는가?
+```
+
+#### 보존할 핵심 스크린샷/로그
+
+```text
+queue=199500 stable=4
+saturation_elapsed_sec=62.622
+
+5초 hold 후 queue=199500
+
+Producer backpressure events=155
+Backpressure wait total=6953.442 ms
+
+Requested/Accepted=211250
+Failed requests=0
+
+DB=211250/211250
+
+raw Collector metrics:
+sent_spans=211450
+accepted_spans=211450
+refused_spans=0
+```
+

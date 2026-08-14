@@ -2467,3 +2467,119 @@ Docker storage filesystem full
 - Collector batch 설정 변경
 - Collector/file_storage 버전 변경
 - queue full 이후 실제 데이터 보존 정책 변경 필요
+
+---
+
+### 200,000 Queue 완전 포화 검증
+
+`queue_size=200000` 정식 적용 후 운영 후보 workload인 3,250 spans/s에서 실제 queue 완전 포화 동작을 추가 검증했다.
+
+테스트 조건:
+
+```text
+Backend             = paused
+incoming rate       = 3,250 spans/s
+requested spans     = 211,250
+configured queue    = 200,000
+block_on_overflow   = true
+num_consumers       = 2
+```
+
+실제 queue는 다음 상태에서 포화됐다.
+
+```text
+queue_saturated     = 199,500
+in_flight_saturated = 2
+saturation_elapsed  = 62.622 sec
+```
+
+설계 시 계산했던 이론적 장애 buffer는:
+
+```text
+200,000 / 3,250
+≈ 61.5 sec
+```
+
+였으며 실제 실험에서도 약 1분 후 queue saturation이 재현됐다.
+
+configured capacity인 200,000보다 500 작은 199,500에서 plateau가 형성된 것은 현재 workload의 Collector batch granularity 영향으로 해석한다.
+
+포화 상태를 추가로 5초 유지한 결과:
+
+```text
+queue     = 199,500
+in_flight = 2
+```
+
+로 유지됐으며 upstream sender에 backpressure가 발생했다.
+
+```text
+Backpressure wait total      = 6,953.442 ms
+Producer backpressure events = 155
+
+Request latency max = 6,513.931 ms
+Producer lag p99    = 5,503.897 ms
+Send-start lag p99  = 5,996.734 ms
+```
+
+Sender 결과:
+
+```text
+Requested spans  = 211,250
+Accepted spans   = 211,250
+Failed requests  = 0
+
+Delivery success        = PASS
+Sustained-rate validity = FAIL
+sender_rc               = 22
+```
+
+`sender_rc=22`는 telemetry delivery 실패가 아니라 queue saturation으로 backpressure가 발생하면서 3,250 spans/s의 목표 cadence를 유지하지 못해 sustained-rate validity 검증이 실패한 결과다.
+
+Backend 복구 후:
+
+```text
+DB        = 211,250 / 211,250
+queue     = 0
+in_flight = 0
+```
+
+이었다.
+
+Collector raw metrics:
+
+```text
+otelcol_exporter_sent_spans     = 211,450
+otelcol_receiver_accepted_spans = 211,450
+otelcol_receiver_refused_spans  = 0
+```
+
+동일 Collector lifecycle에서 포화 실험 직전 수행한 정식 설정 smoke가 200 Span이었으므로 이번 실험의 실제 counter delta는:
+
+```text
+sent delta     = 211,250
+accepted delta = 211,250
+refused delta  = 0
+```
+
+로 확인됐다.
+
+`otelcol_exporter_enqueue_failed_spans`는 현재 Collector lifecycle에서 metric series 자체가 노출되지 않았으므로 임의로 수치 0으로 변환해 측정값으로 기록하지 않는다.
+
+End-to-end 결과는:
+
+```text
+Requested          = 211,250
+Sender accepted    = 211,250
+Collector accepted = 211,250
+Collector sent     = 211,250
+DB stored          = 211,250
+Missing            = 0
+```
+
+이다.
+
+따라서 `queue_size=200000`과 `block_on_overflow=true` 조합은 이번 검증 workload에서 약 1분의 Backend 완전 장애 buffer를 제공했고, queue 포화 이후에는 silent telemetry loss 대신 upstream backpressure를 발생시키며 Backend 복구 후 전체 telemetry를 저장했다.
+
+이 결과를 근거로 기존 `queue_size=200000` 운영 기본값 결정을 유지한다.
+

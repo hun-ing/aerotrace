@@ -7340,3 +7340,343 @@ queue_size=200000 정식 config diff
 final_queue=0
 final_in_flight=0
 ```
+
+---
+
+## 200k Persistent Queue 완전 포화 Failure Semantics 검증
+
+### 목적
+
+`queue_size=200000`이 계산상 약 1분의 outage buffer를 제공하는 것에 그치지 않고 실제 운영 후보 workload에서도 같은 동작을 보이는지 확인했다.
+
+또한 queue가 실제 capacity에 도달한 이후:
+
+```text
+telemetry가 유실되는가?
+Collector가 요청을 거부하는가?
+upstream에 backpressure가 발생하는가?
+Backend 복구 후 전체 backlog가 저장되는가?
+```
+
+를 검증했다.
+
+### 테스트 조건
+
+```text
+Backend             = paused
+target rate         = 3,250 spans/s
+duration            = 65 sec
+requested spans     = 211,250
+batch size          = 50
+sender workers      = 4
+
+Collector:
+queue_size          = 200,000
+sizer               = items
+num_consumers       = 2
+block_on_overflow   = true
+persistent storage  = enabled
+```
+
+테스트 시작 상태:
+
+```text
+queue     = 0
+in_flight = 0
+
+Backend:
+running
+paused=false
+healthy
+```
+
+### Queue Saturation
+
+queue는 점진적으로 증가했고 최종:
+
+```text
+queue_saturated     = 199,500
+in_flight_saturated = 2
+saturation_elapsed  = 62.622 sec
+```
+
+에서 안정적으로 plateau를 형성했다.
+
+포화 판정은:
+
+```text
+queue >= 198,000
+in_flight >= 2
+동일 queue 값 4회 연속 관찰
+```
+
+조건으로 수행했다.
+
+설계 시 계산값:
+
+```text
+200,000 / 3,250
+≈ 61.54 sec
+```
+
+와 실제 62.622초가 근접하게 재현됐다.
+
+configured queue capacity 200,000보다 작은 199,500에서 plateau가 형성된 것은 현재 workload에서 관찰되는 약 1,050 Span 단위 Collector batch granularity 영향으로 해석한다.
+
+### Saturation Hold
+
+포화 상태를 추가 5초 유지했다.
+
+```text
+queue_after_hold     = 199,500
+in_flight_after_hold = 2
+```
+
+queue가 더 이상 증가하지 않았고 upstream sender에 backpressure가 전달됐다.
+
+### Sender Backpressure
+
+최종 Sender:
+
+```text
+Requested spans    = 211,250
+Accepted spans     = 211,250
+Requested requests = 4,225
+Accepted requests  = 4,225
+Failed requests    = 0
+
+Actual elapsed     = 69.354845 sec
+Target rate        = 3,250 spans/s
+Observed rate      = 3,045.93 spans/s
+Rate error         = 6.279%
+```
+
+Latency 및 backpressure:
+
+```text
+Request latency p99 = 7.932 ms
+Request latency max = 6,513.931 ms
+
+Producer lag p99    = 5,503.897 ms
+Producer lag max    = 5,961.468 ms
+
+Send-start lag p99  = 5,996.734 ms
+Send-start lag max  = 6,453.542 ms
+
+Backpressure wait total = 6,953.442 ms
+Backpressure wait p99   = 241.917 ms
+Backpressure wait max   = 5,961.325 ms
+
+Producer backpressure events = 155
+```
+
+결과:
+
+```text
+Delivery success        = PASS
+Sustained-rate validity = FAIL
+sender_rc               = 22
+```
+
+`sender_rc=22`는 데이터 delivery 실패를 의미하지 않는다.
+
+모든 211,250 Span 요청이 Collector에 전달됐지만 queue saturation으로 약 6초 수준의 지연이 upstream으로 전파되면서 목표 sustained rate를 유지하지 못한 결과다.
+
+### Backend 복구와 Queue Drain
+
+Backend 복구 후 queue:
+
+```text
+156,650
+141,950
+127,250
+112,550
+95,750
+81,050
+64,250
+47,450
+32,750
+15,950
+0
+```
+
+최종:
+
+```text
+queue     = 0
+in_flight = 0
+```
+
+DB:
+
+```text
+211,250 / 211,250
+```
+
+으로 전체 telemetry 저장을 확인했다.
+
+### Collector Counter Helper 오류 발견
+
+실험 초기에 사용한 metric helper가 모든 Collector metric에 다음 label을 요구했다.
+
+```text
+data_type="traces"
+```
+
+그 결과:
+
+```text
+sent_spans
+accepted_spans
+refused_spans
+enqueue_failed_spans
+```
+
+counter를 찾지 못하고 빈 값을 `0`으로 변환했다.
+
+최초 출력:
+
+```text
+sent_before=0
+accepted_before=0
+
+sent_delta=0
+accepted_delta=0
+```
+
+은 실제 metric 값이 아니라 helper 오류였다.
+
+Raw metrics를 확인한 결과 label 구조는 다음과 달랐다.
+
+Queue gauge:
+
+```text
+otelcol_exporter_queue_size{
+  data_type="traces",
+  exporter="otlp_http/aerotrace"
+}
+
+otelcol_exporter_in_flight_requests{
+  data_type="traces",
+  exporter="otlp_http/aerotrace"
+}
+```
+
+Span counters:
+
+```text
+otelcol_exporter_sent_spans{
+  exporter="otlp_http/aerotrace",
+  ...
+}
+
+otelcol_receiver_accepted_spans{
+  receiver="otlp",
+  transport="http"
+}
+
+otelcol_receiver_refused_spans{
+  receiver="otlp",
+  transport="http"
+}
+```
+
+즉 span counter에는 `data_type="traces"` label이 존재하지 않았다.
+
+실험 후 실제 raw metric:
+
+```text
+otelcol_exporter_sent_spans     = 211,450
+otelcol_receiver_accepted_spans = 211,450
+otelcol_receiver_refused_spans  = 0
+```
+
+현재 Collector lifecycle에서 포화 실험 전에 수행한 정식 설정 smoke가 200 Span이므로 실제 포화 실험 delta는:
+
+```text
+sent delta     = 211,250
+accepted delta = 211,250
+refused delta  = 0
+```
+
+이다.
+
+`otelcol_exporter_enqueue_failed_spans`는 raw metrics에 series 자체가 존재하지 않았다.
+
+따라서 존재하지 않는 counter series를 자동으로 0으로 변환한 값을 측정값으로 사용하지 않는다.
+
+### End-to-End 최종 결과
+
+```text
+Requested spans        = 211,250
+Sender accepted        = 211,250
+Failed sender requests = 0
+
+Collector accepted Δ   = 211,250
+Collector sent Δ       = 211,250
+Collector refused      = 0
+
+DB stored              = 211,250
+Missing                = 0
+
+Final queue            = 0
+Final in-flight        = 0
+```
+
+### 결론
+
+`queue_size=200000`은 3,250 spans/s workload에서 실제로 약 62.6초 후 effective saturation에 도달했다.
+
+따라서 설계 목표였던:
+
+```text
+약 1분 Backend 완전 장애 buffer
+```
+
+가 실제 workload에서도 검증됐다.
+
+queue가 포화된 이후에는 telemetry를 조용히 버리는 대신 upstream sender에 backpressure가 전달됐다.
+
+Backend 복구 후 211,250 Span 전체가 DB까지 저장됐으며 이번 실험에서 영구 missing telemetry는 0건이었다.
+
+### 실무적 교훈
+
+- queue capacity의 이론적 outage budget은 실제 장애 테스트로 확인해야 한다.
+- configured queue size와 실제 effective saturation point가 batch granularity 때문에 정확히 같지 않을 수 있다.
+- backpressure가 정상 작동하면 delivery는 성공하면서 sustained-rate 목표는 실패할 수 있다.
+- sender exit code만 보고 telemetry delivery 실패로 판단하면 안 된다.
+- Collector internal metric은 metric 이름별 실제 label schema를 확인하고 수집해야 한다.
+- 존재하지 않는 metric series를 무조건 0으로 변환하면 관측 오류를 실제 시스템 상태로 오인할 수 있다.
+- internal metric 검증과 end-to-end DB count를 함께 사용해야 failure semantics를 정확히 판단할 수 있다.
+
+### 보존해야 할 증거
+
+```text
+queue_saturated=199500
+in_flight_saturated=2
+saturation_elapsed_sec=62.622
+
+queue_after_hold=199500
+in_flight_after_hold=2
+
+Backpressure wait total=6953.442 ms
+Producer backpressure events=155
+
+Requested=211250
+Accepted=211250
+Failed requests=0
+
+DB=211250/211250
+final_queue=0
+final_in_flight=0
+
+raw metric:
+sent_spans=211450
+accepted_spans=211450
+refused_spans=0
+
+200 Span prior smoke를 제외한:
+sent delta=211250
+accepted delta=211250
+```
+
