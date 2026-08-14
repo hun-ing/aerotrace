@@ -427,6 +427,43 @@ if [ "${completion_ok}" -ne 1 ]; then
   exit 33
 fi
 
+echo
+echo "===== Waiting for DB settle ====="
+
+db_settle_ok=0
+
+for attempt in $(seq 1 10)
+do
+  final_db_count="$(
+    count_test_spans
+  )"
+
+  printf \
+    'attempt=%02d db=%s/%s\n' \
+    "${attempt}" \
+    "${final_db_count}" \
+    "${total_spans}"
+
+  if [ "${final_db_count}" -gt "${total_spans}" ]; then
+    echo "Duplicate test spans detected."
+    exit 32
+  fi
+
+  if [ "${final_db_count}" = "${total_spans}" ]; then
+    db_settle_ok=1
+    echo "DB settle complete."
+    break
+  fi
+
+  sleep 1
+done
+
+
+if [ "${db_settle_ok}" -ne 1 ]; then
+  echo \
+    "DB did not reach expected count after Collector drain; continuing integrity verification."
+fi
+
 enqueue_failed_after="$(
   metric_value \
     otelcol_exporter_enqueue_failed_spans
