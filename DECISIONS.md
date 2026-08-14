@@ -1928,3 +1928,542 @@ in_flight       = 0
 - queue 크기 또는 `num_consumers` 변경 후 새로운 병목 확인
 - Collector 버전 변경으로 queue 또는 retry semantics가 변경
 - 현재 DB idempotency identity로 처리되지 않는 duplicate 형태 발견
+
+---
+
+## Collector Persistent Queue 용량 및 장애 복구 정책
+
+### 해결하려는 문제
+
+AeroTrace는 OpenTelemetry Collector의 exporter queue에 persistent storage를 연결하고 있다.
+
+현재 구조:
+
+```yaml
+sending_queue:
+  enabled: true
+  num_consumers: 2
+  sizer: items
+  queue_size: 200000
+  block_on_overflow: true
+  storage: file_storage/aerotrace
+
+file_storage/aerotrace:
+  directory: /var/lib/otelcol/storage
+  create_directory: true
+  directory_permissions: "0750"
+  timeout: 1s
+  max_size: 536870912
+  fsync: true
+  compaction:
+    on_start: true
+    cleanup_on_start: true
+    directory: /var/lib/otelcol/compaction
+```
+
+`block_on_overflow=true`를 통해 queue overflow 시 silent telemetry loss 대신 backpressure를 선택했지만, 실제 운영에서는 다음 질문에 대한 검증이 추가로 필요했다.
+
+```text
+persistent queue가 실제 디스크에 데이터를 저장하는가?
+Collector restart 후 telemetry가 복구되는가?
+Collector가 SIGKILL로 비정상 종료되어도 복구되는가?
+queue_size=50,000은 실제 장애를 얼마나 버틸 수 있는가?
+queue를 확대했을 때 디스크 비용은 현실적인가?
+```
+
+### Persistent Storage 구조
+
+Collector의 file storage는 Docker named volume을 사용한다.
+
+```text
+Docker volume:
+aerotrace-otelcol-data
+
+Container mount:
+/var/lib/otelcol
+
+file_storage directory:
+/var/lib/otelcol/storage
+
+Host volume source:
+/var/lib/docker/volumes/aerotrace-otelcol-data/_data
+```
+
+호스트 filesystem 측정 당시:
+
+```text
+Filesystem = /dev/sda2
+Size       ≈ 468 GiB
+Available  ≈ 369 GiB
+Usage      = 17%
+```
+
+따라서 persistent queue 데이터는 Collector container lifecycle과 분리된 Docker volume에 저장된다.
+
+### 20,000 Span Persistent Storage 측정
+
+Backend를 pause하여 exporter downstream을 차단하고 2,000 spans/s로 10초 동안 20,000 Span을 전송했다.
+
+Sender:
+
+```text
+Requested spans = 20,000
+Accepted spans  = 20,000
+Failed requests = 0
+sender_rc       = 0
+```
+
+Backend 장애 중:
+
+```text
+queue       = 20,000
+in_flight   = 2
+DB          = 0 / 20,000
+```
+
+filesystem 측정:
+
+```text
+before apparent   = 77,824 bytes
+during apparent   = 4,206,592 bytes
+apparent growth   = 4,128,768 bytes
+
+before allocated  = 57,344 bytes
+during allocated  = 2,678,784 bytes
+allocated growth  = 2,621,440 bytes
+```
+
+Collector persistent queue metadata에서는 동일 20,000 Span에 대해:
+
+```text
+itemsSize = 20,000
+bytesSize = 2,234,800
+```
+
+를 기록했다.
+
+따라서 다음 값들은 서로 같은 의미가 아니다.
+
+```text
+queue logical payload bytes
+bbolt database file size
+filesystem allocated bytes
+```
+
+capacity planning에서는 실제 filesystem 사용량도 함께 측정해야 한다.
+
+### Graceful Restart 복구 검증
+
+Backend가 pause된 상태에서 20,000 Span을 persistent queue에 저장한 뒤 `docker restart`로 Collector를 재시작했다.
+
+Restart 직전:
+
+```text
+queue     = 20,000
+in_flight = 2
+DB        = 0 / 20,000
+```
+
+Restart 후 Backend가 여전히 중단된 상태:
+
+```text
+queue     = 20,000
+in_flight = 2
+DB        = 0 / 20,000
+```
+
+Collector startup log:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20000
+bytesSize       = 2234800
+dispatchedItems = 2
+```
+
+이어 진행 중이던 두 item에 대해:
+
+```text
+Fetching items left for dispatch by consumers
+numberOfItems = 2
+
+Moved items for dispatching back to queue
+numberOfItems = 2
+```
+
+가 기록됐다.
+
+Backend 복구 후:
+
+```text
+DB        = 20,000 / 20,000
+queue     = 0
+in_flight = 0
+```
+
+이었다.
+
+따라서 graceful Collector restart를 가로질러 persistent queue에 저장된 telemetry가 복구되는 것을 실제로 확인했다.
+
+### Shutdown 중 Dropping Data 로그 해석
+
+Graceful restart 과정에서 다음 로그가 두 번 발생했다.
+
+```text
+Exporting failed. Dropping data.
+dropped_items: 1050
+```
+
+로그만 보면 2,100 Span의 영구 유실로 해석할 수 있지만 실제 결과는:
+
+```text
+restart 후 itemsSize = 20,000
+final DB              = 20,000 / 20,000
+```
+
+이었다.
+
+이번 실험에서는 shutdown 시 진행 중이던 export 작업이 중단되면서 queue sender가 drop 로그를 기록했지만 persistent queue metadata에는 항목이 보존됐고 restart 시 다시 queue로 복귀했다.
+
+따라서 `Dropping data` 로그만으로 실제 영구 데이터 유실량을 단정하지 않는다.
+
+다음 정보를 함께 확인한다.
+
+```text
+persistent queue metadata
+queue size
+enqueue failure metric
+sent metric
+최종 DB row 수
+```
+
+단, 다른 failure path의 `Dropping data`까지 항상 안전하다고 일반화하지 않는다.
+
+### SIGKILL Crash Recovery 검증
+
+Graceful shutdown이 아닌 프로세스 비정상 종료 상황을 검증하기 위해 다시 20,000 Span을 queue에 저장했다.
+
+SIGKILL 직전:
+
+```text
+queue     = 20,000
+in_flight = 2
+DB        = 0 / 20,000
+```
+
+Collector 강제 종료:
+
+```text
+docker kill --signal=KILL aerotrace-otel-collector
+
+exit code = 137
+```
+
+Collector가 정상 shutdown hook을 실행할 기회 없이 종료된 뒤 다시 시작했다.
+
+Startup log:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20000
+bytesSize       = 2234800
+dispatchedItems = 2
+```
+
+그리고:
+
+```text
+Fetching items left for dispatch by consumers
+numberOfItems = 2
+
+Moved items for dispatching back to queue
+numberOfItems = 2
+```
+
+가 다시 확인됐다.
+
+Backend가 여전히 pause된 상태:
+
+```text
+queue = 20,000
+DB    = 0 / 20,000
+```
+
+Backend 복구 후:
+
+```text
+DB        = 20,000 / 20,000
+queue     = 0
+in_flight = 0
+```
+
+이었다.
+
+따라서 AeroTrace의 현재 persistent queue 구성은 실제 실험 범위에서 다음 두 장애를 모두 통과했다.
+
+```text
+Collector graceful restart → 20,000 / 20,000 복구
+Collector SIGKILL          → 20,000 / 20,000 복구
+```
+
+### 기존 queue_size=50,000의 장애 흡수 시간
+
+기존 설정:
+
+```yaml
+queue_size: 50000
+```
+
+Backend 처리량이 완전히 0이 된다고 가정하면 이론적 outage budget은:
+
+```text
+50,000 / incoming spans per second
+```
+
+이다.
+
+실제 테스트 workload 기준:
+
+```text
+2,000 spans/s
+→ 약 25초
+
+3,250 spans/s
+→ 약 15.4초
+```
+
+이다.
+
+3,250 spans/s는 AeroTrace 운영 후보 서버의 실제 sustained ingest 성능 실험에서 사용한 workload이므로, 약 15초의 완전 장애 buffer는 Backend 재기동, DB stall, 배포 또는 일시적인 host resource contention을 흡수하기에 여유가 작다고 판단했다.
+
+### queue_size=200,000 후보 검증
+
+운영 목표를 다음처럼 설정했다.
+
+> 검증된 3,250 spans/s workload에서도 Backend가 약 1분 동안 완전히 응답하지 못하는 상황을 Collector persistent queue가 흡수할 수 있도록 한다.
+
+필요한 queue:
+
+```text
+3,250 spans/s × 60 sec
+= 195,000 spans
+```
+
+따라서 round number로:
+
+```yaml
+queue_size: 200000
+```
+
+을 후보로 선정했다.
+
+이론적 outage budget:
+
+```text
+2,000 spans/s
+→ 100초
+
+3,250 spans/s
+→ 약 61.5초
+```
+
+### 200,000 Queue Storage 성장 검증
+
+정식 설정을 변경하기 전에 임시 Collector config를 사용하여 `queue_size=200000`을 검증했다.
+
+Backend를 pause한 상태에서 다음 checkpoint까지 순차적으로 backlog를 증가시켰다.
+
+```text
+50,000
+100,000
+150,000
+190,000
+```
+
+모든 sender test:
+
+```text
+sender_rc = 0
+```
+
+측정 결과:
+
+```text
+checkpoint  queue    file_size    apparent_bytes  allocated_bytes
+baseline    0        32,768       45,056          32,768
+50k         50,000   8,388,608    8,400,896       6,049,792
+100k        100,000  16,777,216   16,789,504      11,894,784
+150k        150,000  33,599,488   33,611,776      17,547,264
+190k        190,000  33,599,488   33,611,776      21,954,560
+```
+
+190,000 Span에서 baseline을 제외한 실제 filesystem allocated 증가량:
+
+```text
+21,921,792 bytes
+≈ 20.9 MiB
+```
+
+이번 workload에서 단순 환산하면:
+
+```text
+약 115 bytes/span allocated
+```
+
+수준이었다.
+
+단, bbolt의 page allocation과 재사용 때문에 file size가 queue item 수와 선형으로 증가하지 않았으므로 이 값을 모든 telemetry payload에 고정적으로 적용하지 않는다.
+
+특히:
+
+```text
+150k file_size = 33,599,488
+190k file_size = 33,599,488
+```
+
+로 파일 논리 크기는 동일한 상태에서 filesystem allocated bytes만 증가했다.
+
+따라서 persistent storage capacity planning은 단일 `bytes/span` 상수보다 실제 workload 측정을 우선한다.
+
+### 190,000 Span End-to-End 복구
+
+Backend가 중단된 동안:
+
+```text
+queue = 190,000
+DB    = 0 / 190,000
+```
+
+이었다.
+
+Backend 복구 후 queue는 drain됐고:
+
+```text
+DB        = 190,000 / 190,000
+queue     = 0
+in_flight = 0
+```
+
+을 확인했다.
+
+즉 190,000 Span backlog 전체가 최종 DB까지 보존됐다.
+
+### 최종 결정
+
+AeroTrace의 기본 Collector queue 용량을:
+
+```yaml
+queue_size: 50000
+```
+
+에서:
+
+```yaml
+queue_size: 200000
+```
+
+으로 변경한다.
+
+최종 기본 정책:
+
+```yaml
+sending_queue:
+  enabled: true
+  num_consumers: 2
+  sizer: items
+  queue_size: 200000
+  block_on_overflow: true
+  storage: file_storage/aerotrace
+```
+
+선택 이유:
+
+```text
+silent telemetry loss 대신 backpressure 우선
+persistent storage를 통한 Collector restart 복구
+SIGKILL 이후에도 queue 복구 검증
+3,250 spans/s에서 약 1분의 완전 장애 buffer 확보
+190,000 Span 실제 backlog에서 약 21 MiB allocated storage 사용
+190,000 / 190,000 end-to-end 복구 검증
+현재 홈서버 자원에서 충분히 감당 가능한 storage 비용
+```
+
+### 정식 설정 적용 검증
+
+Repository의 정식 설정:
+
+```text
+otel-collector-config.yaml
+```
+
+에 다음을 적용했다.
+
+```yaml
+queue_size: 200000
+block_on_overflow: true
+```
+
+Runtime mount:
+
+```text
+source=/home/huning/aerotrace/otel-collector-config.yaml
+destination=/etc/otel-collector-config.yaml
+```
+
+정식 설정으로 Collector를 재생성한 뒤 200 Span smoke:
+
+```text
+Requested spans = 200
+Accepted spans  = 200
+Failed requests = 0
+sender_rc       = 0
+DB              = 200 / 200
+
+final queue     = 0
+final in_flight = 0
+```
+
+### 현재 검증 범위의 한계
+
+이번 실험으로 다음은 검증했다.
+
+```text
+Backend 일시 중단
+Collector graceful restart
+Collector SIGKILL
+최대 190,000 Span persistent backlog
+Backend 복구 후 queue drain
+최종 DB 데이터 보존
+```
+
+하지만 다음 상황은 아직 검증하지 않았다.
+
+```text
+호스트 OS reboot
+호스트 전원 강제 차단
+filesystem corruption
+Docker volume 손실
+file_storage max_size 도달
+host disk full
+Docker storage filesystem full
+장시간 장애 중 queue_size=200000 완전 포화 이후 동작
+```
+
+따라서 현재 정책을 “모든 장애에서 데이터 유실 없음”으로 표현하지 않는다.
+
+### 재검토 조건
+
+다음 조건이 발생하면 queue capacity를 다시 측정하고 조정한다.
+
+- 실제 사용자 telemetry rate가 3,250 spans/s를 지속적으로 초과
+- 1분 이상의 Backend/DB 완전 장애를 Collector에서 흡수해야 함
+- 여러 tenant의 동시 burst로 queue 포화가 반복
+- persistent volume 사용량 증가가 운영상 문제가 됨
+- telemetry payload 평균 크기가 현재 benchmark보다 크게 증가
+- sampling 또는 tenant quota 정책 도입
+- `num_consumers` 변경
+- Collector batch 설정 변경
+- Collector/file_storage 버전 변경
+- queue full 이후 실제 데이터 보존 정책 변경 필요

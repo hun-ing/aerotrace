@@ -1844,3 +1844,285 @@ batch rewrite 적용 후 COPY 비교 필요성
 4. 왜 초기 Windows benchmark에서 rewrite를 보류하고 이번 N100 benchmark에서는 채택한 것이 모순이 아닌가?
 5. Collector의 약 323ms cadence보다 writer가 오래 걸리는 요청이 반복되면 어떤 운영 문제가 발생할 수 있는가?
 
+---
+
+## Portfolio Checkpoint — OpenTelemetry Persistent Queue 장애 복구 및 Capacity 설계
+
+### 직접 경험한 문제
+
+OpenTelemetry Collector에서 `block_on_overflow=true`를 적용해 queue overflow 시 silent telemetry loss를 방지한 뒤, persistent queue가 실제 장애 상황에서 어느 정도 데이터를 보호할 수 있는지 직접 검증했다.
+
+단순히 persistent queue 설정을 추가하는 데서 끝내지 않고 다음 장애를 순차적으로 재현했다.
+
+```text
+Backend 완전 중단
+Collector graceful restart
+Collector SIGKILL
+190,000 Span backlog
+queue capacity 확대
+```
+
+### 직접 검증한 내용
+
+20,000 Span을 persistent queue에 저장한 상태에서 Collector를 정상 재시작했다.
+
+```text
+restart 전:
+queue = 20,000
+DB    = 0
+
+restart 후:
+Loaded queue metadata
+itemsSize = 20,000
+
+Backend 복구:
+DB = 20,000 / 20,000
+```
+
+이후 Collector를 SIGKILL로 강제 종료했다.
+
+```text
+exit code = 137
+```
+
+재시작 후:
+
+```text
+Loaded queue metadata
+itemsSize       = 20,000
+dispatchedItems = 2
+```
+
+가 확인됐으며 최종:
+
+```text
+DB = 20,000 / 20,000
+```
+
+으로 전부 복구됐다.
+
+### Queue Capacity 설계 경험
+
+기존 `queue_size=50,000`은 운영 후보 workload인 3,250 spans/s에서 Backend 완전 장애를 약 15.4초밖에 흡수하지 못한다는 점을 계산했다.
+
+목표를:
+
+```text
+3,250 spans/s에서 약 1분 완전 장애 흡수
+```
+
+로 설정했다.
+
+필요 queue:
+
+```text
+3,250 × 60
+= 195,000 spans
+```
+
+이므로:
+
+```yaml
+queue_size: 200000
+```
+
+을 후보로 선정했다.
+
+설정을 바로 운영에 넣지 않고 임시 Collector config로 실제 용량 실험을 수행했다.
+
+### 실제 190k Backlog 측정
+
+```text
+checkpoint  queue    allocated_bytes
+baseline    0        32,768
+50k         50,000   6,049,792
+100k        100,000  11,894,784
+150k        150,000  17,547,264
+190k        190,000  21,954,560
+```
+
+190,000 Span을 queue에 보유했을 때 baseline 대비 filesystem allocated 증가량은 약 20.9 MiB였다.
+
+Backend 장애 중:
+
+```text
+DB = 0 / 190,000
+```
+
+Backend 복구 후:
+
+```text
+DB        = 190,000 / 190,000
+queue     = 0
+in_flight = 0
+```
+
+을 확인했다.
+
+### 설계 변경 결과
+
+기존:
+
+```text
+queue_size=50,000
+
+3,250 spans/s 기준
+약 15.4초 장애 buffer
+```
+
+변경:
+
+```text
+queue_size=200,000
+
+3,250 spans/s 기준
+약 61.5초 장애 buffer
+```
+
+로 확대했다.
+
+정식 운영 후보 설정:
+
+```yaml
+sending_queue:
+  sizer: items
+  queue_size: 200000
+  block_on_overflow: true
+  storage: file_storage/aerotrace
+```
+
+### 채용 담당자 또는 면접관이 평가할 수 있는 부분
+
+이 경험의 핵심은 OpenTelemetry 설정값 자체가 아니다.
+
+다음 문제 해결 과정이 중요하다.
+
+```text
+장애 시 telemetry 보존 요구 정의
+→ persistent queue storage 구조 확인
+→ 실제 disk 사용량 측정
+→ graceful restart 장애 재현
+→ SIGKILL crash 재현
+→ queue metadata 기반 복구 과정 확인
+→ 최종 DB 데이터 보존 검증
+→ ingest rate에서 outage budget 계산
+→ capacity 목표 설정
+→ 190k 실제 backlog 검증
+→ 운영 기본값 승격
+```
+
+운영 설정을 감으로 결정하지 않고 실제 workload, failure semantics, disk 비용을 측정해서 결정한 경험으로 설명할 수 있다.
+
+### 보존할 자료
+
+포트폴리오에서 다음 자료를 보존한다.
+
+```text
+graceful restart 전후 queue=20000 출력
+Loaded queue metadata itemsSize=20000 로그
+dispatchedItems=2 복구 로그
+graceful restart DB=20000/20000 결과
+
+SIGKILL exit=137 출력
+SIGKILL 후 Loaded queue metadata 로그
+SIGKILL 후 DB=20000/20000 결과
+
+growth.tsv:
+baseline
+50k
+100k
+150k
+190k
+
+190k:
+allocated_bytes=21954560
+db_during=0/190000
+final_db=190000/190000
+
+queue_size:
+50000 → 200000 diff
+
+정식 설정 smoke:
+sender_rc=0
+DB=200/200
+queue=0
+in_flight=0
+```
+
+가능하면 터미널 결과와 함께 queue 증가/감소 그래프를 추후 포트폴리오 자료로 만든다.
+
+### 이력서 성과 문장 초안
+
+- OpenTelemetry Collector persistent queue의 graceful restart 및 SIGKILL 장애를 직접 재현해 각각 20,000/20,000 Span 복구를 검증하고, 실제 telemetry workload 기반 storage 사용량과 장애 허용 시간을 측정해 데이터 유실 방지 구조의 내구성을 검증
+- 운영 후보 workload 3,250 spans/s에서 기존 50,000 Span queue가 약 15초의 완전 장애만 흡수하는 한계를 확인하고, 190,000 Span backlog의 약 21 MiB filesystem 사용량과 190,000/190,000 복구를 검증한 뒤 queue capacity를 200,000으로 확대해 약 1분의 outage buffer 확보
+
+두 번째 문장의 수치는 이번 실험에서 직접 측정하거나 측정값에서 계산한 범위에 한정한다.
+
+### 예상 면접 질문
+
+```text
+왜 persistent queue가 필요한가?
+memory queue와 persistent queue의 차이는 무엇인가?
+왜 graceful restart와 SIGKILL을 따로 테스트했는가?
+SIGKILL 후 진행 중이던 exporter item은 어떻게 처리됐는가?
+Dropping data 로그가 있었는데 왜 최종 데이터는 유실되지 않았는가?
+queue_size=200000은 왜 선택했는가?
+왜 더 크게 1,000,000으로 잡지 않았는가?
+queue size를 disk size 기준으로 결정하지 않은 이유는?
+190k에서 bbolt file size가 증가하지 않았는데 allocated bytes가 증가한 이유를 어떻게 해석했는가?
+persistent queue만 있으면 데이터 유실이 완전히 없어지는가?
+현재 아직 검증하지 않은 장애는 무엇인가?
+```
+
+### 블로그 주제
+
+**제목**
+
+> OpenTelemetry Persistent Queue는 정말 장애에서 데이터를 지켜줄까? Restart부터 SIGKILL까지 직접 검증해봤다
+
+**해결한 문제**
+
+```text
+Collector 설정에 persistent queue가 있다고 해서
+실제 장애에서 telemetry가 살아남는다고 확신할 수 있는가?
+```
+
+**핵심 메시지**
+
+```text
+설정 존재 여부보다 실제 장애 복구 실험이 중요하다.
+queue 용량은 ingest rate와 목표 outage duration에서 역산해야 한다.
+```
+
+**글 구성**
+
+```text
+1. 왜 persistent queue를 검증했는가
+2. AeroTrace Collector storage 구조
+3. Backend pause로 backlog 생성
+4. 실제 disk 사용량 측정
+5. graceful restart 실험
+6. shutdown 중 Dropping data 로그 분석
+7. SIGKILL crash 실험
+8. queue_size=50k의 실제 outage budget
+9. 200k capacity 목표 선정
+10. 50k → 190k storage 성장 실험
+11. 운영 기본값 변경
+12. 아직 보장할 수 없는 failure scenario
+```
+
+### 다음에 경험할 한 단계 높은 과제
+
+현재 검증은 Collector process 수준의 장애까지다.
+
+다음 단계에서는 다음 중 우선순위가 높은 failure boundary를 검증한다.
+
+```text
+queue 완전 포화 이후 failure semantics
+file_storage write 실패
+host reboot 이후 persistent queue 복구
+disk/storage 한계 접근 시 운영 동작
+```
+
+특히 실제 운영에서는 queue가 100%에 도달하기 전에 감지할 수 있도록 queue utilization과 persistent storage 사용량에 대한 monitoring/alerting 정책까지 연결해야 한다.
+

@@ -6824,3 +6824,519 @@ DB=200/200
 queue=0
 in_flight=0
 ```
+
+---
+
+## Persistent Queue 장애 내구성 및 200k Queue Capacity 검증
+
+### 목적
+
+`block_on_overflow=true` 적용 후 AeroTrace Collector가 downstream 장애를 실제로 얼마나 버틸 수 있는지 검증했다.
+
+검증 항목:
+
+```text
+persistent queue 실제 disk 저장
+Collector graceful restart 복구
+Collector SIGKILL 복구
+queue item 수에 따른 storage 증가
+기존 queue_size=50,000의 outage budget
+queue_size=200,000 확대 가능성
+190,000 Span backlog end-to-end 복구
+```
+
+### 현재 Persistent Storage 구조
+
+Collector 설정:
+
+```yaml
+sending_queue:
+  enabled: true
+  num_consumers: 2
+  sizer: items
+  storage: file_storage/aerotrace
+
+file_storage/aerotrace:
+  directory: /var/lib/otelcol/storage
+  timeout: 1s
+  max_size: 536870912
+  fsync: true
+  compaction:
+    on_start: true
+    cleanup_on_start: true
+```
+
+Docker storage:
+
+```text
+volume = aerotrace-otelcol-data
+
+container:
+/var/lib/otelcol
+
+host:
+/var/lib/docker/volumes/aerotrace-otelcol-data/_data
+```
+
+Host filesystem 측정:
+
+```text
+/dev/sda2
+Size      ≈ 468 GiB
+Available ≈ 369 GiB
+Usage     = 17%
+```
+
+### 20,000 Span Persistent Storage 실험
+
+조건:
+
+```text
+Backend pause
+target rate = 2,000 spans/s
+duration    = 10 sec
+requested   = 20,000 spans
+```
+
+Sender:
+
+```text
+Accepted spans  = 20,000
+Failed requests = 0
+sender_rc       = 0
+```
+
+장애 중:
+
+```text
+queue     = 20,000
+in_flight = 2
+DB        = 0 / 20,000
+```
+
+Filesystem:
+
+```text
+before apparent = 77,824
+during apparent = 4,206,592
+growth          = 4,128,768 bytes
+
+before allocated = 57,344
+during allocated = 2,678,784
+growth           = 2,621,440 bytes
+```
+
+Backend 복구 후:
+
+```text
+DB        = 20,000 / 20,000
+queue     = 0
+in_flight = 0
+```
+
+### Collector Graceful Restart Recovery
+
+다시 20,000 Span backlog를 생성했다.
+
+Restart 전:
+
+```text
+queue     = 20,000
+in_flight = 2
+DB        = 0 / 20,000
+```
+
+`docker restart aerotrace-otel-collector` 실행.
+
+Collector는 SIGTERM 기반 정상 shutdown을 수행했다.
+
+Startup 이후:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20000
+bytesSize       = 2234800
+dispatchedItems = 2
+```
+
+진행 중이던 export item:
+
+```text
+Fetching items left for dispatch by consumers
+numberOfItems = 2
+
+Moved items for dispatching back to queue
+numberOfItems = 2
+```
+
+Restart 후 Backend가 계속 pause된 상태:
+
+```text
+queue     = 20,000
+in_flight = 2
+DB        = 0 / 20,000
+```
+
+Backend 복구 후:
+
+```text
+DB        = 20,000 / 20,000
+queue     = 0
+in_flight = 0
+```
+
+### Graceful Shutdown 중 Dropping Data 로그
+
+Shutdown 과정에서:
+
+```text
+Exporting failed. Dropping data.
+dropped_items = 1050
+```
+
+가 consumer 두 개에서 각각 발생했다.
+
+단순 로그 합계로는 2,100 Span drop처럼 보였지만 restart 후:
+
+```text
+itemsSize = 20,000
+final DB  = 20,000 / 20,000
+```
+
+이었다.
+
+이번 failure path에서는 진행 중 export가 shutdown으로 실패하면서 drop 로그가 발생했지만 persistent queue state가 항목을 다시 복구했다.
+
+교훈:
+
+```text
+Dropping data 로그만으로 실제 영구 유실을 단정하지 않는다.
+persistent queue metadata와 최종 저장 결과를 함께 확인한다.
+```
+
+### Collector SIGKILL Recovery
+
+Graceful shutdown이 불가능한 crash 상황을 재현했다.
+
+조건:
+
+```text
+Backend pause
+queue = 20,000
+DB    = 0
+```
+
+실행:
+
+```text
+docker kill --signal=KILL aerotrace-otel-collector
+```
+
+종료 결과:
+
+```text
+running = false
+status  = exited
+exit    = 137
+```
+
+다시 Collector를 시작한 뒤:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20000
+bytesSize       = 2234800
+dispatchedItems = 2
+```
+
+그리고 두 dispatched item을 다시 queue로 이동한 로그가 확인됐다.
+
+Backend가 계속 pause된 상태:
+
+```text
+queue = 20,000
+DB    = 0 / 20,000
+```
+
+Backend 복구 후:
+
+```text
+DB        = 20,000 / 20,000
+queue     = 0
+in_flight = 0
+```
+
+결과:
+
+```text
+graceful restart → 20,000 / 20,000 복구
+SIGKILL          → 20,000 / 20,000 복구
+```
+
+### 기존 Queue Capacity 분석
+
+기존:
+
+```yaml
+queue_size: 50000
+```
+
+Backend 처리량이 0인 완전 장애 기준:
+
+```text
+2,000 spans/s → 약 25초
+3,250 spans/s → 약 15.4초
+```
+
+3,250 spans/s workload는 앞선 운영 후보 서버 sustained ingest 검증에서 사용한 실제 측정 조건이다.
+
+따라서 50,000 Span capacity는 약 15초의 짧은 장애 buffer만 제공한다.
+
+### Queue 200,000 후보 선정
+
+목표:
+
+```text
+3,250 spans/s workload에서
+Backend 완전 장애 약 1분 흡수
+```
+
+계산:
+
+```text
+3,250 × 60
+= 195,000 spans
+```
+
+따라서 테스트 후보:
+
+```yaml
+queue_size: 200000
+```
+
+### 200k Queue 성장 곡선 실험
+
+Repository 설정을 바로 변경하지 않고 `/tmp` Collector config를 사용했다.
+
+조건:
+
+```text
+queue_size         = 200,000
+block_on_overflow  = true
+Backend            = paused
+incoming rate      = 2,000 spans/s
+```
+
+순차적으로 backlog를 증가시켰다.
+
+```text
+checkpoint  queue    in_flight  file_size    apparent_bytes  allocated_bytes
+baseline    0        0          32,768       45,056          32,768
+50k         50,000   2          8,388,608    8,400,896       6,049,792
+100k        100,000  2          16,777,216   16,789,504      11,894,784
+150k        150,000  2          33,599,488   33,611,776      17,547,264
+190k        190,000  2          33,599,488   33,611,776      21,954,560
+```
+
+각 workload:
+
+```text
+50k sender_rc  = 0
+100k sender_rc = 0
+150k sender_rc = 0
+190k sender_rc = 0
+```
+
+장애 중 최종:
+
+```text
+queue = 190,000
+DB    = 0 / 190,000
+```
+
+190k에서 baseline을 제외한 allocated storage 증가:
+
+```text
+21,921,792 bytes
+≈ 20.9 MiB
+```
+
+이번 payload 기준으로 단순 환산하면 약:
+
+```text
+115 bytes/span allocated
+```
+
+였지만 bbolt page allocation과 reuse가 존재하므로 일반적인 고정 Span storage size로 사용하지 않는다.
+
+특히:
+
+```text
+150k file_size = 33,599,488
+190k file_size = 33,599,488
+```
+
+로 file size 자체는 증가하지 않은 반면 allocated bytes는 증가했다.
+
+### 190k Backlog 복구
+
+Backend unpause 후 queue drain:
+
+```text
+145,900
+134,050
+118,300
+103,600
+87,300
+72,600
+55,800
+38,950
+26,350
+11,650
+0
+```
+
+최종:
+
+```text
+DB        = 190,000 / 190,000
+queue     = 0
+in_flight = 0
+```
+
+190,000 Span persistent backlog 전체가 최종 DB까지 복구됐다.
+
+### 정식 설정 승격
+
+실험 결과를 근거로 repository 설정을 변경했다.
+
+파일:
+
+```text
+otel-collector-config.yaml
+```
+
+변경:
+
+```diff
+- queue_size: 50000
++ queue_size: 200000
+```
+
+기존 정책:
+
+```yaml
+block_on_overflow: true
+```
+
+는 유지했다.
+
+최종:
+
+```yaml
+sending_queue:
+  enabled: true
+  num_consumers: 2
+  sizer: items
+  queue_size: 200000
+  block_on_overflow: true
+  storage: file_storage/aerotrace
+```
+
+임시 overlay 없이 실제 runtime mount:
+
+```text
+source=/home/huning/aerotrace/otel-collector-config.yaml
+destination=/etc/otel-collector-config.yaml
+```
+
+### 정식 설정 Smoke
+
+```text
+Requested spans = 200
+Accepted spans  = 200
+Failed requests = 0
+
+sender_rc       = 0
+DB              = 200 / 200
+
+final queue     = 0
+final in_flight = 0
+```
+
+`git diff --check` 오류 없음.
+
+### 장애 Budget 변화
+
+변경 전:
+
+```text
+queue_size=50,000
+
+2,000 spans/s → 약 25초
+3,250 spans/s → 약 15.4초
+```
+
+변경 후:
+
+```text
+queue_size=200,000
+
+2,000 spans/s → 약 100초
+3,250 spans/s → 약 61.5초
+```
+
+따라서 운영 후보 workload 기준 완전 장애 흡수 시간을 약 15초에서 약 1분으로 확대했다.
+
+### 실무적 교훈
+
+- persistent queue는 설정 존재 여부가 아니라 실제 restart/crash 실험으로 검증해야 한다.
+- graceful restart만 통과했다고 프로세스 crash 복구까지 검증된 것은 아니다.
+- SIGKILL 테스트를 통해 shutdown hook 없이도 persistent queue metadata가 복구되는지 확인할 수 있다.
+- exporter의 `Dropping data` 로그와 최종 영구 유실은 항상 동일하지 않을 수 있다.
+- queue logical bytes, bbolt file size, filesystem allocated bytes는 서로 다른 값이다.
+- persistent queue storage는 payload 크기와 bbolt page allocation 특성 때문에 단순 선형 증가를 가정하면 안 된다.
+- queue capacity는 임의의 큰 숫자가 아니라 목표 outage duration과 ingest rate에서 역산해야 한다.
+- 50,000 Span queue는 높은 ingest rate에서 생각보다 짧은 장애만 흡수한다.
+- capacity 변경 전 임시 config로 실제 workload를 재현하면 운영 설정 변경의 근거를 남길 수 있다.
+- 데이터 보존은 queue drain뿐 아니라 최종 DB row 수까지 확인해야 한다.
+
+### 아직 검증하지 않은 장애
+
+다음은 후속 장애 실험 대상으로 남긴다.
+
+```text
+host reboot
+강제 전원 차단
+filesystem corruption
+Docker volume loss
+file_storage max_size 도달
+host disk full
+queue_size=200000 완전 포화 이후 동작
+```
+
+현재 결과를 위 장애까지 포함하는 것으로 과장하지 않는다.
+
+### 보존해야 할 증거
+
+```text
+20k persistent storage filesystem 측정 결과
+itemsSize=20000 / bytesSize=2234800 startup log
+graceful restart 20000/20000 복구 결과
+SIGKILL exit=137 결과
+SIGKILL 후 Loaded queue metadata 로그
+SIGKILL 후 20000/20000 복구 결과
+
+50k / 100k / 150k / 190k growth.tsv
+190k allocated_bytes=21954560
+db_during=0/190000
+final_db=190000/190000
+
+queue_size=200000 정식 config diff
+정식 mount source 확인
+200 Span smoke 200/200
+final_queue=0
+final_in_flight=0
+```

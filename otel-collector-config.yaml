@@ -32,7 +32,7 @@ exporters:
       enabled: true
       num_consumers: 2
       sizer: items
-      queue_size: 50000
+      queue_size: 200000
       block_on_overflow: true
       storage: file_storage/aerotrace
 
