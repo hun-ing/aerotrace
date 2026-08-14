@@ -2716,3 +2716,364 @@ file_storage write failure
 따라서 AeroTrace의 현재 데이터 보존 정책을 "모든 host 장애에서 데이터 유실 없음"으로 표현하지 않는다.
 
 기존 persistent queue 운영 결정은 유지한다.
+
+---
+
+## Collector Queue 운영 상태 판정 정책
+
+### 해결하려는 문제
+
+AeroTrace Collector persistent queue는 다음 장애 복구 실험을 통해 telemetry 보존 동작을 검증했다.
+
+```text
+Collector graceful restart
+Collector SIGKILL
+Host OS reboot
+200,000 queue saturation
+```
+
+그러나 장애 복구가 가능하다는 것만으로는 충분하지 않다.
+
+실제 운영에서는 queue가 포화된 뒤 장애를 발견하는 것이 아니라 다음 상태를 조기에 판단할 수 있어야 한다.
+
+```text
+현재 queue 사용량
+남은 queue capacity
+현재 ingest workload 기준 예상 headroom
+in-flight export 상태
+Collector send/receive counter
+queue 포화 위험 수준
+```
+
+기존에는 shell helper와 개별 `curl` 명령으로 확인했기 때문에 반복 가능하고 일관된 운영 상태 판정이 어려웠다.
+
+### 선택한 방식
+
+Repository에 다음 운영 체크 스크립트를 둔다.
+
+```text
+scripts/check-collector-queue.py
+```
+
+스크립트는 Collector Prometheus metrics endpoint:
+
+```text
+http://127.0.0.1:8888/metrics
+```
+
+를 직접 조회하고 repository의:
+
+```text
+otel-collector-config.yaml
+```
+
+에서 `queue_size`를 읽는다.
+
+따라서 현재 운영 설정:
+
+```text
+queue_size=200000
+```
+
+과 별도의 hard-coded capacity가 서로 달라지는 것을 방지한다.
+
+### Queue 상태 기준
+
+MVP 기본 threshold:
+
+```text
+queue utilization < 50%
+→ OK
+
+50% <= queue utilization < 80%
+→ WARNING
+
+queue utilization >= 80%
+→ CRITICAL
+```
+
+exit code:
+
+```text
+OK       = 0
+WARNING  = 1
+CRITICAL = 2
+UNKNOWN  = 3
+```
+
+이를 통해 사람이 실행하는 CLI뿐 아니라 이후 scheduler, systemd, monitoring integration에서도 같은 상태 판정 로직을 재사용할 수 있게 한다.
+
+### Threshold 선택 근거
+
+현재 운영 후보 workload에서 검증한 ingest rate:
+
+```text
+3,250 spans/s
+```
+
+현재 queue capacity:
+
+```text
+200,000 spans
+```
+
+Backend 처리량이 완전히 0이 된 단순 worst-case 모델에서는 queue가 비어 있을 때:
+
+```text
+200,000 / 3,250
+≈ 61.54 sec
+```
+
+의 headroom이 있다.
+
+50% 사용 시:
+
+```text
+remaining = 100,000 spans
+
+100,000 / 3,250
+≈ 30.77 sec
+```
+
+80% 사용 시:
+
+```text
+remaining = 40,000 spans
+
+40,000 / 3,250
+≈ 12.31 sec
+```
+
+이다.
+
+따라서 MVP 초기 기준은:
+
+```text
+WARNING:
+대략 절반의 장애 buffer를 소비한 시점
+
+CRITICAL:
+현재 검증 workload 기준 약 12초 수준의
+잔여 buffer만 남은 시점
+```
+
+으로 설정한다.
+
+이 threshold는 영구 정책이 아니다.
+
+실제 tenant traffic, sampling, burst 패턴, 운영 대응 시간 측정 후 재조정한다.
+
+### Headroom 표시
+
+스크립트는 다음 값을 함께 표시한다.
+
+```text
+full_outage_headroom_sec
+```
+
+계산:
+
+```text
+(queue_capacity - queue_size)
+/
+reference_spans_per_sec
+```
+
+기본 reference workload:
+
+```text
+3,250 spans/s
+```
+
+이다.
+
+이 값은 다음 가정에서의 단순 추정치다.
+
+```text
+Backend 처리량 = 0
+incoming rate = 3,250 spans/s로 일정
+```
+
+따라서 실제 SLA나 장애 지속 가능 시간을 보장하는 값으로 사용하지 않는다.
+
+### Metric 부재 처리 정책
+
+Collector metric series가 존재하지 않는 경우 이를 자동으로 `0`으로 처리하지 않는다.
+
+대신:
+
+```text
+N/A
+```
+
+로 출력한다.
+
+이 결정은 앞선 queue saturation 실험에서 발견한 계측 오류를 반영한 것이다.
+
+예를 들어 현재 Collector lifecycle에서 event가 발생하지 않아 다음 series가 존재하지 않을 수 있다.
+
+```text
+otelcol_exporter_enqueue_failed_spans
+otelcol_exporter_send_failed_spans
+otelcol_receiver_accepted_spans
+otelcol_receiver_refused_spans
+```
+
+`series 없음`과 `실제 값 0`은 서로 다른 상태이므로 구분한다.
+
+### Metric Label 처리
+
+Queue gauge:
+
+```text
+otelcol_exporter_queue_size
+otelcol_exporter_in_flight_requests
+```
+
+는 다음 label을 사용한다.
+
+```text
+data_type="traces"
+exporter="otlp_http/aerotrace"
+```
+
+Exporter span counter는:
+
+```text
+exporter="otlp_http/aerotrace"
+```
+
+를 기준으로 찾는다.
+
+Receiver span counter는:
+
+```text
+receiver="otlp"
+transport="http"
+```
+
+를 사용한다.
+
+모든 metric에 동일한 label 조건을 적용하지 않는다.
+
+### 실제 동작 검증
+
+정상 상태:
+
+```text
+queue_size=0
+queue_capacity=200000
+queue_utilization_pct=0.00
+full_outage_headroom_sec=61.54
+
+status=OK
+exit=0
+```
+
+Backend를 pause한 뒤 실제 2,000 Span backlog를 생성했다.
+
+```text
+queue_size=2000
+queue_capacity=200000
+queue_utilization_pct=1.00
+full_outage_headroom_sec=60.92
+```
+
+기본 production threshold에서는:
+
+```text
+status=OK
+exit=0
+```
+
+이었다.
+
+작은 backlog 자체를 장애로 판단하지 않는 것을 확인했다.
+
+동일한 실제 queue 상태에서 테스트용 threshold를 낮춰 WARNING 경로를 검증했다.
+
+```text
+warn=0.5%
+critical=2%
+
+queue utilization=1%
+
+status=WARNING
+exit=1
+```
+
+CRITICAL 경로:
+
+```text
+warn=0.1%
+critical=0.5%
+
+queue utilization=1%
+
+status=CRITICAL
+exit=2
+```
+
+잘못된 threshold:
+
+```text
+warn=90%
+critical=80%
+```
+
+에 대해서는:
+
+```text
+UNKNOWN
+exit=3
+```
+
+으로 잘못된 운영 설정을 거부했다.
+
+Backend 복구 후:
+
+```text
+DB=2000/2000
+queue=0
+status=OK
+exit=0
+```
+
+을 확인했다.
+
+### 최종 결정
+
+AeroTrace MVP의 Collector queue 운영 상태 판정은:
+
+```text
+scripts/check-collector-queue.py
+```
+
+를 단일 판정 로직으로 사용한다.
+
+기본 정책:
+
+```text
+OK       < 50%
+WARNING  >= 50%
+CRITICAL >= 80%
+
+UNKNOWN:
+metric/config/threshold를 신뢰할 수 없는 경우
+```
+
+향후 alert scheduler나 외부 monitoring system을 붙일 때 queue threshold 계산을 각 시스템에 다시 구현하지 않고 이 정책과 동일한 의미를 유지한다.
+
+### 재검토 조건
+
+다음 조건에서 threshold와 reference workload를 다시 측정한다.
+
+- 실제 production ingest rate 측정
+- tenant 수 증가
+- burst traffic 패턴 확인
+- sampling 적용
+- queue_size 변경
+- 장애 대응 평균 시간 측정
+- Backend 처리량 변경
+- Collector batch 또는 consumer 설정 변경
+- 실제 WARNING/CRITICAL 발생 이력 축적

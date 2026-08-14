@@ -7973,3 +7973,342 @@ final_queue=0
 final_in_flight=0
 backend=running health=healthy
 ```
+
+---
+
+## Collector Queue 운영 체크 및 Threshold 검증
+
+### 목적
+
+Persistent queue 장애 복구 검증 후 운영자가 queue saturation 위험을 일관되게 판단할 수 있도록 재사용 가능한 운영 체크 도구를 구현했다.
+
+새 파일:
+
+```text
+scripts/check-collector-queue.py
+```
+
+### 제공 정보
+
+스크립트는 Collector metrics와 실제 repository config를 사용해 다음 정보를 출력한다.
+
+```text
+status
+queue_size
+queue_capacity
+queue_utilization_pct
+queue_remaining_items
+full_outage_headroom_sec
+reference_spans_per_sec
+
+in_flight
+
+sent_spans
+enqueue_failed_spans
+send_failed_spans
+
+accepted_spans
+refused_spans
+```
+
+### Queue Capacity
+
+다음 값을 코드에 중복 hard-code하지 않고:
+
+```text
+otel-collector-config.yaml
+```
+
+에서 읽도록 구현했다.
+
+현재:
+
+```text
+queue_size=200000
+```
+
+실제 실행에서도:
+
+```text
+queue_capacity=200000
+```
+
+으로 확인했다.
+
+### Metric Series 부재 처리
+
+이전 saturation 실험에서 metric helper가 존재하지 않는 series를 0으로 변환하는 문제가 있었다.
+
+새 스크립트에서는 해당 문제를 방지하기 위해 series가 없으면:
+
+```text
+N/A
+```
+
+로 표시한다.
+
+Host reboot 직후 실제 상태:
+
+```text
+sent_spans=20000
+
+enqueue_failed_spans=N/A
+send_failed_spans=N/A
+accepted_spans=N/A
+refused_spans=N/A
+```
+
+이었다.
+
+이는 Collector reboot 이후 새 OTLP 수신 없이 persistent queue에 복원된 20,000 Span만 exporter가 Backend로 전송한 현재 lifecycle과 일치한다.
+
+### 상태 및 Exit Code
+
+기본:
+
+```text
+OK       = exit 0
+WARNING  = exit 1
+CRITICAL = exit 2
+UNKNOWN  = exit 3
+```
+
+기본 threshold:
+
+```text
+warning  = 50%
+critical = 80%
+```
+
+### 정상 상태 검증
+
+```text
+status=OK
+queue_size=0
+queue_capacity=200000
+queue_utilization_pct=0.00
+queue_remaining_items=200000
+full_outage_headroom_sec=61.54
+reference_spans_per_sec=3250.00
+in_flight=0
+
+exit=0
+```
+
+### Threshold Validation 검증
+
+잘못된 설정:
+
+```text
+warn=0.9
+critical=0.8
+```
+
+결과:
+
+```text
+UNKNOWN: warning ratio must be lower than critical ratio.
+exit=3
+```
+
+잘못된 threshold로 운영 상태가 계산되지 않도록 방어했다.
+
+### 실제 Queue Backlog 생성
+
+Backend를 pause한 상태에서:
+
+```text
+target rate = 1,000 spans/s
+duration    = 2 sec
+requested   = 2,000 spans
+accepted    = 2,000 spans
+failed      = 0
+sender_rc   = 0
+```
+
+의 실제 telemetry backlog를 생성했다.
+
+Collector:
+
+```text
+queue_size=2000
+queue_capacity=200000
+queue_utilization_pct=1.00
+queue_remaining_items=198000
+full_outage_headroom_sec=60.92
+in_flight=2
+```
+
+### 기본 Threshold
+
+실제 queue utilization 1%에서는:
+
+```text
+status=OK
+exit=0
+```
+
+이었다.
+
+즉 작은 일시적 backlog를 운영 장애로 판단하지 않는다.
+
+### WARNING 경로 검증
+
+실제 queue를 대규모로 다시 채우지 않고 동일한 실제 2,000 Span backlog를 사용하면서 테스트 invocation에서만 threshold를 낮췄다.
+
+```text
+warning  = 0.5%
+critical = 2%
+```
+
+실제:
+
+```text
+queue utilization = 1%
+```
+
+결과:
+
+```text
+status=WARNING
+exit=1
+```
+
+### CRITICAL 경로 검증
+
+테스트 threshold:
+
+```text
+warning  = 0.1%
+critical = 0.5%
+```
+
+결과:
+
+```text
+status=CRITICAL
+exit=2
+```
+
+따라서 실제 Collector metric을 입력으로 사용해:
+
+```text
+OK
+WARNING
+CRITICAL
+UNKNOWN
+```
+
+네 상태와 exit code를 모두 검증했다.
+
+### Backend Recovery
+
+Backend unpause 후 health:
+
+```text
+unhealthy
+unhealthy
+healthy
+```
+
+queue는 첫 확인 시 이미:
+
+```text
+queue=0
+```
+
+까지 drain됐다.
+
+최종 DB:
+
+```text
+2000/2000
+```
+
+### 최종 상태
+
+```text
+status=OK
+queue_size=0
+queue_capacity=200000
+queue_utilization_pct=0.00
+full_outage_headroom_sec=61.54
+in_flight=0
+
+sent_spans=22000
+accepted_spans=2000
+refused_spans=0
+```
+
+`sent_spans=22000`과 `accepted_spans=2000`의 차이는 오류가 아니다.
+
+현재 Collector lifecycle에서:
+
+```text
+Host reboot 후 persistent queue 재전송 = 20,000
+이번 테스트 신규 receiver 수신          = 2,000
+```
+
+이므로:
+
+```text
+exported total = 22,000
+newly received = 2,000
+```
+
+과 일치한다.
+
+### 실무적 교훈
+
+- queue가 0보다 크다고 즉시 장애는 아니다.
+- queue utilization과 남은 장애 buffer를 함께 봐야 한다.
+- 운영 체크 도구는 사람이 읽는 출력뿐 아니라 자동화 가능한 exit code를 가져야 한다.
+- production threshold를 검증하기 위해 실제 queue를 위험한 수준까지 매번 채울 필요는 없다.
+- 실제 Collector metric을 사용하되 테스트 invocation에서 threshold만 낮춰 상태 분기 자체를 검증할 수 있다.
+- metric series 부재와 실제 counter 0은 반드시 구분해야 한다.
+- Collector counter는 process lifecycle에 종속된 cumulative metric이므로 서로 다른 restart 구간의 counter를 단순 비교하면 안 된다.
+- queue capacity는 운영 config와 단일 source of truth를 유지해야 한다.
+
+### 현재 기본 운영 기준
+
+```text
+queue < 50%
+→ OK
+
+queue >= 50%
+→ WARNING
+
+queue >= 80%
+→ CRITICAL
+```
+
+현재 3,250 spans/s reference workload에서는:
+
+```text
+0% used
+→ 약 61.54 sec remaining
+
+50% used
+→ 약 30.77 sec remaining
+
+80% used
+→ 약 12.31 sec remaining
+```
+
+단, 이는 Backend throughput이 완전히 0이라는 단순 outage 모델 기준이다.
+
+### 다음 작업
+
+현재 스크립트는 사람이 직접 실행해야 한다.
+
+다음 단계에서는:
+
+```text
+누가 주기적으로 실행하는가?
+어느 host/container에서 실행하는가?
+경고 상태를 어디로 전달하는가?
+중복 알림을 어떻게 방지하는가?
+Collector 자체가 죽어 metrics를 읽을 수 없는 UNKNOWN은 어떻게 처리하는가?
+```
+
+를 설계한다.
