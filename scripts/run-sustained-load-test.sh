@@ -87,6 +87,41 @@ metric_value() {
     'index($0, metric_name "{") == 1 && index($0, "exporter=\"otlp_http/aerotrace\"") > 0 { print $2; exit }'
 }
 
+receiver_metric_value() {
+  local metric_name="$1"
+
+  curl \
+    --silent \
+    --show-error \
+    "${collector_metrics}" |
+  awk \
+    -v metric_name="${metric_name}" \
+    'index($0, metric_name "{") == 1 &&
+     index($0, "receiver=\"otlp\"") > 0 &&
+     index($0, "transport=\"http\"") > 0 {
+       print $2
+       exit
+     }'
+}
+
+
+metric_delta() {
+  python3 - "$1" "$2" <<'PY'
+from decimal import Decimal
+import sys
+
+before = Decimal(sys.argv[1])
+after = Decimal(sys.argv[2])
+delta = after - before
+
+if delta != delta.to_integral_value():
+    raise SystemExit(
+        f"Metric delta is not an integer: {delta}"
+    )
+
+print(int(delta))
+PY
+}
 
 count_test_spans() {
   docker exec \
@@ -198,6 +233,26 @@ in_flight_before="$(
     otelcol_exporter_in_flight_requests
 )"
 
+enqueue_failed_before="$(
+  metric_value \
+    otelcol_exporter_enqueue_failed_spans
+)"
+
+sent_spans_before="$(
+  metric_value \
+    otelcol_exporter_sent_spans
+)"
+
+accepted_spans_before="$(
+  receiver_metric_value \
+    otelcol_receiver_accepted_spans
+)"
+
+refused_spans_before="$(
+  receiver_metric_value \
+    otelcol_receiver_refused_spans
+)"
+
 printf 'Backend:   %s\n' \
   "${backend_state}"
 
@@ -213,6 +268,11 @@ printf 'Queue:     %s\n' \
 printf 'In flight: %s\n' \
   "${in_flight_before}"
 
+printf 'Enqueue failed: %s\n' \
+  "${enqueue_failed_before}"
+
+printf 'Receiver refused: %s\n' \
+  "${refused_spans_before}"
 
 if [ "${backend_state}" != "running false healthy" ]; then
   echo "Backend preflight failed."
@@ -288,8 +348,9 @@ tee \
 sender_rc="${PIPESTATUS[0]}"
 
 if [ "${sender_rc}" -ne 0 ]; then
-  echo "Sustained sender failed."
-  exit "${sender_rc}"
+  printf \
+    'Sender exited non-zero: %s; continuing pipeline verification.\n' \
+    "${sender_rc}"
 fi
 
 
@@ -349,12 +410,11 @@ do
   fi
 
   if \
-    [ "${final_db_count}" = "${total_spans}" ] &&
     [ "${final_queue}" = "0" ] &&
     [ "${final_in_flight}" = "0" ]
   then
     completion_ok=1
-    echo "Sustained pipeline completion: OK"
+    echo "Collector drain complete."
     break
   fi
 
@@ -367,6 +427,50 @@ if [ "${completion_ok}" -ne 1 ]; then
   exit 33
 fi
 
+enqueue_failed_after="$(
+  metric_value \
+    otelcol_exporter_enqueue_failed_spans
+)"
+
+sent_spans_after="$(
+  metric_value \
+    otelcol_exporter_sent_spans
+)"
+
+accepted_spans_after="$(
+  receiver_metric_value \
+    otelcol_receiver_accepted_spans
+)"
+
+refused_spans_after="$(
+  receiver_metric_value \
+    otelcol_receiver_refused_spans
+)"
+
+
+enqueue_failed_delta="$(
+  metric_delta \
+    "${enqueue_failed_before}" \
+    "${enqueue_failed_after}"
+)"
+
+sent_spans_delta="$(
+  metric_delta \
+    "${sent_spans_before}" \
+    "${sent_spans_after}"
+)"
+
+accepted_spans_delta="$(
+  metric_delta \
+    "${accepted_spans_before}" \
+    "${accepted_spans_after}"
+)"
+
+refused_spans_delta="$(
+  metric_delta \
+    "${refused_spans_before}" \
+    "${refused_spans_after}"
+)"
 
 echo
 echo "===== Waiting for resource monitor ====="
@@ -411,6 +515,21 @@ echo "===== FINAL RESULT ====="
   printf 'In flight: %s\n' \
     "${final_in_flight}"
 
+  printf 'Collector accepted delta: %s\n' \
+    "${accepted_spans_delta}"
+
+  printf 'Collector refused delta: %s\n' \
+    "${refused_spans_delta}"
+
+  printf 'Exporter sent delta: %s\n' \
+    "${sent_spans_delta}"
+
+  printf 'Exporter enqueue failed delta: %s\n' \
+    "${enqueue_failed_delta}"
+
+  printf 'Sender exit code: %s\n' \
+    "${sender_rc}"
+
   printf 'Sender log: %s\n' \
     "${sender_log}"
 
@@ -421,5 +540,44 @@ tee \
   "${summary_file}"
 
 
+data_integrity_ok=1
+
+if [ "${final_db_count}" != "${total_spans}" ]; then
+  data_integrity_ok=0
+
+  printf \
+    'Data loss detected: DB stored %s/%s spans.\n' \
+    "${final_db_count}" \
+    "${total_spans}"
+fi
+
+if [ "${enqueue_failed_delta}" -ne 0 ]; then
+  data_integrity_ok=0
+
+  printf \
+    'Data loss detected: exporter enqueue failed delta=%s.\n' \
+    "${enqueue_failed_delta}"
+fi
+
+if [ "${refused_spans_delta}" -ne 0 ]; then
+  data_integrity_ok=0
+
+  printf \
+    'Data loss detected: receiver refused delta=%s.\n' \
+    "${refused_spans_delta}"
+fi
+
+
 echo
+
+if [ "${data_integrity_ok}" -ne 1 ]; then
+  echo "Sustained load test: FAIL (data integrity)"
+  exit 34
+fi
+
+if [ "${sender_rc}" -ne 0 ]; then
+  echo "Sustained load test: FAIL (sender validity)"
+  exit "${sender_rc}"
+fi
+
 echo "Sustained load test: PASS"
