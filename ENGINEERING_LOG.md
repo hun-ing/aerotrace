@@ -6459,3 +6459,368 @@ Backend healthy / restart=0 출력
 - 성능 진단용 instrumentation은 분석이 끝난 뒤 운영 코드에서 제거한다.
 - 최적화 결과는 측정한 범위만 표현하고 최대 처리량 증가처럼 측정하지 않은 성과를 과장하지 않는다.
 
+---
+
+## Collector Queue Overflow 데이터 유실 및 Backpressure 장애 실험
+
+### 문제 발견
+
+OpenTelemetry Collector의 exporter `sending_queue`가 가득 찼을 때 현재 설정이 telemetry 보존에 어떤 영향을 주는지 검증했다.
+
+초기 설정:
+
+```yaml
+sending_queue:
+  enabled: true
+  num_consumers: 2
+  sizer: items
+  queue_size: 50000
+  block_on_overflow: false
+  storage: file_storage/aerotrace
+```
+
+Backend 장애를 `docker pause`로 재현하고 70,000 Span sustained workload를 전송했다.
+
+### block_on_overflow=false 장애 결과
+
+측정 결과:
+
+```text
+requested        = 70,000
+sender accepted  = 70,000
+receiver accepted Δ = 70,000
+
+enqueue_failed Δ = 20,250
+sent Δ           = 49,750
+
+DB               = 49,750
+missing          = 20,250
+```
+
+Sender와 Collector receiver 관점에서는 70,000 Span이 수락됐지만 exporter queue 진입 실패로 20,250 Span이 최종 저장되지 않았다.
+
+이 실험을 통해 queue overflow 시 telemetry가 조용히 유실될 수 있음을 확인했다.
+
+### block_on_overflow=true A/B
+
+임시 Collector config를 사용하여 다음 설정으로 동일한 장애를 재현했다.
+
+```yaml
+block_on_overflow: true
+```
+
+정상 경로를 먼저 200 Span smoke로 검증했다.
+
+```text
+Requested spans = 200
+Accepted spans  = 200
+Failed requests = 0
+DB              = 200 / 200
+queue           = 0
+enqueue_failed  = 0
+```
+
+이후 70,000 Span 장애 실험:
+
+```text
+enqueue_failed Δ = 0
+sent Δ           = 70,000
+accepted Δ       = 70,000
+refused Δ        = 0
+DB               = 70,000
+missing          = 0
+```
+
+대신 Sender에서는 backpressure가 관찰됐다.
+
+```text
+Request latency p99          = 170.502 ms
+Producer lag p99             = 7,854.452 ms
+Send-start lag p99           = 8,654.874 ms
+Producer backpressure events = 312
+
+Delivery success        = PASS
+Sustained-rate validity = FAIL
+```
+
+데이터 유실이 upstream 지연으로 이동한 것으로 판단했다.
+
+### 장기 Queue Saturation
+
+queue 포화 상태를 15초 유지했다.
+
+포화 중:
+
+```text
+queue      = 49,750
+in_flight  = 2
+enqueue_failed = 0
+```
+
+Sender 결과:
+
+```text
+Requested spans = 70,000
+Accepted spans  = 69,600
+Failed requests = 8
+
+Observed accepted spans/sec = 1,265.39
+Request latency max         = 10,011.129 ms
+Producer lag p99            = 25,679.388 ms
+Send-start lag p99          = 26,481.702 ms
+Backpressure wait total     = 28,323.182 ms
+
+Delivery success        = FAIL
+Sustained-rate validity = FAIL
+```
+
+Sender는 8개 요청, 총 400 Span을 timeout으로 실패 판단했다.
+
+하지만 Backend 복구와 Collector drain 후:
+
+```text
+enqueue_failed Δ = 0
+sent Δ           = 70,000
+accepted Δ       = 70,000
+refused Δ        = 0
+
+DB               = 70,000
+missing          = 0
+```
+
+이었다.
+
+client timeout과 실제 telemetry 저장 결과가 다를 수 있다는 점을 확인했다.
+
+### 고정 Payload 기반 Ambiguous Timeout 재현
+
+Timeout된 요청이 실제로 저장되는지 명확히 추적하기 위해 고정 OTLP payload를 생성했다.
+
+```text
+request files = 8
+spans/request = 50
+total spans   = 400
+```
+
+사전 DB count:
+
+```text
+0
+```
+
+Backend를 pause한 후 filler load로 Collector queue를 포화시켰다.
+
+첫 번째 saturation detector는 `queue >= 49,750`이라는 고정 임계값을 사용했지만 queue가 `49,350`에서 장시간 정체돼 조건을 만족하지 못했다.
+
+이 결과를 통해 절대 queue 값 하나만을 saturation 조건으로 사용하는 테스트가 workload의 batch 크기에 의존한다는 문제를 발견했다.
+
+포화 판정을 다음처럼 수정했다.
+
+```text
+queue >= 49,000
+in_flight >= 2
+동일 queue 값이 연속적으로 유지
+```
+
+재실험에서:
+
+```text
+queue_saturated     = 49,550
+in_flight_saturated = 2
+```
+
+를 확인했다.
+
+고정된 8개 요청을 동시에 전송한 결과:
+
+```text
+request 01 curl_rc=28 HTTP=000
+request 02 curl_rc=28 HTTP=000
+request 03 curl_rc=28 HTTP=000
+request 04 curl_rc=28 HTTP=000
+request 05 curl_rc=28 HTTP=000
+request 06 curl_rc=28 HTTP=000
+request 07 curl_rc=28 HTTP=000
+request 08 curl_rc=28 HTTP=000
+```
+
+모든 요청이 client timeout이었다.
+
+Backend 복구 후:
+
+```text
+probe_db = 400 / 400
+```
+
+각 요청별:
+
+```text
+request 01 ~ 08
+DB = 50 / 50
+```
+
+최종 Collector:
+
+```text
+queue     = 0
+in_flight = 0
+```
+
+따라서 client가 timeout으로 실패 판단한 요청도 Collector 내부에 이미 수락되어 이후 저장될 수 있음을 재현했다.
+
+### Ambiguous Timeout Retry Idempotency
+
+Timeout된 8개의 JSON payload를 수정하지 않고 그대로 다시 전송했다.
+
+Retry 전:
+
+```text
+count             = 400
+distinct identity = 400
+max ingested_at   = 2026-08-14 03:35:59.609128+00
+```
+
+Retry 결과:
+
+```text
+request 01 ~ 08
+curl_rc = 0
+HTTP    = 200
+```
+
+Retry 후:
+
+```text
+count             = 400
+distinct identity = 400
+max ingested_at   = 2026-08-14 03:35:59.609128+00
+row growth        = 0
+```
+
+현재 DB Unique Identity:
+
+```text
+tenant_id
+project_id
+trace_id
+span_id
+start_time
+```
+
+저장 로직:
+
+```sql
+ON CONFLICT (
+    tenant_id,
+    project_id,
+    trace_id,
+    span_id,
+    start_time
+)
+DO NOTHING
+```
+
+동일 telemetry retry가 실제 DB 중복을 만들지 않는 것을 장애 조건에서 확인했다.
+
+### 운영 설정 적용
+
+실험 결과를 근거로 정식 Collector 설정을 변경했다.
+
+변경 파일:
+
+```text
+otel-collector-config.yaml
+```
+
+변경:
+
+```diff
+- block_on_overflow: false
++ block_on_overflow: true
+```
+
+임시 `/tmp` overlay 없이 Compose를 다시 구성했고 Runtime mount를 확인했다.
+
+```text
+source=/home/huning/aerotrace/otel-collector-config.yaml
+destination=/etc/otel-collector-config.yaml
+```
+
+정식 설정으로 Collector를 재기동한 후 200 Span smoke:
+
+```text
+Requested spans        = 200
+Accepted spans         = 200
+Failed requests        = 0
+Observed accepted rate = 99.97 spans/s
+Delivery success       = PASS
+Sustained-rate validity= PASS
+sender_rc              = 0
+DB                     = 200 / 200
+```
+
+Collector 최종 상태:
+
+```text
+queue     = 0
+in_flight = 0
+```
+
+`git diff --check` 오류 없음.
+
+### 최종 판단
+
+AeroTrace는 Collector exporter queue overflow에서 silent telemetry loss보다 upstream backpressure를 우선한다.
+
+```text
+block_on_overflow=true
+```
+
+를 정식 기본값으로 사용한다.
+
+장애가 길어질 경우 client latency 증가와 timeout은 발생할 수 있지만, 이번 실험에서는 queue 진입 단계 데이터 유실을 방지했고 timeout 후 동일 Span retry도 DB idempotency로 중복 저장 없이 처리됐다.
+
+### 실무적 교훈
+
+- OTLP request 성공과 최종 DB 저장 성공은 동일한 의미가 아니다.
+- Collector receiver accepted metric만으로 end-to-end 데이터 보존을 판단하면 안 된다.
+- queue overflow에서는 `enqueue_failed`와 최종 DB row 수를 함께 확인해야 한다.
+- backpressure를 활성화하면 데이터 유실 문제가 latency와 timeout 문제로 이동할 수 있다.
+- client timeout은 요청이 처리되지 않았다는 확정적인 증거가 아니다.
+- ambiguous timeout이 존재하는 시스템에서는 저장 계층의 idempotency가 중요하다.
+- retry 정책을 검증할 때 단순 정상 재전송뿐 아니라 실제 장애 조건에서 동일 payload를 재전송해야 한다.
+- queue saturation을 고정된 절대 수치 하나로 판정하면 workload의 batch granularity 때문에 잘못된 테스트가 될 수 있다.
+- 장애 실험에는 cleanup을 넣어 Backend가 pause 상태로 남지 않도록 해야 한다.
+- 데이터 보존 정책은 throughput뿐 아니라 failure semantics까지 측정한 뒤 결정해야 한다.
+
+### 보존해야 할 증거
+
+다음 결과는 향후 포트폴리오와 운영 정책 검토를 위해 보존 가치가 있다.
+
+```text
+block_on_overflow=false 70,000 Span 결과
+enqueue_failed=20,250 / DB=49,750 결과
+
+block_on_overflow=true 70,000 Span 결과
+enqueue_failed=0 / DB=70,000 결과
+
+15초 saturation Sender timeout 결과
+Failed requests=8 / Sender accepted=69,600
+Collector accepted=70,000 / DB=70,000
+
+고정 400 Span ambiguous timeout 결과
+8/8 curl_rc=28
+DB=400/400
+
+동일 payload retry 결과
+before_count=400
+after_count=400
+row_growth=0
+ingested_at unchanged
+
+정식 설정 200 Span smoke
+sender_rc=0
+DB=200/200
+queue=0
+in_flight=0
+```

@@ -1639,3 +1639,292 @@ e8a1408 PostgreSQL 배치 INSERT 재작성 최적화 적용
 - PostgreSQL COPY가 동일 correctness 조건에서 더 높은 효율을 보인다는 측정 결과 확보
 - 현재 단일 TimescaleDB 저장 구조가 지속적인 bottleneck으로 확인
 - 더 높은 ingest rate에서 Collector backlog가 지속적으로 증가
+
+---
+
+## Collector Queue Overflow 시 Backpressure 우선 정책
+
+### 해결하려는 문제
+
+OpenTelemetry Collector가 Backend 장애 또는 저장 지연으로 인해 exporter queue를 모두 사용했을 때 telemetry를 어떻게 처리할지 결정해야 했다.
+
+기존 설정은 다음과 같았다.
+
+```yaml
+sending_queue:
+  enabled: true
+  num_consumers: 2
+  sizer: items
+  queue_size: 50000
+  block_on_overflow: false
+  storage: file_storage/aerotrace
+```
+
+`block_on_overflow=false`에서는 queue가 더 이상 데이터를 받을 수 없을 때 새 telemetry가 queue 진입에 실패할 수 있다.
+
+AeroTrace는 장애 분석을 위한 telemetry를 저장하는 시스템이므로, 호출자에게 성공처럼 보이는 동안 Span이 조용히 유실되는 동작을 운영 기본 정책으로 허용할지 검증이 필요했다.
+
+### 검토한 방식
+
+다음 두 설정을 동일한 장애 조건에서 비교했다.
+
+```text
+block_on_overflow=false
+block_on_overflow=true
+```
+
+공통 조건:
+
+```text
+Collector sending queue size = 50,000 items
+Collector consumers = 2
+Backend pause로 exporter downstream 차단
+2,000 spans/s sustained workload
+70,000 requested spans
+```
+
+### block_on_overflow=false 결과
+
+Backend가 중단된 상태에서 queue overflow를 발생시킨 결과:
+
+```text
+requested spans        = 70,000
+sender accepted        = 70,000
+receiver accepted Δ    = 70,000
+enqueue_failed Δ       = 20,250
+sent Δ                 = 49,750
+DB stored              = 49,750
+missing                = 20,250
+```
+
+Sender는 70,000 Span을 Collector가 받은 것으로 판단했지만 최종 DB에는 49,750 Span만 저장됐다.
+
+20,250 Span은 exporter queue 진입 단계에서 유실됐다.
+
+따라서 이 조건에서는 호출자 관점의 성공과 실제 telemetry 보존 여부가 일치하지 않았다.
+
+### block_on_overflow=true 결과
+
+동일한 70,000 Span 장애 실험에서:
+
+```text
+enqueue_failed Δ = 0
+sent Δ           = 70,000
+receiver accepted Δ = 70,000
+DB stored        = 70,000
+missing          = 0
+```
+
+queue saturation 동안 upstream에 backpressure가 전파됐으며 Sender 측에서는 다음 현상이 관찰됐다.
+
+```text
+Producer backpressure events = 312
+Request latency p99          = 170.502 ms
+Producer lag p99             = 7,854.452 ms
+Send-start lag p99           = 8,654.874 ms
+Sustained-rate validity      = FAIL
+```
+
+즉 telemetry를 조용히 버리는 대신 전송 지연이 호출자 쪽으로 전달됐다.
+
+### 장기 장애와 Timeout 검증
+
+queue 포화 상태를 15초 유지한 추가 실험에서는 Sender가 일부 요청을 timeout으로 판단했다.
+
+```text
+Requested spans  = 70,000
+Accepted spans   = 69,600
+Failed requests  = 8
+Sender 실패 판단 = 400 spans
+```
+
+하지만 Collector와 DB 최종 결과는 다음과 같았다.
+
+```text
+enqueue_failed Δ = 0
+sent Δ           = 70,000
+receiver accepted Δ = 70,000
+DB stored        = 70,000
+missing          = 0
+```
+
+따라서 client timeout이 발생했다고 해서 해당 telemetry가 Collector에 수락되지 않았거나 DB에 저장되지 않았다고 단정할 수 없음을 확인했다.
+
+### Ambiguous Timeout 재현
+
+이 현상을 독립적으로 검증하기 위해 동일 payload를 다시 사용할 수 있는 8개 OTLP 요청을 생성했다.
+
+```text
+8 requests
+50 spans/request
+400 spans total
+```
+
+Backend를 pause하고 Collector queue를 포화시켰다.
+
+측정된 포화 상태:
+
+```text
+queue_saturated     = 49,550
+in_flight_saturated = 2
+```
+
+그 상태에서 8개 요청을 전송한 결과 모든 요청이 client timeout으로 종료됐다.
+
+```text
+request 01 ~ 08
+curl_rc = 28
+HTTP    = 000
+```
+
+그러나 Backend 복구 후:
+
+```text
+probe DB total = 400 / 400
+각 request DB  = 50 / 50
+final queue    = 0
+final in-flight= 0
+```
+
+이었다.
+
+즉 client가 실패로 판단한 모든 telemetry가 실제로는 Collector에 남아 있었고 이후 DB에 저장됐다.
+
+### Timeout Retry 중복 검증
+
+Ambiguous timeout 후 실제 client retry 상황을 검증하기 위해 timeout이 발생했던 8개 payload를 그대로 다시 전송했다.
+
+Retry 전:
+
+```text
+row count       = 400
+distinct identity = 400
+```
+
+동일 payload 8개 재전송:
+
+```text
+request 01 ~ 08
+curl_rc = 0
+HTTP    = 200
+```
+
+Retry 후:
+
+```text
+row count         = 400
+distinct identity = 400
+row growth        = 0
+```
+
+`ingested_at`의 최대값도 변경되지 않았다.
+
+```text
+before = 2026-08-14 03:35:59.609128+00
+after  = 2026-08-14 03:35:59.609128+00
+```
+
+현재 Span 저장 계층은 다음 identity에 대해 Unique Index를 사용한다.
+
+```text
+tenant_id
+project_id
+trace_id
+span_id
+start_time
+```
+
+저장 SQL은 다음 방식이다.
+
+```sql
+ON CONFLICT (
+    tenant_id,
+    project_id,
+    trace_id,
+    span_id,
+    start_time
+)
+DO NOTHING
+```
+
+따라서 동일 OTLP Span payload가 retry되더라도 새로운 DB row를 만들지 않는 것을 실제 장애 조건에서 검증했다.
+
+### 최종 결정
+
+AeroTrace의 Collector exporter queue는 다음을 기본 정책으로 사용한다.
+
+```yaml
+block_on_overflow: true
+```
+
+선택 이유:
+
+```text
+silent telemetry loss보다 upstream backpressure를 우선
+queue overflow 시 enqueue 단계 데이터 유실 방지
+client timeout이 발생하더라도 Collector가 이미 보유한 telemetry 보존
+ambiguous timeout 후 동일 payload retry는 DB idempotency로 중복 방지
+멀티테넌트 identity를 포함한 Unique Index로 tenant/project 간 충돌 방지
+```
+
+AeroTrace는 장애 분석을 위한 관측 데이터를 다루므로, 정상처럼 보이면서 telemetry를 조용히 잃는 것보다 지연과 timeout이 호출자에게 명시적으로 전파되는 방식을 선택한다.
+
+### Trade-off
+
+`block_on_overflow=true`는 데이터 유실을 없애는 무료 옵션이 아니다.
+
+downstream 장애가 충분히 길어지면 다음 현상이 발생할 수 있다.
+
+```text
+OTLP 요청 latency 증가
+upstream backpressure
+Sender cadence 붕괴
+client timeout
+SDK 또는 상위 Collector retry 증가
+persistent queue 사용량 증가
+```
+
+따라서 `block_on_overflow=true`만으로 무한 장애를 견딜 수 있다고 판단하지 않는다.
+
+queue와 persistent storage 용량을 초과하는 장기 장애에 대해서는 별도의 용량 정책과 데이터 유실 허용 기준이 필요하다.
+
+### 정식 적용 검증
+
+실험용 `/tmp` overlay가 아닌 저장소의 정식 설정에 다음 변경을 적용했다.
+
+```yaml
+block_on_overflow: true
+```
+
+Runtime mount:
+
+```text
+source=/home/huning/aerotrace/otel-collector-config.yaml
+destination=/etc/otel-collector-config.yaml
+```
+
+정식 설정으로 Collector를 재기동한 후 200 Span smoke 결과:
+
+```text
+Requested spans = 200
+Accepted spans  = 200
+Failed requests = 0
+sender_rc       = 0
+DB              = 200 / 200
+queue           = 0
+in_flight       = 0
+```
+
+### 재검토 조건
+
+다음 조건이 발생하면 이 결정을 다시 검토한다.
+
+- 실제 사용자 서비스에서 OTLP latency가 애플리케이션 성능에 영향을 줌
+- SDK 또는 upstream Collector의 timeout/retry 정책과 충돌
+- persistent queue 디스크 사용량이 운영 한계를 초과
+- 장시간 DB 장애에서 허용할 수 없는 memory/disk pressure 발생
+- tenant별 ingest quota 또는 rate limit을 도입
+- sampling 정책으로 overload를 사전에 제어하게 됨
+- queue 크기 또는 `num_consumers` 변경 후 새로운 병목 확인
+- Collector 버전 변경으로 queue 또는 retry semantics가 변경
+- 현재 DB idempotency identity로 처리되지 않는 duplicate 형태 발견
