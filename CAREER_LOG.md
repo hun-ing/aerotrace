@@ -2242,3 +2242,177 @@ accepted_spans=211450
 refused_spans=0
 ```
 
+---
+
+### Portfolio Checkpoint 추가 — Host Reboot 이후 Telemetry 복구 검증
+
+OpenTelemetry Collector persistent queue의 장애 내구성을 process restart와 SIGKILL 수준에서 끝내지 않고 Host OS reboot까지 확장해서 검증했다.
+
+Backend를 정상 stop한 상태에서 20,000 Span을 Collector persistent queue에 저장했다.
+
+Host reboot 직전:
+
+```text
+queue = 20,000
+DB    = 0 / 20,000
+```
+
+이 상태에서 실제 host를 reboot했다.
+
+```text
+sudo reboot
+```
+
+재부팅 후:
+
+```text
+Collector   = running
+TimescaleDB = healthy
+Backend     = exited
+```
+
+이었기 때문에 Backend가 queue를 drain하기 전에 persistent queue 복구 상태를 직접 확인할 수 있었다.
+
+Collector startup log:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20,000
+bytesSize       = 2,234,800
+dispatchedItems = 2
+```
+
+진행 중이던 두 item도:
+
+```text
+Moved items for dispatching back to queue
+numberOfItems = 2
+```
+
+로 다시 queue에 복원됐다.
+
+Backend가 여전히 중단된 상태에서:
+
+```text
+queue = 20,000
+DB    = 0 / 20,000
+```
+
+을 확인했다.
+
+Backend 복구 후:
+
+```text
+queue:
+18,950
+→ 15,800
+→ 13,700
+→ 10,550
+→ 6,350
+→ 3,150
+→ 0
+
+DB = 20,000 / 20,000
+```
+
+으로 전체 telemetry가 최종 저장됐다.
+
+현재까지 직접 검증한 failure boundary:
+
+```text
+Collector graceful restart → 20,000 / 20,000
+Collector SIGKILL          → 20,000 / 20,000
+Host OS reboot             → 20,000 / 20,000
+```
+
+#### 포트폴리오에서 강조할 부분
+
+단순히 OpenTelemetry persistent queue를 설정한 것이 아니라 장애 경계를 단계적으로 확장했다.
+
+```text
+process restart
+→ SIGKILL
+→ host reboot
+```
+
+각 단계에서:
+
+```text
+장애 전 queue 상태
+DB 미저장 상태
+startup queue metadata
+진행 중 item 복원
+queue drain
+최종 DB 데이터
+```
+
+를 모두 확인했다.
+
+특히 host reboot 실험에서는 shell과 `/tmp` 상태가 사라지는 문제를 고려해 실험 metadata를 persistent host 파일로 따로 저장하고 재접속 후 동일 telemetry를 추적했다.
+
+#### 이력서 성과 문장 보강
+
+- OpenTelemetry Collector persistent queue의 장애 내구성을 graceful restart, SIGKILL, Host OS reboot까지 단계적으로 검증하고, 각 장애에서 20,000/20,000 Span이 최종 DB까지 복구되는 것을 확인해 telemetry 수집 경로의 장애 복구 신뢰성을 검증
+- Host reboot 전 DB 미저장 상태의 20,000 Span backlog를 생성하고 Docker volume 재마운트 후 `itemsSize=20000` queue 복원과 최종 20,000/20,000 저장을 검증하여 process lifecycle을 넘어선 데이터 보존 특성을 확인
+
+#### 예상 면접 질문
+
+```text
+왜 docker restart와 host reboot를 따로 테스트했는가?
+Backend를 pause하지 않고 stop한 이유는?
+왜 reboot 이후 Backend가 자동으로 올라오지 않는 상태가 오히려 테스트에 유리했는가?
+reboot 전에 DB=0인지 확인한 이유는?
+왜 실험 metadata를 홈 디렉터리에 저장했는가?
+Loaded queue metadata에서 무엇을 확인했는가?
+dispatchedItems=2는 어떤 의미로 해석했는가?
+Docker volume을 사용하면 host reboot에서도 항상 안전하다고 말할 수 있는가?
+아직 검증하지 않은 storage failure는 무엇인가?
+```
+
+#### 보존할 핵심 증거
+
+```text
+reboot state 파일
+queue_before_reboot=20000
+DB_before_reboot=0
+
+재부팅 후 container 상태:
+Collector Up
+TimescaleDB healthy
+Backend Exited
+
+Loaded queue metadata:
+itemsSize=20000
+bytesSize=2234800
+dispatchedItems=2
+
+queue_after_reboot=20000
+DB_after_reboot=0
+
+final_db=20000/20000
+final_queue=0
+final_in_flight=0
+Backend healthy
+```
+
+#### 블로그 소재
+
+**제목**
+
+> OpenTelemetry Persistent Queue는 서버 재부팅도 버틸까? Process Crash에서 Host Reboot까지 장애 실험
+
+**핵심 흐름**
+
+```text
+왜 process restart 테스트만으로 부족한가
+→ Docker volume과 persistent queue 구조
+→ reboot 전 DB=0인 backlog 만들기
+→ 실험 metadata 보존
+→ 실제 Host reboot
+→ Collector metadata reload 확인
+→ dispatch 중 item 복구
+→ Backend 복구
+→ 최종 20,000/20,000 검증
+→ 아직 검증하지 않은 power-loss 영역
+```

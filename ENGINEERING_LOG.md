@@ -7680,3 +7680,296 @@ sent delta=211250
 accepted delta=211250
 ```
 
+---
+
+## Host Reboot Persistent Queue Recovery 실험
+
+### 목적
+
+앞선 실험에서 다음 Collector process 단위 장애에 대한 persistent queue 복구를 확인했다.
+
+```text
+graceful restart
+SIGKILL
+```
+
+이번에는 failure boundary를 host 수준까지 확대해 다음을 검증했다.
+
+```text
+Host OS reboot
+Docker daemon restart
+Docker named volume 재마운트
+Collector 재시작
+Backend가 없는 상태에서 persistent backlog 복원
+Backend 복구 후 최종 DB 저장
+```
+
+### 실험 준비
+
+시작 전 Collector:
+
+```text
+queue     = 0
+in_flight = 0
+```
+
+Backend:
+
+```text
+running
+healthy
+```
+
+Host reboot 직후 queue가 의도치 않게 drain되는 것을 방지하기 위해 Backend를 `pause`하지 않고 정상 stop했다.
+
+```text
+docker stop aerotrace-backend
+```
+
+이후 Backend가 없는 상태에서:
+
+```text
+target rate = 2,000 spans/s
+duration    = 10 sec
+batch size  = 50
+workers     = 4
+```
+
+조건으로 20,000 Span을 Collector에 전송했다.
+
+Reboot 직전:
+
+```text
+queue_before_reboot     = 20,000
+in_flight_before_reboot = 2
+DB_before_reboot        = 0 / 20,000
+```
+
+persistent storage file size:
+
+```text
+33,570,816 bytes
+```
+
+였다.
+
+실험 metadata는 shell과 `/tmp`가 reboot 후 사라질 수 있으므로 홈 디렉터리에 별도 저장했다.
+
+```text
+~/aerotrace-pq-host-reboot.state
+```
+
+저장 내용:
+
+```text
+REBOOT_RUN=20260814T053923Z
+PREFIX=aerotrace-sustained-20260814T053924Z-a954b5-
+QUEUE_BEFORE_REBOOT=20000
+INFLIGHT_BEFORE_REBOOT=2
+DB_BEFORE_REBOOT=0
+FILE_BEFORE_REBOOT=33570816
+```
+
+### Host Reboot
+
+실행:
+
+```text
+sudo reboot
+```
+
+SSH 연결이 종료된 뒤 host에 다시 접속했다.
+
+재부팅 후 container 상태:
+
+```text
+aerotrace-otel-collector = Up
+aerotrace-timescaledb    = Up / healthy
+aerotrace-backend        = Exited (143)
+```
+
+Backend가 자동 시작되지 않았기 때문에 Collector가 persistent queue를 복원한 직후 상태를 DB drain 전에 확인할 수 있었다.
+
+### Collector Persistent Queue 복구
+
+Collector startup log:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20000
+bytesSize       = 2234800
+dispatchedItems = 2
+```
+
+이어:
+
+```text
+Fetching items left for dispatch by consumers
+numberOfItems = 2
+
+Moved items for dispatching back to queue
+numberOfItems = 2
+```
+
+가 확인됐다.
+
+이는 host reboot 이전에 consumer가 dispatch 중이던 두 item까지 persistent metadata를 통해 다시 queue로 복구한 것이다.
+
+Backend가 여전히 stopped인 상태에서 실제 Collector metric:
+
+```text
+queue_after_reboot     = 20,000
+in_flight_after_reboot = 2
+```
+
+DB:
+
+```text
+0 / 20,000
+```
+
+이었다.
+
+따라서 reboot 전에 DB에 저장된 데이터를 잘못 복구 결과로 판단하는 가능성을 제거했다.
+
+### Backend 복구
+
+Backend를 수동으로 시작했다.
+
+```text
+docker start aerotrace-backend
+```
+
+health:
+
+```text
+running false starting
+...
+running false healthy
+```
+
+까지 정상 복구됐다.
+
+Collector queue drain:
+
+```text
+18,950
+15,800
+13,700
+10,550
+6,350
+3,150
+0
+```
+
+최종:
+
+```text
+queue     = 0
+in_flight = 0
+```
+
+DB:
+
+```text
+20,000 / 20,000
+```
+
+Backend:
+
+```text
+running
+healthy
+```
+
+### 최종 결과
+
+```text
+queue before reboot = 20,000
+DB before reboot    = 0 / 20,000
+
+Host reboot
+
+queue after reboot  = 20,000
+DB after reboot     = 0 / 20,000
+
+Backend recovery
+
+final DB            = 20,000 / 20,000
+final queue         = 0
+final in-flight     = 0
+Backend             = running / healthy
+```
+
+### 현재까지의 Persistent Queue 장애 복구 결과
+
+```text
+Collector graceful restart
+→ 20,000 / 20,000
+
+Collector SIGKILL
+→ 20,000 / 20,000
+
+Host OS reboot
+→ 20,000 / 20,000
+```
+
+세 실험 모두 Backend 복구 후 최종 DB row 수로 end-to-end 데이터 보존을 확인했다.
+
+### 실무적 교훈
+
+- process restart와 host reboot는 서로 다른 failure boundary이므로 별도로 검증해야 한다.
+- persistent Docker volume을 사용한다고 해서 host reboot 복구를 가정만 해서는 안 된다.
+- reboot 테스트에서는 downstream이 자동 복구되기 전에 queue 상태를 확인할 수 있도록 실험 조건을 설계해야 한다.
+- shell 변수와 `/tmp` 파일은 reboot 실험의 기준 데이터 보존 위치로 적합하지 않다.
+- reboot 전 prefix, queue size, DB count 등의 metadata를 persistent host path에 저장하면 재접속 후 동일 데이터를 정확히 추적할 수 있다.
+- Collector startup log의 `Loaded queue metadata`는 persistent queue 복구 확인에 중요한 증거다.
+- `itemsSize`뿐 아니라 dispatch 중이던 item이 다시 queue로 이동되는지도 확인해야 한다.
+- persistent queue 복구 성공 여부는 startup log만이 아니라 최종 DB row 수까지 확인해야 한다.
+- 정상 OS reboot 성공 결과를 강제 전원 차단이나 filesystem corruption 내구성까지 확대 해석하면 안 된다.
+
+### 아직 검증하지 않은 Host/Storage 장애
+
+```text
+강제 전원 차단
+filesystem corruption
+Docker volume 손실
+SSD 장애
+host disk full
+file_storage max_size 도달
+file_storage write 실패
+```
+
+### 보존해야 할 증거
+
+```text
+~/aerotrace-pq-host-reboot.state
+
+queue_before_reboot=20000
+DB_before_reboot=0
+
+Host reboot 후:
+Backend=Exited
+Collector=Up
+TimescaleDB=healthy
+
+Loaded queue metadata:
+itemsSize=20000
+bytesSize=2234800
+dispatchedItems=2
+
+Moved items for dispatching back to queue:
+numberOfItems=2
+
+queue_after_reboot=20000
+DB_after_reboot=0
+
+queue drain:
+18950 → 15800 → 13700 → 10550 → 6350 → 3150 → 0
+
+final_db=20000/20000
+final_queue=0
+final_in_flight=0
+backend=running health=healthy
+```

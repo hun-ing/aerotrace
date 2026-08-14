@@ -2583,3 +2583,136 @@ Missing            = 0
 
 이 결과를 근거로 기존 `queue_size=200000` 운영 기본값 결정을 유지한다.
 
+---
+
+### Host Reboot Persistent Queue 복구 검증
+
+Collector process 단위의 restart와 SIGKILL 복구 검증에 이어, Docker daemon과 host OS까지 재시작되는 더 넓은 failure boundary에서 persistent queue가 유지되는지 검증했다.
+
+테스트 조건:
+
+```text
+Backend             = stopped
+incoming rate       = 2,000 spans/s
+requested spans     = 20,000
+persistent queue    = enabled
+queue_size          = 200,000
+block_on_overflow   = true
+Docker volume       = aerotrace-otelcol-data
+```
+
+Host reboot 직전 상태:
+
+```text
+queue_before_reboot     = 20,000
+in_flight_before_reboot = 2
+DB_before_reboot        = 0 / 20,000
+persistent file size    = 33,570,816 bytes
+```
+
+Backend는 reboot 전에 정상적으로 stop했고 telemetry는 DB에 저장되지 않은 상태로 Collector persistent queue에만 존재하도록 만들었다.
+
+이후 host에서:
+
+```text
+sudo reboot
+```
+
+를 실행했다.
+
+Host 재부팅 후 container 상태:
+
+```text
+Collector    = running
+TimescaleDB  = running / healthy
+Backend      = exited
+```
+
+Backend가 자동으로 실행되지 않았기 때문에 queue가 DB로 drain되기 전에 reboot 직후 persistent state를 독립적으로 확인할 수 있었다.
+
+Collector startup log:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20000
+bytesSize       = 2234800
+dispatchedItems = 2
+```
+
+이어 restart 전에 consumer가 처리 중이던 두 item을 복구하는 로그도 확인됐다.
+
+```text
+Fetching items left for dispatch by consumers
+numberOfItems = 2
+
+Moved items for dispatching back to queue
+numberOfItems = 2
+```
+
+Backend가 여전히 stopped인 상태에서 실제 metric:
+
+```text
+queue_after_reboot     = 20,000
+in_flight_after_reboot = 2
+DB_after_reboot        = 0 / 20,000
+```
+
+이었다.
+
+따라서 다음 경로를 거친 뒤에도 persistent queue 전체가 유지되는 것을 확인했다.
+
+```text
+Collector process 종료
+Docker daemon 종료
+Host OS reboot
+Docker volume 재마운트
+Collector 재기동
+persistent queue metadata reload
+```
+
+Backend를 다시 시작한 후 queue drain:
+
+```text
+18,950
+15,800
+13,700
+10,550
+6,350
+3,150
+0
+```
+
+최종 결과:
+
+```text
+DB        = 20,000 / 20,000
+queue     = 0
+in_flight = 0
+Backend   = running / healthy
+```
+
+따라서 현재 AeroTrace persistent queue 구성은 실제 검증 범위에서 다음 failure boundary를 통과했다.
+
+```text
+Collector graceful restart → 20,000 / 20,000 복구
+Collector SIGKILL          → 20,000 / 20,000 복구
+Host OS reboot             → 20,000 / 20,000 복구
+```
+
+이 결과는 Docker named volume에 저장된 Collector persistent queue가 단순 container lifecycle뿐 아니라 host reboot 이후에도 telemetry를 복구할 수 있음을 현재 환경에서 확인한 것이다.
+
+단, 이번 테스트는 정상적인 OS reboot이며 다음 상황까지 검증한 것은 아니다.
+
+```text
+강제 전원 차단
+filesystem corruption
+Docker volume 손실
+SSD 또는 filesystem failure
+host disk full
+file_storage write failure
+```
+
+따라서 AeroTrace의 현재 데이터 보존 정책을 "모든 host 장애에서 데이터 유실 없음"으로 표현하지 않는다.
+
+기존 persistent queue 운영 결정은 유지한다.
