@@ -3379,3 +3379,372 @@ alert_required=true
 를 반환한 경우에만 동작하도록 구성한다.
 
 이를 통해 실행 환경과 alert state machine을 분리하고 alert storm을 방지한다.
+
+---
+
+## Collector Queue Alert 자동 실행 및 Host Scheduler 정책
+
+### 해결하려는 문제
+
+Collector queue 상태 판정과 alert 상태 전이 로직을 구현했지만 수동 실행만으로는 실제 운영에서 장애를 조기에 감지할 수 없다.
+
+다음 요구사항이 필요했다.
+
+```text
+짧은 주기로 자동 실행
+동일 장애의 중복 알림 억제
+Collector 자체 장애 감지
+복구 이벤트 자동 감지
+reboot 후 scheduler 자동 활성화
+SaaS host와 온프레미스 환경의 실행 방식 분리
+```
+
+### 선택한 구조
+
+AeroTrace SaaS host에서는 systemd를 scheduling adapter로 사용한다.
+
+```text
+systemd timer
+    ↓
+systemd oneshot service
+    ↓
+evaluate-collector-queue-alert.py
+    ↓
+check-collector-queue.py
+    ↓
+Collector metrics endpoint
+```
+
+systemd에는 queue threshold나 상태 전이 로직을 구현하지 않는다.
+
+실제 판정 로직은 repository의 Python script에 유지한다.
+
+```text
+scripts/check-collector-queue.py
+scripts/evaluate-collector-queue-alert.py
+```
+
+따라서 향후 온프레미스 환경에서 systemd 대신 다른 scheduler를 사용하더라도 핵심 판정 로직을 재사용할 수 있다.
+
+### 실행 주기
+
+Timer:
+
+```text
+OnUnitInactiveSec=5s
+AccuracySec=1s
+```
+
+를 사용한다.
+
+현재 queue 운영 기준:
+
+```text
+queue_size = 200,000
+reference workload = 3,250 spans/s
+
+WARNING = 50%
+CRITICAL = 80%
+```
+
+Backend throughput이 0이라는 단순 outage 모델에서:
+
+```text
+50% 사용 시 남은 headroom
+≈ 30.77 sec
+
+80% 사용 시 남은 headroom
+≈ 12.31 sec
+```
+
+이므로 1분 단위 scheduler는 현재 threshold와 맞지 않는다.
+
+5초 polling을 사용해 CRITICAL 상태에서도 남은 buffer 내에서 장애를 발견할 가능성을 높인다.
+
+### Overlap 방지
+
+Timer는:
+
+```text
+OnUnitInactiveSec=5s
+```
+
+를 사용한다.
+
+즉:
+
+```text
+oneshot service 실행
+→ 완료
+→ 5초
+→ 다음 실행
+```
+
+순서다.
+
+평가 시간이 일시적으로 길어져도 동일 oneshot service가 중첩 실행되지 않도록 한다.
+
+### 정상 상태 로그 억제
+
+5초마다 queue 상태 전체를 journal에 기록하면 정상 상태에서도 불필요한 로그가 계속 쌓인다.
+
+Evaluator에:
+
+```text
+--quiet-no-event
+```
+
+옵션을 추가했다.
+
+동작:
+
+```text
+event=NONE
+→ state는 갱신
+→ stdout 없음
+
+ALERT
+STATUS_CHANGE
+RECOVERY
+REMINDER
+→ stdout 출력
+```
+
+실제 정상 상태 검증:
+
+```text
+quiet_rc=0
+quiet_output_bytes=0
+```
+
+state file은 정상적으로 생성 및 갱신됐다.
+
+UNKNOWN event가 발생한 경우에는 `--quiet-no-event` 상태에서도 이벤트 내용이 출력되는 것을 확인했다.
+
+### Persistent State 위치
+
+systemd service에서는:
+
+```text
+StateDirectory=aerotrace-monitoring
+```
+
+을 사용한다.
+
+실제 경로:
+
+```text
+/var/lib/aerotrace-monitoring
+```
+
+Alert state:
+
+```text
+/var/lib/aerotrace-monitoring/collector-queue-alert.json
+```
+
+실제 권한:
+
+```text
+directory:
+owner=huning
+group=huning
+mode=750
+
+state file:
+owner=huning
+group=huning
+mode=640
+```
+
+runtime state를 repository나 `/tmp`에 저장하지 않는다.
+
+### systemd Service 정책
+
+Service:
+
+```text
+Type=oneshot
+User=huning
+Group=huning
+WorkingDirectory=/home/huning/aerotrace
+```
+
+기본 hardening:
+
+```text
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+UMask=0027
+```
+
+Collector metrics endpoint:
+
+```text
+127.0.0.1:8888
+```
+
+접근이 필요하므로 service의 network namespace를 완전히 격리하는 `PrivateNetwork=true`는 사용하지 않는다.
+
+### 자동 실행 검증
+
+Timer:
+
+```text
+enabled
+active
+```
+
+Service:
+
+```text
+Result=success
+ExecMainStatus=0
+```
+
+State의 `last_evaluated_at`이 timer 실행에 따라 반복 갱신되는 것을 확인했다.
+
+첫 검증:
+
+```text
+before:
+2026-08-18T03:42:28+00:00
+
+after:
+2026-08-18T03:42:40+00:00
+
+timer_state_update=PASS
+```
+
+두 번째 검증:
+
+```text
+timer_repeat=PASS
+```
+
+따라서 timer가 단순 active 상태인 것뿐 아니라 실제 evaluator를 반복 실행하는 것을 확인했다.
+
+### 정상 상태 Journal
+
+정상 상태에서는 evaluator 상세 metric 출력이 기록되지 않았다.
+
+Journal에는 systemd lifecycle:
+
+```text
+Starting...
+Deactivated successfully.
+Finished...
+```
+
+정도만 반복됐다.
+
+따라서 5초 polling을 유지하면서 queue metric 전체가 정상 상태마다 journal에 누적되는 문제를 방지한다.
+
+### Collector 장애 자동 탐지 검증
+
+실제 Collector container를 중단했다.
+
+```text
+running=false
+status=exited
+```
+
+사람이 evaluator를 직접 실행하지 않은 상태에서 systemd timer가 자동으로 장애를 감지했다.
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+
+checker_stderr=
+UNKNOWN: Connection refused
+```
+
+Alert 발생 시각:
+
+```text
+2026-08-18 12:46:39 KST
+```
+
+Collector가 계속 중단된 상태에서도 추가 ALERT는 발생하지 않았다.
+
+```text
+alert_count=1
+```
+
+따라서:
+
+```text
+OK → UNKNOWN
+→ ALERT 1회
+
+UNKNOWN → UNKNOWN
+→ 중복 억제
+```
+
+가 실제 systemd polling 환경에서도 검증됐다.
+
+### Collector 복구 자동 감지
+
+Collector를 다시 시작하고 metrics endpoint가 복구된 뒤 systemd timer가 자동으로 상태 변화를 감지했다.
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=UNKNOWN
+current_status=OK
+checker_exit_code=0
+```
+
+Recovery 발생 시각:
+
+```text
+2026-08-18 12:47:15 KST
+```
+
+최종:
+
+```text
+alert_count=1
+recovery_count=1
+current_status=OK
+```
+
+이었다.
+
+### 최종 결정
+
+AeroTrace SaaS host의 Collector queue monitoring은 다음 구조를 사용한다.
+
+```text
+5초 systemd timer
+→ oneshot evaluator
+→ 상태 변화가 있을 때만 event 출력
+→ persistent state로 중복 억제
+```
+
+systemd는 실행 시점만 담당하고 queue 판단 및 alert state machine은 Python 코드에 유지한다.
+
+외부 notification adapter는 이후:
+
+```text
+alert_required=true
+```
+
+이벤트만 받아 전달하도록 구현한다.
+
+### 재검토 조건
+
+다음 상황에서 polling 주기 또는 scheduler 방식을 재검토한다.
+
+- 실제 production ingest rate 변화
+- queue capacity 변경
+- warning/critical threshold 변경
+- 실제 장애 대응 시간 측정
+- systemd service 실행 시간이 5초에 근접
+- 온프레미스에서 systemd가 없는 환경 지원
+- monitoring stack 도입으로 별도 alert engine을 사용하게 되는 경우

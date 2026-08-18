@@ -8619,3 +8619,437 @@ systemd timer
 를 이용해 주기 실행한다.
 
 판정 로직은 Python script에 유지하고 systemd는 실행 scheduling만 담당하도록 해 향후 온프레미스 환경에서 다른 scheduler로 교체할 수 있게 한다.
+
+---
+
+## Collector Queue Alert systemd 자동 실행 및 E2E 장애 감지 검증
+
+### 목적
+
+수동으로 검증한 queue checker와 alert evaluator를 실제 운영 scheduler에 연결해 다음 전체 경로를 검증했다.
+
+```text
+주기 실행
+상태 persistence
+정상 상태 로그 억제
+Collector 장애 자동 탐지
+동일 장애 중복 억제
+Collector 복구 자동 탐지
+```
+
+### Quiet Mode 추가
+
+Evaluator에:
+
+```text
+--quiet-no-event
+```
+
+옵션을 추가했다.
+
+최초 구현 과정에서는 argparse option만 추가되고 실제 return 조건이 누락돼:
+
+```text
+quiet_rc=0
+quiet_output_bytes=455
+```
+
+로 정상 상태 출력이 계속 발생하는 문제를 발견했다.
+
+원인:
+
+```text
+--quiet-no-event option은 존재
+event=NONE 조건의 early return은 누락
+```
+
+수정:
+
+```python
+if args.quiet_no_event and event == "NONE":
+    return 0
+```
+
+을 state write 이후, 출력 직전에 추가했다.
+
+재검증:
+
+```text
+quiet_rc=0
+quiet_output_bytes=0
+```
+
+state:
+
+```json
+{
+  "current_status": "OK",
+  "last_changed_at": "2026-08-18T03:14:32+00:00",
+  "last_evaluated_at": "2026-08-18T03:14:32+00:00"
+}
+```
+
+로 정상 기록됐다.
+
+이벤트가 발생하면 quiet mode에서도 출력하도록 유지했다.
+
+### systemd Unit
+
+Repository:
+
+```text
+deploy/systemd/aerotrace-collector-queue-alert.service
+deploy/systemd/aerotrace-collector-queue-alert.timer
+```
+
+Service 구조:
+
+```text
+Type=oneshot
+User=huning
+Group=huning
+WorkingDirectory=/home/huning/aerotrace
+```
+
+Evaluator:
+
+```text
+--state-file
+/var/lib/aerotrace-monitoring/collector-queue-alert.json
+
+--repeat-after-sec 300
+--checker-timeout-sec 10
+--quiet-no-event
+```
+
+Timer:
+
+```text
+OnBootSec=30s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+```
+
+### Static Verification
+
+`systemd-analyze verify` 실행 시 AeroTrace unit 자체 오류는 발생하지 않았다.
+
+Host에 이미 존재하는 다른 unit에서 다음 메시지가 출력됐다.
+
+```text
+netplan-ovs-cleanup.service permission warning
+snapd.service RestartMode unknown key
+```
+
+AeroTrace service/timer를 가리키는 오류는 없었다.
+
+Python compile 및:
+
+```text
+git diff --check
+```
+
+도 통과했다.
+
+### systemd 설치
+
+Unit을:
+
+```text
+/etc/systemd/system
+```
+
+에 설치하고:
+
+```text
+systemctl daemon-reload
+```
+
+를 수행했다.
+
+실제 systemd가 읽은 service 값:
+
+```text
+User=huning
+Group=huning
+WorkingDirectory=/home/huning/aerotrace
+StateDirectory=aerotrace-monitoring
+```
+
+을 확인했다.
+
+### Service 단독 실행
+
+Timer를 활성화하기 전에 service를 한 번 직접 실행했다.
+
+결과:
+
+```text
+Type=oneshot
+Active=inactive (dead)
+Result=success
+ExecMainStatus=0
+```
+
+`inactive (dead)`는 oneshot 실행 종료 후의 정상 상태다.
+
+### Persistent StateDirectory 검증
+
+실제 생성:
+
+```text
+/var/lib/aerotrace-monitoring
+```
+
+State:
+
+```text
+/var/lib/aerotrace-monitoring/collector-queue-alert.json
+```
+
+권한:
+
+```text
+directory:
+huning:huning
+750
+
+state file:
+huning:huning
+640
+```
+
+현재 상태:
+
+```text
+current_status=OK
+```
+
+을 확인했다.
+
+### Timer 활성화
+
+실행:
+
+```text
+systemctl enable --now
+aerotrace-collector-queue-alert.timer
+```
+
+결과:
+
+```text
+enabled
+active
+```
+
+Timer status:
+
+```text
+active (waiting)
+```
+
+이며 약 5~6초 간격으로 service 실행이 반복됐다.
+
+### 실제 반복 실행 검증
+
+State file의 mtime과 `last_evaluated_at`을 비교했다.
+
+첫 측정:
+
+```text
+before_evaluated=
+2026-08-18T03:42:28+00:00
+
+after_evaluated=
+2026-08-18T03:42:40+00:00
+
+timer_state_update=PASS
+```
+
+다음 cycle:
+
+```text
+timer_repeat=PASS
+```
+
+따라서 timer가 active 표시만 되는 것이 아니라 실제 evaluator 실행을 반복하는 것을 검증했다.
+
+### 정상 상태 Journal
+
+최근 journal:
+
+```text
+Starting AeroTrace Collector queue alert evaluator...
+Deactivated successfully.
+Finished AeroTrace Collector queue alert evaluator.
+```
+
+가 반복됐다.
+
+정상 `event=NONE` 상태에서는 다음 상세 출력이 기록되지 않았다.
+
+```text
+checker_output_begin
+queue_size=...
+checker_output_end
+```
+
+따라서 5초 polling에서 정상 metric dump로 인한 journal spam을 억제했다.
+
+### Collector 장애 자동 감지 E2E 테스트
+
+시작:
+
+```text
+timer=enabled/active
+current_status=OK
+Collector=running
+Backend=healthy
+```
+
+Collector를 실제 중단했다.
+
+```text
+docker stop aerotrace-otel-collector
+
+running=false
+status=exited
+exit=0
+```
+
+Timer가 자동 실행된 뒤 state:
+
+```text
+current_status=UNKNOWN
+last_changed_at=2026-08-18T03:46:39+00:00
+```
+
+Journal:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+
+checker_stderr=
+UNKNOWN: <urlopen error [Errno 111] Connection refused>
+```
+
+사람이 evaluator를 직접 실행하지 않고 systemd timer가 Collector 장애를 자동 감지했다.
+
+### 동일 장애 중복 억제
+
+Collector가 계속 중단된 상태에서 timer가 여러 번 평가됐지만:
+
+```text
+alert_count=1
+```
+
+이었다.
+
+즉:
+
+```text
+최초 OK → UNKNOWN
+→ ALERT
+
+이후 UNKNOWN 유지
+→ event=NONE
+→ quiet output
+```
+
+이 실제 scheduler 환경에서도 동작했다.
+
+### Collector Recovery 자동 감지
+
+Collector를 다시 시작했다.
+
+```text
+docker start aerotrace-otel-collector
+```
+
+metrics endpoint 복구 확인 후 timer가 자동으로 상태 변화를 발견했다.
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=UNKNOWN
+current_status=OK
+checker_exit_code=0
+```
+
+state:
+
+```text
+current_status=OK
+last_changed_at=2026-08-18T03:47:15+00:00
+```
+
+최종 이벤트 수:
+
+```text
+alert_count=1
+recovery_count=1
+```
+
+### 최종 자동화 경로
+
+현재 실제 검증된 흐름:
+
+```text
+Collector healthy
+    ↓
+systemd timer 5초 polling
+    ↓
+OK
+
+Collector stop
+    ↓
+metrics Connection refused
+    ↓
+UNKNOWN
+    ↓
+ALERT 1회
+    ↓
+동일 UNKNOWN 중복 억제
+
+Collector start
+    ↓
+metrics 복구
+    ↓
+OK
+    ↓
+RECOVERY 1회
+```
+
+### 실무적 교훈
+
+- scheduler가 active인 것과 실제 workload가 반복 실행되는 것은 별도로 검증해야 한다.
+- persistent state의 mtime과 timestamp를 확인하면 실제 scheduler execution을 증명할 수 있다.
+- 정상 상태의 짧은 polling은 로그 억제가 없으면 불필요한 journal 사용량을 만든다.
+- Collector 자체 장애는 queue CRITICAL이 아니라 metrics 접근 불가 UNKNOWN으로 감지해야 한다.
+- UNKNOWN 상태 역시 alert 대상이어야 monitoring system 자체 장애를 놓치지 않는다.
+- polling과 notification을 분리하면 동일 장애의 반복 실행과 반복 알림을 독립적으로 제어할 수 있다.
+- recovery event를 실제 scheduler 경로에서 검증해야 장애 종료까지 운영 자동화가 완성된다.
+
+### 다음 작업
+
+현재 자동화는 event를 systemd journal에 출력하는 단계까지다.
+
+다음에는 실제 queue backlog에 대해:
+
+```text
+OK
+→ WARNING
+→ CRITICAL
+→ RECOVERY
+```
+
+자동 상태 전이를 검증한다.
+
+대규모 100k/160k backlog를 다시 생성하지 않고 테스트용 threshold를 안전하게 전달할 수 있는 구조를 먼저 만든다.
+
+이후 외부 notification adapter를 연결한다.

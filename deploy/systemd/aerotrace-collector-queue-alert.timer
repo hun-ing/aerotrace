@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AeroTrace Collector queue alert evaluator every 5 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Unit=aerotrace-collector-queue-alert.service
+
+[Install]
+WantedBy=timers.target

@@ -2416,3 +2416,183 @@ Backend healthy
 → 최종 20,000/20,000 검증
 → 아직 검증하지 않은 power-loss 영역
 ```
+
+---
+
+### Portfolio Checkpoint — Collector 장애 자동 탐지 및 Alert Storm 방지
+
+Collector queue monitoring을 수동 스크립트 수준에서 끝내지 않고 systemd timer를 이용한 실제 운영 자동화 경로까지 확장했다.
+
+구조:
+
+```text
+Collector metrics
+→ queue 상태 checker
+→ stateful alert evaluator
+→ systemd oneshot service
+→ 5초 timer
+```
+
+운영 상태 판정 로직은 systemd에 넣지 않고 Python 코드에 유지해 scheduler와 monitoring logic을 분리했다.
+
+#### 정상 상태 polling 검증
+
+5초 단위 timer를 활성화한 뒤 state file의:
+
+```text
+last_evaluated_at
+```
+
+이 반복 갱신되는 것을 확인했다.
+
+```text
+timer_state_update=PASS
+timer_repeat=PASS
+```
+
+정상 상태에서는 `event=NONE` 상세 출력을 억제해 5초마다 Collector metric 전체가 journal에 기록되는 문제를 방지했다.
+
+#### 실제 Collector 장애 자동 탐지
+
+Collector container를 실제 중단했다.
+
+```text
+running=false
+status=exited
+```
+
+사람이 checker/evaluator를 직접 실행하지 않은 상태에서 systemd timer가 자동으로:
+
+```text
+previous_status=OK
+current_status=UNKNOWN
+event=ALERT
+alert_required=true
+```
+
+를 생성했다.
+
+실제 원인:
+
+```text
+Collector metrics endpoint
+Connection refused
+```
+
+도 journal에 남았다.
+
+동일 장애가 계속되는 동안 timer가 반복 실행됐지만:
+
+```text
+alert_count=1
+```
+
+로 중복 alert가 억제됐다.
+
+#### 자동 Recovery 감지
+
+Collector를 복구한 뒤:
+
+```text
+previous_status=UNKNOWN
+current_status=OK
+event=RECOVERY
+alert_required=true
+```
+
+가 자동 발생했다.
+
+최종:
+
+```text
+alert_count=1
+recovery_count=1
+```
+
+이었다.
+
+#### 직접 경험한 운영 문제
+
+이번 단계에서 다음 실무 문제를 직접 다뤘다.
+
+```text
+짧은 polling 주기와 로그 증가
+alert storm
+상태 persistence
+process exit code와 서비스 상태 분리
+monitoring 대상 자체가 죽은 경우의 UNKNOWN 처리
+recovery notification
+systemd oneshot lifecycle
+timer 실제 실행 여부 검증
+runtime state 권한 관리
+```
+
+또한 최초 quiet mode 구현에서 argument만 추가되고 실제 early-return 조건이 빠져 정상 상태에서도 출력이 계속되는 문제를 실행 결과로 발견하고 수정했다.
+
+#### 이력서 성과 문장 초안
+
+- OpenTelemetry Collector queue 상태를 5초 주기로 자동 평가하는 systemd 기반 운영 monitoring을 구성하고, persistent alert state와 상태 전이 기반 중복 억제를 적용해 Collector 장애 시 UNKNOWN ALERT 1회와 복구 시 RECOVERY 1회가 자동 발생하는 E2E 경로를 검증
+- 짧은 polling 환경에서 정상 상태 metric dump로 발생할 수 있는 journal 증가를 event 기반 quiet mode로 억제하고, monitoring 대상 자체의 장애를 UNKNOWN 상태로 분리해 실제 Collector 중단 시 Connection Refused를 자동 탐지하도록 운영 경로를 구축
+
+#### 면접에서 설명할 포인트
+
+```text
+왜 1분 cron이 아니라 5초 polling을 선택했는가?
+왜 systemd에 threshold 로직을 직접 넣지 않았는가?
+OnUnitInactiveSec를 선택한 이유는?
+왜 WARNING/CRITICAL에서 evaluator exit code를 non-zero로 만들지 않았는가?
+UNKNOWN과 evaluator failure는 어떻게 다른가?
+동일 장애의 alert storm은 어떻게 막았는가?
+왜 recovery notification이 필요한가?
+StateDirectory를 사용한 이유는?
+정상 상태에서 journal spam은 어떻게 방지했는가?
+timer가 active인 것과 실제 실행되고 있는 것을 어떻게 구분해 검증했는가?
+```
+
+#### 보존할 증거
+
+```text
+timer enabled/active 출력
+
+timer_state_update=PASS
+timer_repeat=PASS
+
+systemd state:
+current_status=OK
+
+Collector stop:
+running=false status=exited
+
+자동 장애 탐지:
+event=ALERT
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+Connection refused
+
+alert_count=1
+
+자동 복구:
+event=RECOVERY
+previous_status=UNKNOWN
+current_status=OK
+
+recovery_count=1
+```
+
+#### 다음 한 단계 높은 과제
+
+현재는 Collector process 자체 장애를 자동 감지했다.
+
+다음 단계에서는 Collector는 살아 있지만 downstream 장애로 persistent queue가 증가하는 상황에서:
+
+```text
+OK
+→ WARNING
+→ CRITICAL
+→ RECOVERY
+```
+
+상태 변화가 자동으로 탐지되는지 검증한다.
+
+그 이후 실제 notification adapter를 연결해 운영자가 외부 채널에서 장애와 복구를 받을 수 있는 구조로 확장한다.

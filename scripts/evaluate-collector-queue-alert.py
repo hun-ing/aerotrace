@@ -88,6 +88,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum runtime for the queue checker.",
     )
 
+    parser.add_argument(
+        "--quiet-no-event",
+        action="store_true",
+        help=(
+            "Produce no output when event=NONE. "
+            "State is still updated."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -423,6 +432,9 @@ def main() -> int:
             file=sys.stderr,
         )
         return 4
+
+    if args.quiet_no_event and event == "NONE":
+        return 0
 
     previous_display = (
         previous_status
