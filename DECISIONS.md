@@ -4878,3 +4878,219 @@ Notification Adapter
 ```
 
 이 구분을 기준으로 이후 Generic Webhook transport와 delivery receipt를 설계한다.
+
+---
+
+## Notification Delivery Receipt 분리
+
+### 해결하려는 문제
+
+Evaluator의:
+
+```text
+evaluated_at
+last_alert_event_at
+```
+
+은 notification이 필요한 event를 판단한 시각이다.
+
+하지만 실제 notification transport가 성공한 시각은 이와 다를 수 있다.
+
+예:
+
+```text
+07:17:50 event 판단
+07:17:57 transport 성공
+```
+
+따라서 event 발생 시각과 실제 delivery 성공 시각을 같은 상태 값으로 표현하면 안 된다.
+
+### 선택한 구조
+
+Notification adapter의 성공 결과를 별도의 delivery receipt로 저장한다.
+
+기존 local delivered 파일:
+
+```text
+<event_id>.json
+= event payload
+```
+
+대신 다음 receipt contract를 사용한다.
+
+```json
+{
+  "receipt_schema_version": 1,
+  "event_id": "...",
+  "transport": "local-file",
+  "delivered_at": "...",
+  "event": {
+    "schema_version": 1,
+    "event_id": "...",
+    "evaluated_at": "...",
+    "event": "ALERT"
+  }
+}
+```
+
+의미는 다음과 같다.
+
+```text
+event.evaluated_at
+= evaluator가 event를 판단한 시각
+
+receipt.delivered_at
+= notification adapter가 transport 성공을 확정한 시각
+```
+
+### CLI 변경
+
+Notification adapter의 성공 기록 위치를 의미에 맞게:
+
+```text
+--receipt-dir
+```
+
+로 표현한다.
+
+기존:
+
+```text
+--delivered-dir
+```
+
+은 기존 테스트 및 배포 명령과의 호환성을 위해 alias로 유지한다.
+
+```text
+--receipt-dir RECEIPT_DIR
+--delivered-dir RECEIPT_DIR
+```
+
+두 옵션은 동일한 `receipt_dir`을 사용한다.
+
+### Delivery Receipt 검증
+
+실제 ALERT event:
+
+```text
+event_id=1787037470416077807-1565940
+
+evaluated_at
+= 2026-08-18T07:17:50+00:00
+
+delivered_at
+= 2026-08-18T07:17:57+00:00
+```
+
+Receipt 검증:
+
+```text
+receipt_schema_version=1
+transport=local-file
+event=ALERT
+
+delivery_receipt_contract=PASS
+receipt_identity=PASS
+```
+
+`delivered_at >= evaluated_at`임을 확인했다.
+
+### Crash Window 처리
+
+다음 상황을 재현했다.
+
+```text
+delivery receipt 저장 성공
+→ pending ACK 전에 process 종료
+→ 동일 event가 pending에 다시 존재
+```
+
+기존 receipt가 있는 동일 event를 다시 처리한 결과:
+
+```text
+delivery_result=ACK_EXISTING
+ack_existing_rc=0
+
+pending_before_ack_existing=1
+pending_after_ack_existing=0
+
+receipt_after_ack_existing=1
+```
+
+기존 receipt의 payload가 pending event와 동일한 경우 새 delivery를 생성하지 않고 pending만 ACK한다.
+
+### 최초 Delivery 시각 보존
+
+ACK_EXISTING 전:
+
+```text
+delivered_at
+= 2026-08-18T07:17:57+00:00
+```
+
+ACK_EXISTING 후:
+
+```text
+delivered_at
+= 2026-08-18T07:17:57+00:00
+```
+
+검증:
+
+```text
+delivery_timestamp_preserved=PASS
+```
+
+따라서 process retry나 crash recovery가 실제 최초 delivery 성공 시각을 덮어쓰지 않는다.
+
+### Receipt 저장 실패
+
+Receipt path를 의도적으로 일반 파일로 만들어 저장을 실패시켰다.
+
+결과:
+
+```text
+adapter_error=delivery failed: ...
+receipt_failure_rc=2
+pending_after_receipt_failure=1
+```
+
+Receipt를 영속화하기 전에 pending event를 제거하지 않음을 확인했다.
+
+### 현재 Delivery 의미
+
+현재 `transport=local-file`은 외부 notification provider가 아니라 transport semantics 검증용 구현이다.
+
+따라서 현재 receipt의 `delivered_at`은:
+
+```text
+local-file transport 성공 시각
+```
+
+을 의미한다.
+
+향후 Generic Webhook을 추가하면:
+
+```text
+transport=webhook
+```
+
+등 transport별 receipt를 생성하고 HTTP 성공 기준에 따라 `delivered_at`을 기록한다.
+
+### 현재 결정
+
+Notification 상태는 다음처럼 분리한다.
+
+```text
+Evaluator
+→ event 발생 시각 관리
+
+Notification Adapter
+→ transport 실행
+→ 성공 receipt 관리
+
+Receipt
+→ 실제 성공 처리 시각 보존
+```
+
+외부 transport retry가 발생하더라도 기존 성공 receipt가 존재하면 동일 event를 다시 성공 처리하지 않는다.

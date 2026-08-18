@@ -10396,3 +10396,196 @@ last_alert_event_*
 ```
 
 실제 외부 transport delivery 성공 시각은 이후 notification adapter의 별도 receipt state로 관리한다.
+
+---
+
+## Notification Delivery Receipt 구현 및 Crash-window 검증
+
+### 변경 파일
+
+```text
+scripts/process-notification-outbox.py
+```
+
+### 목표
+
+Notification event 발생 시각과 실제 transport 성공 시각을 별도의 데이터로 관리한다.
+
+기존 event:
+
+```text
+evaluated_at
+```
+
+에 더해 adapter 성공 시점에:
+
+```text
+delivered_at
+```
+
+을 가진 receipt를 생성한다.
+
+### Receipt Contract
+
+Receipt schema:
+
+```text
+receipt_schema_version=1
+event_id
+transport
+delivered_at
+event
+```
+
+현재 테스트 transport:
+
+```text
+transport=local-file
+```
+
+실제 검증:
+
+```text
+event_id=1787037470416077807-1565940
+evaluated_at=2026-08-18T07:17:50+00:00
+delivered_at=2026-08-18T07:17:57+00:00
+
+delivery_receipt_contract=PASS
+```
+
+`receipt.event_id`와 원본 `event.event_id`가 동일함을 확인했다.
+
+### Receipt Directory CLI
+
+새 canonical option:
+
+```text
+--receipt-dir
+```
+
+기존 option:
+
+```text
+--delivered-dir
+```
+
+은 compatibility alias로 유지한다.
+
+검증:
+
+```text
+legacy_alias_rc=0
+legacy_alias_bytes=0
+```
+
+### ACK_EXISTING
+
+Receipt가 이미 존재하는 동일 event를 pending에 다시 생성해 delivery 성공 후 ACK 전에 process가 종료된 crash window를 재현했다.
+
+재처리 결과:
+
+```text
+delivery_result=ACK_EXISTING
+event_id=1787037470416077807-1565940
+event=ALERT
+
+adapter_status=OK
+processed_events=1
+remaining_events=0
+
+ack_existing_rc=0
+```
+
+파일 상태:
+
+```text
+pending_before_ack_existing=1
+pending_after_ack_existing=0
+receipt_after_ack_existing=1
+```
+
+### Delivery Timestamp 보존
+
+기존 receipt:
+
+```text
+delivered_at_before
+= 2026-08-18T07:17:57+00:00
+```
+
+ACK_EXISTING 이후:
+
+```text
+delivered_at_after
+= 2026-08-18T07:17:57+00:00
+```
+
+검증:
+
+```text
+delivery_timestamp_preserved=PASS
+```
+
+따라서 동일 event retry가 최초 delivery 성공 시각을 변경하지 않는다.
+
+### Receipt Identity
+
+최종 receipt:
+
+```text
+receipt_schema_version=1
+transport=local-file
+event=ALERT
+event_id=1787037470416077807-1565940
+evaluated_at=2026-08-18T07:17:50+00:00
+delivered_at=2026-08-18T07:17:57+00:00
+```
+
+검증:
+
+```text
+receipt_identity=PASS
+```
+
+### Receipt 저장 실패
+
+Receipt directory 위치를 일반 파일로 막아 저장 실패를 재현했다.
+
+결과:
+
+```text
+adapter_error=delivery failed: [Errno 17] File exists: ...
+receipt_failure_rc=2
+pending_after_receipt_failure=1
+```
+
+즉 receipt가 영속화되지 않은 notification event는 pending outbox에서 제거하지 않는다.
+
+### 현재 보장 범위
+
+현재 구현은 local-file transport에서 다음을 검증했다.
+
+```text
+event 발생 시각과 delivery 성공 시각 분리
+receipt identity 보존
+receipt 저장 후 pending ACK
+crash window의 ACK_EXISTING
+최초 delivered_at 보존
+receipt 실패 시 pending 유지
+기존 --delivered-dir CLI 호환
+```
+
+아직 HTTP transport의 다음 특성은 검증하지 않았다.
+
+```text
+2xx 성공 기준
+4xx 처리 정책
+5xx retry
+connection refused
+timeout
+response body 제한
+ambiguous timeout
+외부 provider duplicate delivery
+```
+
+다음 단계에서 Generic Webhook transport를 local fake HTTP server로 검증한다.

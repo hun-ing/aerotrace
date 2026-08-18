@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,12 +40,14 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--receipt-dir",
         "--delivered-dir",
+        dest="receipt_dir",
         type=Path,
         required=True,
         help=(
-            "Local delivery sink used to verify notification "
-            "adapter delivery semantics."
+            "Directory containing successful delivery receipts. "
+            "--delivered-dir is retained as a compatibility alias."
         ),
     )
 
@@ -204,32 +207,96 @@ def validate_event(
     return event_id
 
 
+def utc_now_iso() -> str:
+    return datetime.now(
+        timezone.utc
+    ).isoformat(
+        timespec="seconds"
+    )
+
+
+def build_delivery_receipt(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    event_id = payload["event_id"]
+
+    return {
+        "receipt_schema_version": 1,
+        "event_id": event_id,
+        "transport": "local-file",
+        "delivered_at": utc_now_iso(),
+        "event": payload,
+    }
+
+
+def validate_delivery_receipt(
+    path: Path,
+    receipt: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    if receipt.get(
+        "receipt_schema_version"
+    ) != 1:
+        raise ValueError(
+            f"{path}: unsupported receipt_schema_version"
+        )
+
+    event_id = payload["event_id"]
+
+    if receipt.get("event_id") != event_id:
+        raise ValueError(
+            f"{path}: receipt event_id mismatch"
+        )
+
+    if receipt.get("transport") != "local-file":
+        raise ValueError(
+            f"{path}: unexpected receipt transport"
+        )
+
+    delivered_at = receipt.get(
+        "delivered_at"
+    )
+
+    if (
+        not isinstance(delivered_at, str)
+        or not delivered_at
+    ):
+        raise ValueError(
+            f"{path}: delivered_at must be a non-empty string"
+        )
+
+    if receipt.get("event") != payload:
+        raise ValueError(
+            f"{path}: receipt event payload mismatch"
+        )
+
+
 def deliver_to_local_sink(
     pending_path: Path,
     outbox_dir: Path,
-    delivered_dir: Path,
+    receipt_dir: Path,
     payload: dict[str, Any],
 ) -> str:
-    delivered_dir.mkdir(
+    receipt_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    delivered_path = (
-        delivered_dir
+    receipt_path = (
+        receipt_dir
         / pending_path.name
     )
 
-    if delivered_path.exists():
-        existing_payload = load_json(
-            delivered_path
+    if receipt_path.exists():
+        receipt = load_json(
+            receipt_path
         )
 
-        if existing_payload != payload:
-            raise ValueError(
-                "delivered event_id collision with "
-                f"different payload: {pending_path.name}"
-            )
+        validate_delivery_receipt(
+            receipt_path,
+            receipt,
+            payload,
+        )
 
         pending_path.unlink()
         fsync_directory(
@@ -238,8 +305,12 @@ def deliver_to_local_sink(
 
         return "ACK_EXISTING"
 
+    receipt = build_delivery_receipt(
+        payload
+    )
+
     temporary_path = (
-        delivered_dir
+        receipt_dir
         / (
             f".{pending_path.name}."
             f"{os.getpid()}.tmp"
@@ -252,7 +323,7 @@ def deliver_to_local_sink(
             encoding="utf-8",
         ) as file:
             json.dump(
-                payload,
+                receipt,
                 file,
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -264,11 +335,11 @@ def deliver_to_local_sink(
 
         os.replace(
             temporary_path,
-            delivered_path,
+            receipt_path,
         )
 
         fsync_directory(
-            delivered_dir
+            receipt_dir
         )
 
         pending_path.unlink()
@@ -388,7 +459,7 @@ def main() -> int:
                 deliver_to_local_sink(
                     pending_path=pending_path,
                     outbox_dir=args.outbox_dir,
-                    delivered_dir=args.delivered_dir,
+                    receipt_dir=args.receipt_dir,
                     payload=payload,
                 )
             )
