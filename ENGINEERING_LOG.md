@@ -10589,3 +10589,648 @@ ambiguous timeout
 ```
 
 다음 단계에서 Generic Webhook transport를 local fake HTTP server로 검증한다.
+
+---
+
+## Generic Webhook Transport 구현 및 HTTP Failure Semantics 검증
+
+### 변경 파일
+
+```text
+scripts/process-notification-outbox.py
+```
+
+### Transport 경계
+
+Notification adapter에:
+
+```text
+--transport local-file|webhook
+```
+
+을 추가했다.
+
+기본 transport:
+
+```text
+local-file
+```
+
+로 기존 동작을 유지했다.
+
+Webhook configuration:
+
+```text
+--webhook-url
+AEROTRACE_WEBHOOK_URL
+--webhook-timeout-sec
+```
+
+을 지원한다.
+
+초기 timeout default:
+
+```text
+5 seconds
+```
+
+이며 실제 운영 최적값으로 확정한 수치는 아니다.
+
+### Configuration Validation
+
+다음 오류를 실제 검증했다.
+
+```text
+local-file + --webhook-url
+→ rc=4
+
+webhook + URL 없음
+→ rc=4
+
+ftp scheme
+→ rc=4
+
+URL userinfo credential
+→ rc=4
+
+webhook timeout <= 0
+→ rc=4
+```
+
+기존:
+
+```text
+--delivered-dir
+```
+
+은 `--receipt-dir` alias로 계속 동작한다.
+
+```text
+legacy_alias_rc=0
+legacy_alias_bytes=0
+```
+
+### 기존 Local-file 회귀
+
+Transport dispatch 추가 후 기존 기본 실행을 다시 검증했다.
+
+```text
+delivery_result=DELIVERED
+local_default_rc=0
+default_local_transport=PASS
+```
+
+Webhook 구현 이후에도 다시:
+
+```text
+local_regression_rc=0
+local_transport_regression=PASS
+```
+
+를 확인했다.
+
+### Webhook 2xx Success Path
+
+Local fake HTTP server를 임의 localhost port에서 실행하고 실제 POST를 전송했다.
+
+Server 응답:
+
+```text
+HTTP 204
+```
+
+Adapter 결과:
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+adapter_status=OK
+processed_events=1
+remaining_events=0
+
+webhook_204_rc=0
+```
+
+Outbox:
+
+```text
+pending_before_webhook=1
+pending_after_webhook=0
+```
+
+Receipt:
+
+```text
+webhook_receipt_count=1
+transport=webhook
+```
+
+### 실제 Request Contract
+
+Fake HTTP server에서 실제 request를 capture했다.
+
+```text
+method=POST
+path=/aerotrace
+content_type=application/json
+accept=application/json
+user_agent=AeroTrace-Notification/1
+```
+
+Header:
+
+```text
+X-AeroTrace-Event-Id
+= 1787039514075281594-1612606
+```
+
+Body:
+
+```text
+event_id
+= 1787039514075281594-1612606
+
+event=ALERT
+current_status=WARNING
+alert_required=true
+```
+
+검증:
+
+```text
+webhook_request_contract=PASS
+```
+
+### Webhook Receipt
+
+실제 값:
+
+```text
+evaluated_at=2026-08-18T07:51:54+00:00
+delivered_at=2026-08-18T07:52:02+00:00
+```
+
+검증:
+
+```text
+webhook_receipt_contract=PASS
+```
+
+### Failure Class
+
+추가한 실패 타입:
+
+```text
+WebhookRetryableError
+WebhookPermanentError
+```
+
+Status classification:
+
+```text
+408
+429
+500~599
+→ WebhookRetryableError
+
+3xx
+기타 4xx
+→ WebhookPermanentError
+```
+
+Exit code:
+
+```text
+retryable = 2
+permanent = 5
+```
+
+두 경우 모두 pending event를 삭제하지 않는다.
+
+### HTTP 400
+
+결과:
+
+```text
+prepared_case=400 pending=1
+
+adapter_error=permanent delivery failure:
+webhook returned permanent HTTP 400
+
+http_400_rc=5
+http_400_pending=1
+http_400_receipts=0
+```
+
+### HTTP 408
+
+결과:
+
+```text
+http_408_pending_before=1
+
+adapter_error=retryable delivery failure:
+webhook returned retryable HTTP 408
+
+http_408_rc=2
+http_408_pending_after=1
+http_408_receipts=0
+
+http_408_server_stopped=PASS
+```
+
+### HTTP 429
+
+결과:
+
+```text
+prepared_case=429 pending=1
+
+adapter_error=retryable delivery failure:
+webhook returned retryable HTTP 429
+
+http_429_rc=2
+http_429_pending=1
+```
+
+### HTTP 500
+
+결과:
+
+```text
+prepared_case=500 pending=1
+
+adapter_error=retryable delivery failure:
+webhook returned retryable HTTP 500
+
+http_500_rc=2
+http_500_pending=1
+```
+
+### Redirect
+
+Fake server:
+
+```text
+/redirect
+→ HTTP 302
+→ Location: /redirect-target
+```
+
+결과:
+
+```text
+adapter_error=permanent delivery failure:
+webhook returned permanent HTTP 302
+
+redirect_rc=5
+redirect_requests_added=1
+redirect_target_requests_added=0
+redirect_pending=1
+```
+
+따라서 urllib의 기본 redirect 동작을 사용하지 않고 redirect를 실제로 차단했다.
+
+### Connection Refused
+
+사용하지 않는 localhost port에 POST했다.
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+connection_refused_rc=2
+connection_refused_pending=1
+```
+
+### Ambiguous Timeout
+
+Fake server 동작:
+
+```text
+request body 수신 및 기록
+→ 1초 sleep
+→ HTTP 204
+```
+
+Adapter timeout:
+
+```text
+0.2 seconds
+```
+
+첫 시도:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request timed out
+
+timeout_rc=2
+timeout_server_received=1
+timeout_pending=1
+timeout_receipts=0
+```
+
+Receiver는 request를 수신했지만 AeroTrace에는 성공 receipt가 없다.
+
+같은 pending을 다시 처리했다.
+
+```text
+timeout_retry_rc=2
+timeout_second_request_received=1
+```
+
+두 request의 event ID:
+
+```text
+1787039776322030495-1618606
+```
+
+으로 동일했다.
+
+검증:
+
+```text
+timeout_duplicate_identity=PASS
+```
+
+### 확인된 Delivery 특성
+
+이번 실험으로 다음을 실제 확인했다.
+
+```text
+HTTP 성공 시에만 receipt 생성
+HTTP 성공 후에만 pending ACK
+
+permanent failure에서도 pending 보존
+retryable failure에서도 pending 보존
+
+redirect 자동 추적 안 함
+connection failure retry 가능
+
+timeout 후 receiver 수신 여부가 ambiguous할 수 있음
+동일 event_id로 retry되어 duplicate delivery가 발생할 수 있음
+```
+
+따라서 Generic Webhook notification을 exactly-once라고 표현하지 않는다.
+
+### 현재 운영 위험
+
+현재 retry 자체는 systemd timer의 반복 실행에 의존한다.
+
+아직:
+
+```text
+per-event exponential backoff
+Retry-After 지원
+retry 횟수
+first failure timestamp
+outbox oldest age
+dead-letter queue
+outbox growth limit
+```
+
+을 구현하지 않았다.
+
+Webhook endpoint가 장기간 실패하면 pending outbox가 증가할 수 있으므로 실제 production webhook 활성화 전에 이 부분을 운영 관점에서 추가 검토해야 한다.
+
+---
+
+### Portfolio Checkpoint — Generic Webhook Delivery와 Ambiguous Timeout 검증
+
+Collector queue alert를 실제 HTTP webhook으로 전달할 수 있는 notification transport를 구현하고, 성공뿐 아니라 HTTP 및 network failure semantics를 local fake server로 직접 검증했다.
+
+### 구현한 구조
+
+```text
+Collector queue state
+→ evaluator
+→ JSON outbox
+→ notification adapter
+→ HTTP POST
+→ webhook receiver
+→ delivery receipt
+→ pending ACK
+```
+
+### HTTP Success Path
+
+HTTP 204 응답에서:
+
+```text
+pending 1 → 0
+webhook receipt 0 → 1
+adapter rc=0
+```
+
+을 확인했다.
+
+실제 request:
+
+```text
+POST /aerotrace
+Content-Type: application/json
+X-AeroTrace-Event-Id: <event_id>
+```
+
+Header event ID와 body event ID가 동일함을 검증했다.
+
+```text
+webhook_request_contract=PASS
+webhook_receipt_contract=PASS
+```
+
+### Failure Classification
+
+실제 HTTP server를 이용해 다음 결과를 검증했다.
+
+```text
+400 → permanent → rc=5
+408 → retryable → rc=2
+429 → retryable → rc=2
+500 → retryable → rc=2
+302 → permanent → rc=5
+connection refused → retryable → rc=2
+timeout → retryable → rc=2
+```
+
+모든 failure에서 pending event가 유지됐다.
+
+### Redirect Security
+
+HTTP 302에 Location header를 설정했다.
+
+검증:
+
+```text
+redirect_requests_added=1
+redirect_target_requests_added=0
+```
+
+으로 redirect target에 payload가 전달되지 않았음을 확인했다.
+
+### Ambiguous Timeout 실험
+
+Receiver가 request를 기록한 후 응답을 늦게 보내도록 만들고 AeroTrace timeout을 더 짧게 설정했다.
+
+결과:
+
+```text
+timeout_server_received=1
+timeout_rc=2
+timeout_pending=1
+timeout_receipts=0
+```
+
+즉 receiver는 request를 실제로 받았지만 sender는 성공 여부를 확인할 수 없는 상태를 재현했다.
+
+같은 pending을 재시도하자:
+
+```text
+timeout_second_request_received=1
+```
+
+이 추가됐고 두 request의 event ID가 동일했다.
+
+```text
+timeout_duplicate_identity=PASS
+```
+
+이를 통해 HTTP notification에서 exactly-once delivery를 단순히 구현할 수 없고, receiver-side idempotency가 왜 필요한지 실제 코드와 네트워크 실험으로 확인했다.
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 다음 운영 개념을 실제로 다뤘다.
+
+```text
+HTTP transport failure classification
+retryable vs permanent failure
+at-least-once 성격의 retry
+ambiguous timeout
+idempotency key
+receiver deduplication
+delivery receipt
+redirect security
+outbox ordering
+failure 시 event 보존
+```
+
+### 보존할 로그와 증거
+
+```text
+webhook_204_rc=0
+webhook_request_contract=PASS
+webhook_receipt_contract=PASS
+
+http_400_rc=5
+http_400_pending=1
+http_400_receipts=0
+
+http_408_rc=2
+http_408_pending_after=1
+http_408_receipts=0
+
+http_429_rc=2
+http_429_pending=1
+
+http_500_rc=2
+http_500_pending=1
+
+redirect_rc=5
+redirect_requests_added=1
+redirect_target_requests_added=0
+redirect_pending=1
+
+connection_refused_rc=2
+connection_refused_pending=1
+
+timeout_rc=2
+timeout_server_received=1
+timeout_pending=1
+timeout_receipts=0
+
+timeout_retry_rc=2
+timeout_second_request_received=1
+timeout_duplicate_identity=PASS
+```
+
+특히 timeout experiment의 log와 event ID 비교 결과는 포트폴리오와 기술 블로그에 보존할 가치가 높다.
+
+### 이력서 성과 문장 초안
+
+- Collector 장애 알림을 JSON outbox 기반 Generic Webhook으로 전달하는 경로를 구현하고 HTTP `2xx/400/408/429/5xx`, redirect, connection failure, timeout 시나리오를 실제 local HTTP server로 검증하여 실패 유형별 pending 보존 및 retry semantics를 설계
+- HTTP timeout에서 receiver가 요청을 수신했지만 sender가 성공 여부를 확인하지 못하는 ambiguous delivery를 재현하고 동일 `event_id` 기반 재전송을 검증해 exactly-once 한계를 확인하고 receiver-side idempotency를 고려한 notification 구조를 구축
+
+실제 외부 provider 또는 production systemd 배포까지 완료된 것처럼 표현하지 않는다.
+
+### 예상 면접 질문
+
+```text
+왜 HTTP 400과 500의 exit code를 다르게 했는가?
+
+왜 permanent error에서도 pending을 삭제하지 않는가?
+
+왜 HTTP 302 redirect를 따라가지 않는가?
+
+timeout인데 receiver가 실제 request를 받은 것을 어떻게 증명했는가?
+
+동일 notification이 두 번 전달될 수 있는데 어떻게 대응할 것인가?
+
+event_id를 HTTP header에도 넣은 이유는 무엇인가?
+
+delivery receipt는 어떤 시점에 만들어야 하는가?
+
+receipt를 먼저 만들고 pending을 삭제하는 이유는 무엇인가?
+
+왜 exactly-once라고 표현하면 안 되는가?
+
+429 Retry-After는 현재 어떻게 처리하며 이후 어떻게 개선할 것인가?
+```
+
+### 블로그 주제
+
+**제목**
+
+```text
+Webhook 알림은 왜 Exactly-Once가 아닌가:
+Timeout과 중복 전송을 직접 재현해 본 과정
+```
+
+**핵심 흐름**
+
+```text
+1. 단순 POST 구현
+2. Outbox와 receipt 설계
+3. 2xx 성공 기준
+4. 400 / 429 / 500 분류
+5. redirect 차단
+6. timeout 실험
+7. receiver는 받았지만 sender는 모르는 상태
+8. 동일 event_id retry
+9. receiver-side idempotency 필요성
+10. 실제 운영에서 남은 retry/backoff 문제
+```
+
+### 다음 한 단계 높은 과제
+
+Webhook 전송 자체보다 다음 운영 문제를 해결하는 것이 중요하다.
+
+```text
+notification endpoint 장기 장애
+→ pending outbox 증가
+→ 얼마나 오래 실패 중인지 알 수 없음
+→ systemd가 계속 동일 event를 retry
+```
+
+따라서 다음 단계에서는 retry/backoff를 바로 복잡하게 구현하기 전에 먼저:
+
+```text
+pending event 수
+oldest pending age
+실패 지속 시간
+최근 failure type
+```
+
+을 운영자가 관찰할 수 있도록 만들고, 그 측정 결과를 바탕으로 backoff / retry budget / dead-letter 정책 도입 여부를 결정한다.

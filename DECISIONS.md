@@ -5094,3 +5094,466 @@ Receipt
 ```
 
 외부 transport retry가 발생하더라도 기존 성공 receipt가 존재하면 동일 event를 다시 성공 처리하지 않는다.
+
+---
+
+## Generic Webhook Transport의 HTTP Delivery 및 실패 정책
+
+### 해결하려는 문제
+
+Collector queue alert를 실제 운영자에게 전달하려면 local-file test transport를 넘어 외부 HTTP endpoint로 notification event를 전달할 transport가 필요하다.
+
+Webhook transport에서는 단순히 HTTP POST 기능만 구현하면 충분하지 않다.
+
+다음 실패를 명확하게 구분해야 한다.
+
+```text
+정상 2xx
+HTTP 4xx
+HTTP 5xx
+rate limit
+redirect
+connection failure
+timeout
+```
+
+특히 HTTP timeout에서는 receiver가 요청을 이미 처리했지만 AeroTrace가 응답만 받지 못했을 수 있으므로 delivery 결과가 모호해진다.
+
+### 선택한 Transport
+
+Notification adapter에 다음 transport를 지원한다.
+
+```text
+local-file
+webhook
+```
+
+기본값은 기존 호환성을 위해:
+
+```text
+local-file
+```
+
+로 유지한다.
+
+Webhook transport는:
+
+```text
+--transport webhook
+```
+
+으로 명시적으로 활성화한다.
+
+Webhook URL은 다음 두 경로에서 읽을 수 있다.
+
+```text
+--webhook-url
+AEROTRACE_WEBHOOK_URL
+```
+
+CLI argument는 개발 및 수동 테스트 용도로 사용하고 운영 배포에서는 secret 노출을 줄이기 위해 환경변수 또는 보호된 환경 파일 사용을 우선한다.
+
+### Webhook URL 검증
+
+다음 scheme만 허용한다.
+
+```text
+http
+https
+```
+
+다음 형태는 거부한다.
+
+```text
+ftp://...
+URL에 host 없음
+https://user:password@example.com/...
+fragment 포함 URL
+```
+
+URL userinfo credential을 허용하지 않는 이유는 command line, process metadata, log 등에 인증 정보가 노출되는 위험을 줄이기 위해서다.
+
+### HTTP Request Contract
+
+Webhook notification은 다음 형식으로 전송한다.
+
+```text
+Method:
+POST
+
+Content-Type:
+application/json
+
+Accept:
+application/json
+
+User-Agent:
+AeroTrace-Notification/1
+
+X-AeroTrace-Event-Id:
+<event_id>
+```
+
+Request body는 evaluator가 생성한 schema version 1 event JSON이다.
+
+`X-AeroTrace-Event-Id`와 request body의 `event_id`는 동일하다.
+
+Receiver가 idempotency 또는 duplicate suppression을 지원한다면 이 event ID를 사용할 수 있다.
+
+단, header 자체가 receiver 측 deduplication을 보장하지는 않는다.
+
+### 성공 기준
+
+HTTP status:
+
+```text
+200 <= status < 300
+```
+
+을 성공으로 판단한다.
+
+성공한 경우:
+
+```text
+HTTP success
+→ webhook delivery receipt 저장
+→ receipt fsync
+→ receipt directory fsync
+→ pending event 삭제
+→ outbox directory fsync
+```
+
+순서로 처리한다.
+
+Webhook receipt:
+
+```json
+{
+  "receipt_schema_version": 1,
+  "event_id": "...",
+  "transport": "webhook",
+  "delivered_at": "...",
+  "event": {
+    "schema_version": 1,
+    "event_id": "...",
+    "evaluated_at": "..."
+  }
+}
+```
+
+를 생성한다.
+
+### 실제 2xx 검증
+
+Local fake HTTP server가 204를 반환하도록 구성했다.
+
+결과:
+
+```text
+webhook_204_rc=0
+
+delivery_result=DELIVERED
+adapter_status=OK
+processed_events=1
+remaining_events=0
+
+pending_after_webhook=0
+webhook_receipt_count=1
+```
+
+실제 request contract:
+
+```text
+POST /aerotrace
+Content-Type=application/json
+Accept=application/json
+User-Agent=AeroTrace-Notification/1
+
+X-AeroTrace-Event-Id
+= request body event_id
+```
+
+검증:
+
+```text
+webhook_request_contract=PASS
+webhook_receipt_contract=PASS
+```
+
+Receipt:
+
+```text
+transport=webhook
+evaluated_at=2026-08-18T07:51:54+00:00
+delivered_at=2026-08-18T07:52:02+00:00
+```
+
+으로 evaluator event 발생 시각과 webhook 성공 시각이 분리됨을 확인했다.
+
+### HTTP Failure Classification
+
+Webhook 실패를 다음 두 종류로 분리한다.
+
+#### Retryable Failure
+
+다음은 일시적 장애 가능성이 있으므로 retryable로 취급한다.
+
+```text
+HTTP 408
+HTTP 429
+HTTP 5xx
+connection failure
+timeout
+```
+
+Adapter exit code:
+
+```text
+2
+```
+
+정책:
+
+```text
+receipt 생성하지 않음
+pending 삭제하지 않음
+현재 event에서 처리 중단
+```
+
+#### Permanent Failure
+
+다음은 URL, 인증, 요청 형식 등 운영 설정 문제일 가능성이 높으므로 permanent failure로 분류한다.
+
+```text
+3xx
+408/429를 제외한 4xx
+```
+
+Adapter exit code:
+
+```text
+5
+```
+
+하지만 permanent라고 해서 pending event를 삭제하지 않는다.
+
+이유는 최초 ALERT가 permanent failure로 전달되지 않았는데 뒤에 있는 RECOVERY만 전달되는 순서 역전을 방지하기 위해서다.
+
+현재 adapter는 첫 실패 event에서 처리를 중단해 outbox order를 보존한다.
+
+### HTTP 400 검증
+
+Fake server가 HTTP 400을 반환했다.
+
+결과:
+
+```text
+adapter_error=permanent delivery failure:
+webhook returned permanent HTTP 400
+
+http_400_rc=5
+http_400_pending=1
+http_400_receipts=0
+```
+
+따라서 permanent failure에서도 notification event를 유실하지 않는다.
+
+### HTTP 408 검증
+
+Fake server가 HTTP 408을 반환했다.
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook returned retryable HTTP 408
+
+http_408_rc=2
+http_408_pending_after=1
+http_408_receipts=0
+```
+
+408은 retryable로 분류됐다.
+
+### HTTP 429 검증
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook returned retryable HTTP 429
+
+http_429_rc=2
+http_429_pending=1
+```
+
+Rate limit은 pending event를 유지하고 재시도 대상으로 남긴다.
+
+현재 Retry-After 기반 scheduling은 아직 구현하지 않았다.
+
+### HTTP 500 검증
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook returned retryable HTTP 500
+
+http_500_rc=2
+http_500_pending=1
+```
+
+서버 장애도 retryable로 분류한다.
+
+### Redirect 정책
+
+Webhook URL의 redirect는 자동으로 따라가지 않는다.
+
+의도:
+
+```text
+configured webhook endpoint
+→ 302
+→ 예상하지 않은 다른 endpoint
+```
+
+로 payload가 전달되는 것을 막는다.
+
+실제 HTTP 302 테스트:
+
+```text
+redirect_rc=5
+redirect_requests_added=1
+redirect_target_requests_added=0
+redirect_pending=1
+```
+
+으로 redirect target에 실제 POST가 발생하지 않았음을 확인했다.
+
+### Connection Failure
+
+Connection refused를 실제 발생시켰다.
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+connection_refused_rc=2
+connection_refused_pending=1
+```
+
+따라서 endpoint가 일시적으로 내려간 경우 event를 유실하지 않는다.
+
+### Timeout과 Ambiguous Delivery
+
+Timeout은 HTTP webhook에서 가장 중요한 failure mode다.
+
+Receiver는 request body를 읽고 event를 기록한 뒤 응답을 1초 지연하도록 구성했다.
+
+AeroTrace timeout:
+
+```text
+0.2초
+```
+
+결과:
+
+```text
+timeout_rc=2
+timeout_server_received=1
+timeout_pending=1
+timeout_receipts=0
+```
+
+Receiver는 요청을 실제로 받았지만 AeroTrace는 성공 응답을 받지 못했다.
+
+따라서 AeroTrace는 성공 receipt를 생성하지 않고 pending event를 유지했다.
+
+같은 pending event를 다시 처리했다.
+
+결과:
+
+```text
+timeout_retry_rc=2
+timeout_second_request_received=1
+```
+
+Receiver는 동일 notification을 두 번째로 받았다.
+
+두 request의 identity:
+
+```text
+X-AeroTrace-Event-Id
+= body.event_id
+
+first body.event_id
+= second body.event_id
+```
+
+검증:
+
+```text
+timeout_duplicate_identity=PASS
+```
+
+### Delivery Semantics 결정
+
+Webhook transport는 exactly-once delivery를 보장한다고 표현하지 않는다.
+
+현재 모델은:
+
+```text
+성공 응답 확인
+→ receipt 생성
+→ pending ACK
+
+성공 여부 불명확
+→ receipt 없음
+→ pending 유지
+→ 동일 event_id로 retry
+```
+
+이다.
+
+따라서 timeout과 같은 ambiguous failure에서는 receiver가 동일 event를 여러 번 받을 수 있다.
+
+Receiver가 duplicate-safe 동작을 필요로 한다면:
+
+```text
+event_id
+```
+
+기반 idempotency 또는 deduplication을 구현해야 한다.
+
+### Response 제한
+
+Webhook response body는 진단 목적으로 최대:
+
+```text
+4096 bytes
+```
+
+까지만 소비한다.
+
+Notification adapter가 외부 endpoint의 비정상적으로 큰 response body 때문에 불필요하게 메모리를 사용하는 것을 제한하기 위한 방어다.
+
+### 현재 남은 과제
+
+아직 다음은 구현 또는 검증하지 않았다.
+
+```text
+Retry-After 기반 429 retry scheduling
+exponential backoff
+retry budget
+dead-letter 정책
+outbox 최대 크기 및 최대 age monitoring
+webhook authentication header
+secret rotation
+TLS certificate failure 테스트
+실제 systemd webhook deployment
+실제 외부 provider E2E
+```
+
+현재 MVP에서는 HTTP 실패 시 pending event를 보존하고 systemd의 반복 실행을 통해 retry하는 단순 구조를 유지한다.

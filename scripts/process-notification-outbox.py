@@ -7,7 +7,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 
 VALID_EVENTS = {
@@ -23,6 +29,27 @@ VALID_STATUSES = {
     "CRITICAL",
     "UNKNOWN",
 }
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req,
+        fp,
+        code,
+        msg,
+        headers,
+        newurl,
+    ):
+        return None
+
+
+class WebhookRetryableError(OSError):
+    pass
+
+
+class WebhookPermanentError(OSError):
+    pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -395,6 +422,174 @@ def deliver_to_local_sink(
     return "DELIVERED"
 
 
+def webhook_error_for_status(
+    status: int,
+) -> OSError:
+    if (
+        status in {408, 429}
+        or 500 <= status <= 599
+    ):
+        return WebhookRetryableError(
+            f"webhook returned retryable HTTP {status}"
+        )
+
+    return WebhookPermanentError(
+        f"webhook returned permanent HTTP {status}"
+    )
+
+
+def deliver_to_webhook(
+    pending_path: Path,
+    outbox_dir: Path,
+    receipt_dir: Path,
+    payload: dict[str, Any],
+    webhook_url: str,
+    timeout_sec: float,
+) -> str:
+    receipt_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    receipt_path = (
+        receipt_dir
+        / pending_path.name
+    )
+
+    if receipt_path.exists():
+        receipt = load_json(
+            receipt_path
+        )
+
+        validate_delivery_receipt(
+            receipt_path,
+            receipt,
+            payload,
+            expected_transport="webhook",
+        )
+
+        pending_path.unlink()
+        fsync_directory(
+            outbox_dir
+        )
+
+        return "ACK_EXISTING"
+
+    request_body = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    request = Request(
+        webhook_url,
+        data=request_body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": (
+                "AeroTrace-Notification/1"
+            ),
+            "X-AeroTrace-Event-Id": (
+                payload["event_id"]
+            ),
+        },
+    )
+
+    opener = build_opener(
+        NoRedirectHandler()
+    )
+
+    try:
+        with opener.open(
+            request,
+            timeout=timeout_sec,
+        ) as response:
+            status = response.getcode()
+
+            # Bound response consumption so an unexpected
+            # response body cannot consume unbounded memory.
+            response.read(
+                4096
+            )
+    except HTTPError as exc:
+        raise webhook_error_for_status(
+            exc.code
+        ) from exc
+    except URLError as exc:
+        raise WebhookRetryableError(
+            f"webhook request failed: {exc.reason}"
+        ) from exc
+    except TimeoutError as exc:
+        raise WebhookRetryableError(
+            "webhook request timed out"
+        ) from exc
+
+    if (
+        status < 200
+        or status >= 300
+    ):
+        raise webhook_error_for_status(
+            status
+        )
+
+    receipt = build_delivery_receipt(
+        payload,
+        transport="webhook",
+    )
+
+    temporary_path = (
+        receipt_dir
+        / (
+            f".{pending_path.name}."
+            f"{os.getpid()}.tmp"
+        )
+    )
+
+    try:
+        with temporary_path.open(
+            "x",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                receipt,
+                file,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(
+            temporary_path,
+            receipt_path,
+        )
+
+        fsync_directory(
+            receipt_dir
+        )
+
+        pending_path.unlink()
+
+        fsync_directory(
+            outbox_dir
+        )
+    except Exception:
+        try:
+            temporary_path.unlink(
+                missing_ok=True
+            )
+        except OSError:
+            pass
+
+        raise
+
+    return "DELIVERED"
+
+
 def resolve_webhook_url(
     cli_url: str | None,
 ) -> str | None:
@@ -524,13 +719,6 @@ def main() -> int:
             )
             return 4
 
-        print(
-            "adapter_error="
-            "webhook transport is configured "
-            "but HTTP delivery is not implemented yet",
-            file=sys.stderr,
-        )
-        return 4
 
     if (
         args.outbox_dir.exists()
@@ -603,14 +791,33 @@ def main() -> int:
             return 3
 
         try:
-            delivery_result = (
-                deliver_to_local_sink(
-                    pending_path=pending_path,
-                    outbox_dir=args.outbox_dir,
-                    receipt_dir=args.receipt_dir,
-                    payload=payload,
+            if args.transport == "local-file":
+                delivery_result = (
+                    deliver_to_local_sink(
+                        pending_path=pending_path,
+                        outbox_dir=args.outbox_dir,
+                        receipt_dir=args.receipt_dir,
+                        payload=payload,
+                    )
                 )
-            )
+            else:
+                if webhook_url is None:
+                    raise ValueError(
+                        "webhook URL was not resolved"
+                    )
+
+                delivery_result = (
+                    deliver_to_webhook(
+                        pending_path=pending_path,
+                        outbox_dir=args.outbox_dir,
+                        receipt_dir=args.receipt_dir,
+                        payload=payload,
+                        webhook_url=webhook_url,
+                        timeout_sec=(
+                            args.webhook_timeout_sec
+                        ),
+                    )
+                )
         except ValueError as exc:
             print(
                 "adapter_error="
@@ -626,6 +833,36 @@ def main() -> int:
             )
 
             return 3
+        except WebhookPermanentError as exc:
+            print(
+                "adapter_error="
+                f"permanent delivery failure: {exc}",
+                file=sys.stderr,
+            )
+            print(
+                f"failed_event_id={event_id}"
+            )
+            print(
+                "remaining_events="
+                f"{count_pending(args.outbox_dir)}"
+            )
+
+            return 5
+        except WebhookRetryableError as exc:
+            print(
+                "adapter_error="
+                f"retryable delivery failure: {exc}",
+                file=sys.stderr,
+            )
+            print(
+                f"failed_event_id={event_id}"
+            )
+            print(
+                "remaining_events="
+                f"{count_pending(args.outbox_dir)}"
+            )
+
+            return 2
         except OSError as exc:
             print(
                 "adapter_error="
