@@ -10196,3 +10196,203 @@ last_notification_epoch
 는 실제 transport delivery 완료 시간이 아니라 alert-required event를 생성하고 handoff한 시간에 가깝다.
 
 실제 외부 notification transport를 production에 연결하기 전에 이 의미를 명확하게 분리해야 한다.
+
+---
+
+## Evaluator Notification State 의미 정리 및 Production Migration
+
+### 목표
+
+외부 notification transport를 연결하기 전에 evaluator state의 `last_notification_*` 필드가 실제 delivery 완료 시각처럼 오해될 수 있는 문제를 수정했다.
+
+기존:
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+변경:
+
+```text
+last_alert_event_at
+last_alert_event_epoch
+```
+
+### Migration 전략
+
+Python 내부 identifier와 persisted JSON key migration을 분리했다.
+
+새 persisted key를 우선 읽고 값이 없으면 기존 legacy key를 fallback한다.
+
+```text
+last_alert_event_epoch
+→ 없으면 last_notification_epoch
+
+last_alert_event_at
+→ 없으면 last_notification_at
+```
+
+State를 다시 저장할 때 legacy key를 제거하고 새 key로 보존한다.
+
+### 첫 Patch 실패
+
+최초 자동 patch는:
+
+```text
+legacy migration insertion point was not found
+```
+
+에서 종료됐다.
+
+`path.write_text()` 전에 종료됐기 때문에 실제 source file과 production state에는 부분 변경이 남지 않았다.
+
+확인:
+
+```text
+git diff 없음
+production state legacy key 유지
+evaluator 정상 실행
+```
+
+따라서 rollback이나 state 복구 없이 patch를 다시 적용할 수 있었다.
+
+### Legacy State Migration
+
+Legacy fixture에:
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+를 저장한 뒤 evaluator를 실행했다.
+
+결과:
+
+```text
+migration_rc=0
+legacy_state_migration=PASS
+```
+
+변환된 state:
+
+```text
+last_alert_event_at 존재
+last_alert_event_epoch 존재
+last_notification_at 없음
+last_notification_epoch 없음
+```
+
+### Reminder Suppression 회귀 테스트
+
+Fake checker:
+
+```text
+status=WARNING
+exit=1
+```
+
+Legacy WARNING state에 현재 시각의:
+
+```text
+last_notification_epoch
+```
+
+를 저장하고 repeat interval을 300초로 실행했다.
+
+결과:
+
+```text
+event=NONE
+alert_required=false
+previous_status=WARNING
+current_status=WARNING
+
+legacy_repeat_suppression=PASS
+reminder_state_migration=PASS
+```
+
+따라서 migration 때문에 동일 WARNING에 대한 REMINDER가 즉시 재발생하지 않았다.
+
+### Production Migration
+
+Migration 전 production state:
+
+```text
+current_status=OK
+
+last_notification_at
+= 2026-08-18T06:45:59+00:00
+
+last_notification_epoch
+= 1787035559.0960143
+```
+
+Collector 상태:
+
+```text
+status=OK
+queue_size=0
+```
+
+Production evaluator를 한 번 실행해 state를 migration했다.
+
+결과:
+
+```text
+production_migration_rc=0
+production_state_migration=PASS
+```
+
+Migration 후:
+
+```text
+last_alert_event_at
+= 2026-08-18T06:45:59+00:00
+
+last_alert_event_epoch
+= 1787035559.0960143
+```
+
+으로 기존 timestamp가 그대로 유지됐다.
+
+Legacy key는 제거됐다.
+
+### Runtime 검증
+
+Evaluator timer를 다시 시작했다.
+
+```text
+evaluator_timer_enabled=enabled
+evaluator_timer_active=active
+```
+
+반복 실행 후 state:
+
+```text
+current_status=OK
+last_alert_event_at 존재
+last_alert_event_epoch 존재
+last_notification_* 없음
+```
+
+Collector:
+
+```text
+status=OK
+queue_size=0
+```
+
+으로 정상 상태를 유지했다.
+
+### 결과
+
+Evaluator의 상태 의미가 다음과 같이 명확해졌다.
+
+```text
+last_alert_event_*
+= evaluator가 notification-required event를 발생시킨 시각
+```
+
+실제 외부 transport delivery 성공 시각은 이후 notification adapter의 별도 receipt state로 관리한다.

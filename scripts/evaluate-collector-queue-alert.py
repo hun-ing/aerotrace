@@ -296,7 +296,7 @@ def run_checker(
 def decide_event(
     previous_status: str | None,
     current_status: str,
-    last_notification_epoch: float | None,
+    last_alert_event_epoch: float | None,
     now_epoch: float,
     repeat_after_sec: float,
 ) -> tuple[str, bool]:
@@ -318,12 +318,12 @@ def decide_event(
     if current_status == "OK":
         return "NONE", False
 
-    if last_notification_epoch is None:
+    if last_alert_event_epoch is None:
         return "ALERT", True
 
     elapsed = (
         now_epoch
-        - last_notification_epoch
+        - last_alert_event_epoch
     )
 
     if elapsed >= repeat_after_sec:
@@ -491,19 +491,49 @@ def main() -> int:
     else:
         previous_status = None
 
-    last_notification_value = state.get(
-        "last_notification_epoch"
+    last_alert_event_value = state.get(
+        "last_alert_event_epoch"
     )
 
-    if isinstance(
-        last_notification_value,
+    if not isinstance(
+        last_alert_event_value,
         (int, float),
     ):
-        last_notification_epoch = float(
-            last_notification_value
+        last_alert_event_value = state.get(
+            "last_notification_epoch"
+        )
+
+    if isinstance(
+        last_alert_event_value,
+        (int, float),
+    ):
+        last_alert_event_epoch = float(
+            last_alert_event_value
         )
     else:
-        last_notification_epoch = None
+        last_alert_event_epoch = None
+
+    last_alert_event_at_value = state.get(
+        "last_alert_event_at"
+    )
+
+    if not isinstance(
+        last_alert_event_at_value,
+        str,
+    ):
+        last_alert_event_at_value = state.get(
+            "last_notification_at"
+        )
+
+    if isinstance(
+        last_alert_event_at_value,
+        str,
+    ):
+        last_alert_event_at = (
+            last_alert_event_at_value
+        )
+    else:
+        last_alert_event_at = None
 
     now_epoch = time.time()
     now_iso = utc_now_iso()
@@ -511,7 +541,7 @@ def main() -> int:
     event, alert_required = decide_event(
         previous_status=previous_status,
         current_status=current_status,
-        last_notification_epoch=last_notification_epoch,
+        last_alert_event_epoch=last_alert_event_epoch,
         now_epoch=now_epoch,
         repeat_after_sec=args.repeat_after_sec,
     )
@@ -535,11 +565,30 @@ def main() -> int:
             now_iso
         )
 
+    new_state.pop(
+        "last_notification_at",
+        None,
+    )
+    new_state.pop(
+        "last_notification_epoch",
+        None,
+    )
+
+    if last_alert_event_at is not None:
+        new_state["last_alert_event_at"] = (
+            last_alert_event_at
+        )
+
+    if last_alert_event_epoch is not None:
+        new_state["last_alert_event_epoch"] = (
+            last_alert_event_epoch
+        )
+
     if alert_required:
-        new_state["last_notification_at"] = (
+        new_state["last_alert_event_at"] = (
             now_iso
         )
-        new_state["last_notification_epoch"] = (
+        new_state["last_alert_event_epoch"] = (
             now_epoch
         )
 

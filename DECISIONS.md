@@ -4698,3 +4698,183 @@ outbox handoff를 수행한 시각
 따라서 실제 외부 transport를 production에 연결하기 전에 해당 상태 필드의 이름과 책임을 재검토한다.
 
 실제 delivery 성공 시각은 notification adapter의 책임으로 분리하는 것이 적절하다.
+
+---
+
+## Alert Event 발생 시각과 Notification Delivery 시각의 의미 분리
+
+### 문제
+
+Collector queue alert evaluator의 기존 persistent state에는 다음 필드가 있었다.
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+하지만 이 값은 실제 외부 notification transport가 전송에 성공한 시각이 아니다.
+
+실제 의미는 evaluator가:
+
+```text
+ALERT
+STATUS_CHANGE
+REMINDER
+RECOVERY
+```
+
+와 같이 `alert_required=true`인 event를 결정한 시각이었다.
+
+외부 webhook transport를 연결하면 다음 두 시각이 달라질 수 있다.
+
+```text
+alert event 발생 시각
+notification 실제 delivery 성공 시각
+```
+
+예:
+
+```text
+15:00 ALERT event 생성
+15:00 webhook 전송 실패
+15:02 retry 후 실제 delivery 성공
+```
+
+기존 `last_notification_at`이라는 이름은 이 경우 실제 의미를 잘못 표현하게 된다.
+
+### 결정
+
+Evaluator state의 의미를 다음과 같이 변경한다.
+
+```text
+last_notification_at
+→ last_alert_event_at
+
+last_notification_epoch
+→ last_alert_event_epoch
+```
+
+이 필드는 evaluator가 notification이 필요한 event를 발생시킨 시각을 의미한다.
+
+실제 transport delivery 성공 시각은 evaluator state에 저장하지 않고 notification adapter의 별도 delivery receipt 책임으로 분리한다.
+
+### 기존 State 호환성
+
+기존 production state에는 legacy key가 이미 존재하므로 새 key만 읽도록 즉시 변경하지 않는다.
+
+읽기 우선순위:
+
+```text
+1. last_alert_event_*
+2. 값이 없으면 legacy last_notification_*
+```
+
+저장 시에는:
+
+```text
+legacy key 제거
+→ 새 last_alert_event_* key로 저장
+```
+
+한다.
+
+이를 통해 기존 서비스 상태 파일을 별도 수동 migration 없이 첫 evaluator 실행에서 자동 변환한다.
+
+### Migration 검증
+
+Legacy fixture:
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+를 가진 state를 evaluator가 읽은 뒤:
+
+```text
+legacy_state_migration=PASS
+```
+
+를 확인했다.
+
+Migration 이후:
+
+```text
+last_alert_event_at 존재
+last_alert_event_epoch 존재
+
+last_notification_at 없음
+last_notification_epoch 없음
+```
+
+을 확인했다.
+
+### Repeat Suppression 호환성
+
+기존 `last_notification_epoch`는 non-OK 상태의 REMINDER 반복 억제 기준으로 사용되고 있었다.
+
+Legacy WARNING state에 최근 notification timestamp를 넣은 뒤 evaluator를 실행했다.
+
+결과:
+
+```text
+event=NONE
+alert_required=false
+previous_status=WARNING
+current_status=WARNING
+
+legacy_repeat_suppression=PASS
+reminder_state_migration=PASS
+```
+
+따라서 state field migration 때문에 기존 300초 repeat suppression 기준이 초기화되지 않음을 확인했다.
+
+### Production State Migration
+
+Production migration 전:
+
+```text
+last_notification_at
+= 2026-08-18T06:45:59+00:00
+
+last_notification_epoch
+= 1787035559.0960143
+```
+
+Migration 후:
+
+```text
+last_alert_event_at
+= 2026-08-18T06:45:59+00:00
+
+last_alert_event_epoch
+= 1787035559.0960143
+```
+
+으로 기존 timestamp가 그대로 보존됐다.
+
+Production state:
+
+```text
+production_state_migration=PASS
+current_status=OK
+```
+
+Evaluator timer 재시작 후에도 새 state field를 유지하면서 정상적으로 반복 평가되는 것을 확인했다.
+
+### 최종 책임 분리
+
+현재 의미는 다음과 같다.
+
+```text
+Evaluator
+last_alert_event_at
+last_alert_event_epoch
+→ notification-required event를 발생시킨 시각
+
+Notification Adapter
+→ 실제 transport 전송 책임
+→ 실제 delivery 성공 시각은 별도 receipt로 관리
+```
+
+이 구분을 기준으로 이후 Generic Webhook transport와 delivery receipt를 설계한다.
