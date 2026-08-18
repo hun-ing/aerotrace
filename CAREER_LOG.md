@@ -2596,3 +2596,324 @@ OK
 상태 변화가 자동으로 탐지되는지 검증한다.
 
 그 이후 실제 notification adapter를 연결해 운영자가 외부 채널에서 장애와 복구를 받을 수 있는 구조로 확장한다.
+
+---
+
+### Portfolio Checkpoint — 실제 Collector Queue 기반 Alert Severity State Machine 검증
+
+Collector process 중단에 대한 UNKNOWN 자동 탐지에 이어 실제 persistent queue backlog를 이용해 운영 alert severity 전체 경로를 검증했다.
+
+### 구현한 구조
+
+Evaluator가 checker option을 전달할 수 있도록 다음 기능을 추가했다.
+
+```text
+--checker-arg
+```
+
+이를 이용해 production threshold:
+
+```text
+WARNING 50%
+CRITICAL 80%
+```
+
+를 변경하지 않고 테스트 환경에서만 낮은 threshold를 적용했다.
+
+테스트 threshold는 repository나 영구 systemd 설정에 저장하지 않고 다음 runtime 영역의 drop-in으로 적용했다.
+
+```text
+/run/systemd/system
+```
+
+실험 종료 후 drop-in을 제거하고:
+
+```text
+production_execstart=PASS
+```
+
+로 production 설정이 정상 복구된 것을 확인했다.
+
+### 실제 Queue WARNING 자동 탐지
+
+Backend를 pause하고 실제 2,000 spans를 전송했다.
+
+Sender:
+
+```text
+Accepted spans=2000
+Failed requests=0
+Observed accepted spans/sec=999.87
+Rate error=0.013%
+Delivery success=PASS
+Sustained-rate validity=PASS
+```
+
+Queue:
+
+```text
+queue_size=2000
+queue_capacity=200000
+utilization=1.00%
+```
+
+Production checker는 기존 50%/80% 기준을 유지해:
+
+```text
+status=OK
+```
+
+이었다.
+
+반면 테스트 threshold가 적용된 systemd timer 경로에서는 자동으로:
+
+```text
+OK
+→ WARNING
+
+event=ALERT
+alert_required=true
+```
+
+가 발생했다.
+
+동일 WARNING 상태가 반복돼도:
+
+```text
+warning_alert_count=1
+```
+
+로 중복 alert를 억제했다.
+
+Backend 복구 후:
+
+```text
+WARNING
+→ OK
+
+event=RECOVERY
+```
+
+가 자동 발생했고 DB에는:
+
+```text
+2000/2000
+```
+
+이 저장됐다.
+
+### 실제 WARNING → CRITICAL 승격 검증
+
+두 번째 실험에서도 실제 2,000 spans backlog를 사용했다.
+
+Sender:
+
+```text
+Accepted spans=2000
+Failed requests=0
+Observed accepted spans/sec=999.91
+Rate error=0.009%
+Delivery success=PASS
+Sustained-rate validity=PASS
+```
+
+먼저 다음 자동 전이를 확인했다.
+
+```text
+OK
+→ WARNING
+
+event=ALERT
+```
+
+Backend를 계속 pause한 상태에서 실제 queue는 그대로 두고 test severity 기준만 변경했다.
+
+그 결과:
+
+```text
+WARNING
+→ CRITICAL
+
+event=STATUS_CHANGE
+alert_required=true
+checker_exit_code=2
+```
+
+가 systemd timer를 통해 자동 생성됐다.
+
+Event count:
+
+```text
+ALERT=1
+STATUS_CHANGE=1
+```
+
+이었다.
+
+Backend 복구 후 queue는 다음과 같이 drain됐다.
+
+```text
+1000
+1000
+0
+```
+
+그리고:
+
+```text
+CRITICAL
+→ OK
+
+event=RECOVERY
+```
+
+가 자동 발생했다.
+
+최종:
+
+```text
+RECOVERY=1
+DB=2000/2000
+queue_size=0
+current_status=OK
+timer_enabled=enabled
+timer_active=active
+production_execstart=PASS
+```
+
+을 확인했다.
+
+### 직접 경험한 실무 영역
+
+이번 단계에서 다음 운영 문제를 직접 다뤘다.
+
+```text
+production configuration과 test configuration 격리
+systemd runtime drop-in
+실제 metric 기반 severity transition
+WARNING과 CRITICAL의 운영 의미 분리
+alert storm 방지
+severity escalation
+recovery lifecycle
+실험 후 production 설정 복원 검증
+queue drain 관찰
+telemetry 최종 DB 정합성 검증
+```
+
+단순 unit test가 아니라 실제 다음 전체 경로에서 상태 전이를 검증했다.
+
+```text
+OTLP sender
+→ OpenTelemetry Collector
+→ persistent queue
+→ Collector metrics
+→ queue checker
+→ alert evaluator
+→ systemd timer
+→ journal
+→ Backend
+→ TimescaleDB
+```
+
+### 이력서 성과 문장 초안
+
+- OpenTelemetry Collector의 실제 persistent queue metric을 기반으로 `OK → WARNING → CRITICAL → RECOVERY` 상태 머신을 구축하고, systemd 5초 polling 환경에서 ALERT·severity escalation·RECOVERY가 각각 1회 발생하며 동일 상태의 중복 alert가 억제되는 것을 E2E 검증
+- Production 50%/80% queue threshold를 변경하지 않고 systemd runtime-only drop-in과 checker argument 전달 구조를 적용해 작은 실제 backlog로 alert severity 전이를 안전하게 재현하고, 테스트 종료 후 production 설정 복원 및 span 2,000/2,000 최종 저장을 검증
+
+### 면접에서 설명할 포인트
+
+```text
+왜 실제 100k/160k backlog를 다시 만들지 않았는가?
+Production threshold를 직접 낮추지 않은 이유는?
+왜 /etc가 아니라 /run의 systemd drop-in을 사용했는가?
+ExecStart override에서 빈 ExecStart=가 필요한 이유는?
+WARNING과 CRITICAL을 boolean failure 하나로 처리하지 않은 이유는?
+WARNING → CRITICAL은 왜 ALERT가 아니라 STATUS_CHANGE인가?
+동일 WARNING의 alert storm은 어떻게 방지했는가?
+테스트 설정이 production에 남지 않았다는 것을 어떻게 증명했는가?
+왜 sender 성공뿐 아니라 DB 2000/2000까지 확인했는가?
+Queue가 1000 → 1000 → 0으로 보인 것은 무엇을 의미하는가?
+```
+
+### 보존할 로그와 증거
+
+WARNING 실험:
+
+```text
+queue_size=2000
+queue_utilization_pct=1.00
+
+event=ALERT
+previous_status=OK
+current_status=WARNING
+
+warning_alert_count=1
+
+event=RECOVERY
+previous_status=WARNING
+current_status=OK
+
+db=2000/2000
+```
+
+CRITICAL 승격 실험:
+
+```text
+event=ALERT
+previous_status=OK
+current_status=WARNING
+
+event=STATUS_CHANGE
+previous_status=WARNING
+current_status=CRITICAL
+
+alert_count=1
+status_change_count=1
+
+queue drain:
+1000
+1000
+0
+
+event=RECOVERY
+previous_status=CRITICAL
+current_status=OK
+
+recovery_count=1
+db=2000/2000
+```
+
+최종 운영 상태:
+
+```text
+production_execstart=PASS
+queue_size=0
+current_status=OK
+timer_enabled=enabled
+timer_active=active
+```
+
+### 이번 단계에서 설명할 수 있어야 하는 핵심
+
+- Production threshold와 alert state machine 테스트 조건을 왜 분리했는가?
+- `--checker-arg`는 evaluator와 checker 사이에서 어떤 역할을 하는가?
+- 왜 테스트 설정을 `/run/systemd/system`에 두었는가?
+- WARNING 반복과 WARNING → CRITICAL 전환은 운영적으로 무엇이 다른가?
+- 왜 CRITICAL에서 바로 OK가 됐을 때도 RECOVERY 하나로 처리하는가?
+- queue alert 테스트에서 DB 최종 저장량까지 확인한 이유는 무엇인가?
+
+### 한 단계 높은 다음 과제
+
+현재 AeroTrace는 장애 상태를 자동 판단하고 systemd journal에 이벤트를 생성할 수 있다.
+
+다음 단계에서는 판단 로직과 전달 로직을 분리한 notification adapter를 추가해:
+
+```text
+ALERT
+STATUS_CHANGE
+RECOVERY
+```
+
+이벤트를 실제 운영자에게 전달하는 경로를 구성한다.
+
+Notification 전송 실패가 Collector queue monitoring 자체를 막지 않도록 timeout, retry, duplicate notification 정책을 별도로 설계한다.

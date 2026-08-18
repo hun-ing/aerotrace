@@ -89,6 +89,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--checker-arg",
+        action="append",
+        default=[],
+        help=(
+            "Additional argument passed to the queue checker. "
+            "May be specified multiple times."
+        ),
+    )
+
+    parser.add_argument(
         "--quiet-no-event",
         action="store_true",
         help=(
@@ -178,6 +188,7 @@ def write_state(
 
 def run_checker(
     checker_path: Path,
+    checker_args: list[str],
     timeout_sec: float,
 ) -> tuple[
     str,
@@ -187,7 +198,10 @@ def run_checker(
 ]:
     try:
         result = subprocess.run(
-            [str(checker_path)],
+            [
+                str(checker_path),
+                *checker_args,
+            ],
             capture_output=True,
             text=True,
             timeout=timeout_sec,
@@ -357,6 +371,7 @@ def main() -> int:
         checker_stderr,
     ) = run_checker(
         args.checker_path,
+        args.checker_arg,
         args.checker_timeout_sec,
     )
 

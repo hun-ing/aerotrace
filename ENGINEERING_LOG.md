@@ -9053,3 +9053,510 @@ OK
 대규모 100k/160k backlog를 다시 생성하지 않고 테스트용 threshold를 안전하게 전달할 수 있는 구조를 먼저 만든다.
 
 이후 외부 notification adapter를 연결한다.
+
+---
+
+## Collector Queue WARNING / CRITICAL / RECOVERY 자동 전이 E2E 검증
+
+### 목적
+
+Collector process 자체 장애에 대한 UNKNOWN 자동 탐지 검증 이후 실제 persistent queue backlog를 이용해 다음 severity state transition 전체를 systemd timer 자동 실행 경로에서 검증했다.
+
+```text
+OK
+→ WARNING
+→ CRITICAL
+→ RECOVERY
+```
+
+대규모 production threshold backlog를 반복 생성하지 않기 위해 production configuration은 그대로 유지하면서 runtime-only test threshold를 사용했다.
+
+### Evaluator Checker Argument 전달 기능
+
+수정 파일:
+
+```text
+scripts/evaluate-collector-queue-alert.py
+```
+
+반복 지정 가능한 옵션을 추가했다.
+
+```text
+--checker-arg
+```
+
+특징:
+
+```text
+action=append
+여러 번 지정 가능
+checker subprocess argv에 순서대로 전달
+```
+
+기존 evaluator 실행 호환성 테스트:
+
+```text
+event=NONE
+alert_required=false
+previous_status=NONE
+current_status=OK
+checker_exit_code=0
+base_rc=0
+```
+
+통과.
+
+Test threshold 전달:
+
+```text
+--checker-arg=--warn-ratio
+--checker-arg=0.001
+--checker-arg=--critical-ratio
+--checker-arg=0.005
+```
+
+queue=0 상태에서:
+
+```text
+current_status=OK
+checker_exit_code=0
+arg_rc=0
+```
+
+을 확인했다.
+
+잘못된 threshold:
+
+```text
+warn=0.9
+critical=0.8
+```
+
+전달 시 checker:
+
+```text
+checker_exit_code=3
+checker_stderr=UNKNOWN: warning ratio must be lower than critical ratio.
+```
+
+Evaluator:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=NONE
+current_status=UNKNOWN
+bad_rc=0
+```
+
+으로 동작했다.
+
+즉 checker configuration failure는 monitoring 상태 UNKNOWN으로 변환되고 evaluator 자체 evaluation은 정상 완료된다.
+
+### Production 설정과 테스트 설정 분리
+
+Production checker는 기존 값을 유지했다.
+
+```text
+WARNING=50%
+CRITICAL=80%
+```
+
+테스트에만 다음 runtime systemd drop-in을 사용했다.
+
+```text
+/run/systemd/system/
+aerotrace-collector-queue-alert.service.d/
+10-test-thresholds.conf
+```
+
+테스트 종료 후 파일과 directory를 제거하고:
+
+```text
+systemctl daemon-reload
+```
+
+를 실행했다.
+
+최종:
+
+```text
+production_execstart=PASS
+```
+
+로 production ExecStart에 `--checker-arg`가 남아 있지 않음을 확인했다.
+
+---
+
+### WARNING E2E 테스트
+
+초기 상태:
+
+```text
+current_status=OK
+queue_size=0
+backend=running
+backend=healthy
+timer=enabled
+timer=active
+```
+
+Test threshold:
+
+```text
+WARNING=0.5%
+CRITICAL=2%
+```
+
+Backend를 pause했다.
+
+```text
+running=true
+paused=true
+status=paused
+```
+
+실제 telemetry 2,000 spans를 전송했다.
+
+Sender 결과:
+
+```text
+Requested spans: 2000
+Accepted spans: 2000
+Requested requests: 40
+Accepted requests: 40
+Failed requests: 0
+
+Actual elapsed sec: 2.000266
+Target spans/sec: 1000
+Observed accepted spans/sec: 999.87
+Rate error pct: 0.013
+
+Backpressure wait total ms: 0.000
+Producer backpressure events: 0
+
+Delivery success: PASS
+Sustained-rate validity: PASS
+```
+
+Collector queue:
+
+```text
+status=OK
+queue_size=2000
+queue_capacity=200000
+queue_utilization_pct=1.00
+queue_remaining_items=198000
+full_outage_headroom_sec=60.92
+in_flight=2
+accepted_spans=2000
+refused_spans=0
+```
+
+Production checker는 50%/80% default를 사용하므로:
+
+```text
+status=OK
+```
+
+이었다.
+
+Systemd evaluator는 runtime threshold를 사용해 자동으로 다음 이벤트를 생성했다.
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=WARNING
+checker_exit_code=1
+queue_size=2000
+queue_utilization_pct=1.00
+```
+
+동일 WARNING 상태의 반복 평가 후:
+
+```text
+warning_alert_count=1
+```
+
+로 alert storm이 발생하지 않았다.
+
+Backend를 unpause한 뒤 health는 다음 순서로 회복했다.
+
+```text
+unhealthy
+unhealthy
+unhealthy
+healthy
+```
+
+Collector queue는 복구 후 첫 확인에서:
+
+```text
+queue=0
+```
+
+으로 drain 완료됐다.
+
+Systemd evaluator는 자동으로 다음 recovery를 생성했다.
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=WARNING
+current_status=OK
+checker_exit_code=0
+```
+
+DB 저장 결과:
+
+```text
+2000/2000
+```
+
+테스트 runtime override 제거 후 최종 상태:
+
+```text
+current_status=OK
+queue_size=0
+timer_enabled=enabled
+timer_active=active
+db=2000/2000
+```
+
+---
+
+### WARNING → CRITICAL E2E 테스트
+
+두 번째 실험에서도 동일한 실제 backlog 크기를 사용했다.
+
+초기 test threshold:
+
+```text
+WARNING=0.5%
+CRITICAL=2%
+```
+
+Backend를 pause한 뒤 실제 2,000 spans를 전송했다.
+
+Sender:
+
+```text
+Requested spans: 2000
+Accepted spans: 2000
+Requested requests: 40
+Accepted requests: 40
+Failed requests: 0
+
+Actual elapsed sec: 2.000172
+Observed accepted spans/sec: 999.91
+Rate error pct: 0.009
+
+Backpressure wait total ms: 0.000
+Producer backpressure events: 0
+
+Delivery success: PASS
+Sustained-rate validity: PASS
+```
+
+Collector:
+
+```text
+queue_size=2000
+queue_capacity=200000
+queue_utilization_pct=1.00
+queue_remaining_items=198000
+in_flight=2
+```
+
+Systemd가 자동 WARNING을 생성했다.
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=WARNING
+checker_exit_code=1
+queue_size=2000
+queue_utilization_pct=1.00
+```
+
+Backend를 pause 상태로 유지해 queue를 2,000으로 유지한 뒤 runtime threshold만 다음 값으로 변경했다.
+
+```text
+WARNING=0.1%
+CRITICAL=0.5%
+```
+
+동일한 실제 queue metric에 대해 systemd evaluator가 다음 severity escalation을 자동 생성했다.
+
+```text
+event=STATUS_CHANGE
+alert_required=true
+previous_status=WARNING
+current_status=CRITICAL
+checker_exit_code=2
+queue_size=2000
+queue_utilization_pct=1.00
+```
+
+이벤트 count:
+
+```text
+alert_count=1
+status_change_count=1
+```
+
+따라서 동일 상태의 반복 ALERT가 아니라 실제 severity 변화에 대해 별도의 STATUS_CHANGE가 발생함을 확인했다.
+
+### CRITICAL Recovery
+
+Backend를 unpause했다.
+
+Backend health:
+
+```text
+unhealthy
+unhealthy
+unhealthy
+healthy
+```
+
+Collector queue drain 과정:
+
+```text
+1000
+1000
+0
+```
+
+Systemd evaluator는 queue가 정상화된 뒤 자동으로 다음 이벤트를 생성했다.
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=CRITICAL
+current_status=OK
+checker_exit_code=0
+```
+
+Recovery count:
+
+```text
+recovery_count=1
+```
+
+DB 저장 결과:
+
+```text
+2000/2000
+```
+
+### 최종 운영 상태
+
+Runtime test override 제거 후:
+
+```text
+production_execstart=PASS
+```
+
+최종 Collector 상태:
+
+```text
+status=OK
+queue_size=0
+queue_capacity=200000
+queue_utilization_pct=0.00
+queue_remaining_items=200000
+full_outage_headroom_sec=61.54
+in_flight=0
+```
+
+Collector process lifecycle 누적 metric:
+
+```text
+sent_spans=4000
+accepted_spans=4000
+refused_spans=0
+```
+
+이번 WARNING/CRITICAL 실험 두 번에서 각각 2,000 spans를 전송한 결과와 일치한다.
+
+Alert state:
+
+```text
+current_status=OK
+```
+
+Scheduler:
+
+```text
+timer_enabled=enabled
+timer_active=active
+```
+
+### 검증된 자동 상태 머신
+
+실제 Collector queue metric 기준:
+
+```text
+OK
+    ↓ queue threshold 초과
+WARNING
+    ↓ severity 상승
+CRITICAL
+    ↓ queue drain
+OK
+```
+
+Evaluator event:
+
+```text
+OK → WARNING
+ALERT
+
+WARNING → CRITICAL
+STATUS_CHANGE
+
+CRITICAL → OK
+RECOVERY
+```
+
+각 event:
+
+```text
+ALERT=1
+STATUS_CHANGE=1
+RECOVERY=1
+```
+
+로 검증됐다.
+
+### 실무적 교훈
+
+- Alert state machine 테스트와 production threshold 설정 변경은 분리해야 한다.
+- `/run/systemd/system` drop-in을 사용하면 reboot-persistent production configuration을 오염시키지 않고 실제 scheduler 경로를 테스트할 수 있다.
+- systemd `ExecStart`를 override할 때 기존 명령을 먼저 빈 `ExecStart=`로 초기화해야 한다.
+- Unit override 테스트 후 production configuration 복원 여부까지 검증해야 실험이 완료된 것이다.
+- 동일 metric에서도 threshold 변화에 따라 severity가 상승할 수 있으므로 단순 non-OK boolean보다 WARNING과 CRITICAL 상태를 구분할 가치가 있다.
+- WARNING 반복과 WARNING → CRITICAL 승격은 서로 다른 운영 의미를 가지므로 `ALERT`와 `STATUS_CHANGE`를 분리하는 것이 유용하다.
+- Recovery 시 직전 상태를 보존하면 WARNING 장애였는지 CRITICAL 장애였는지 전체 lifecycle을 설명할 수 있다.
+- Sender 성공, queue metric, alert event, DB 최종 저장량을 함께 확인해야 monitoring 테스트 과정에서 telemetry data loss가 발생하지 않았음을 검증할 수 있다.
+
+### 남은 범위
+
+현재 alert event는 systemd journal까지 자동 생성된다.
+
+아직 실제 운영자에게 전달되는 외부 notification channel은 연결하지 않았다.
+
+다음 단계에서는:
+
+```text
+alert_required=true
+```
+
+인 이벤트를 notification adapter가 받아 외부 채널로 전달하도록 한다.
+
+Evaluator의 상태 판단 로직과 notification transport는 분리한다.
+
+Notification 실패가 Collector queue monitoring 자체를 방해하지 않도록 timeout, retry, duplicate notification 정책도 별도로 설계한다.

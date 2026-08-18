@@ -3748,3 +3748,382 @@ alert_required=true
 - systemd service 실행 시간이 5초에 근접
 - 온프레미스에서 systemd가 없는 환경 지원
 - monitoring stack 도입으로 별도 alert engine을 사용하게 되는 경우
+
+---
+
+## Collector Queue Alert Threshold 전달 및 실제 Severity 전이 검증
+
+### 해결하려는 문제
+
+Collector queue checker는 production 운영 기준으로 다음 threshold를 사용한다.
+
+```text
+WARNING  = 50%
+CRITICAL = 80%
+```
+
+queue capacity가 200,000이므로 실제 production threshold를 그대로 사용해 WARNING과 CRITICAL을 재현하려면 각각 약 다음 backlog가 필요하다.
+
+```text
+WARNING  = 100,000 items
+CRITICAL = 160,000 items
+```
+
+이미 persistent queue capacity 및 saturation 실험을 통해 대규모 backlog 동작을 검증했기 때문에 alert state machine 검증만을 위해 같은 규모의 telemetry를 반복 생성하는 것은 불필요하다.
+
+또한 테스트를 위해 repository의 production threshold 자체를 변경하면 테스트 설정이 실수로 운영 환경에 남을 위험이 있다.
+
+### 선택한 방식
+
+Evaluator에 반복 지정 가능한 옵션을 추가했다.
+
+```text
+--checker-arg
+```
+
+이 옵션을 통해 필요한 경우에만 queue checker에 argument를 전달한다.
+
+예:
+
+```text
+evaluate-collector-queue-alert.py
+  --checker-arg=--warn-ratio
+  --checker-arg=0.005
+  --checker-arg=--critical-ratio
+  --checker-arg=0.02
+```
+
+Evaluator는 checker를 shell command 문자열로 조합하지 않고 subprocess argument list로 실행한다.
+
+따라서 전달된 값은 별도의 argv 항목으로 checker에 전달된다.
+
+Production systemd unit에는 `--checker-arg`를 추가하지 않는다.
+
+기본 운영 실행은 기존 checker default를 그대로 사용한다.
+
+```text
+WARNING  = 0.50
+CRITICAL = 0.80
+```
+
+### Checker Argument 전달 검증
+
+기존 evaluator 실행은 변경 후에도 정상 동작했다.
+
+```text
+event=NONE
+current_status=OK
+checker_exit_code=0
+base_rc=0
+```
+
+테스트 threshold를 전달한 경우에도 queue가 0이면 정상적으로 OK를 유지했다.
+
+```text
+current_status=OK
+checker_exit_code=0
+arg_rc=0
+```
+
+잘못된 threshold:
+
+```text
+warn=0.9
+critical=0.8
+```
+
+를 전달하면 checker는 다음과 같이 실패했다.
+
+```text
+checker_exit_code=3
+checker_stderr=UNKNOWN: warning ratio must be lower than critical ratio.
+```
+
+Evaluator는 이를 운영 상태 UNKNOWN으로 변환했다.
+
+```text
+event=ALERT
+alert_required=true
+current_status=UNKNOWN
+```
+
+Evaluator 자체 실행은 정상적으로 evaluation을 완료했으므로:
+
+```text
+bad_rc=0
+```
+
+을 반환했다.
+
+즉 checker 오류와 evaluator 자체 실행 오류를 분리해서 처리한다.
+
+### 테스트 설정 적용 방식
+
+실제 systemd timer 자동 실행 경로까지 검증하기 위해 repository 또는 `/etc/systemd/system`의 production unit을 수정하지 않았다.
+
+대신 다음 runtime-only drop-in을 사용했다.
+
+```text
+/run/systemd/system/
+aerotrace-collector-queue-alert.service.d/
+10-test-thresholds.conf
+```
+
+systemd에서 기존 `ExecStart`를 override하기 위해 다음 구조를 사용했다.
+
+```text
+ExecStart=
+ExecStart=<test command>
+```
+
+첫 번째 빈 `ExecStart=`로 기존 명령을 초기화한 뒤 테스트용 명령을 등록한다.
+
+테스트가 끝난 뒤 runtime drop-in을 삭제하고:
+
+```text
+systemctl daemon-reload
+```
+
+를 수행했다.
+
+최종 확인:
+
+```text
+production_execstart=PASS
+```
+
+를 통해 production service에 테스트용 `--checker-arg`가 남지 않았음을 확인했다.
+
+### 실제 WARNING 자동 탐지
+
+실제 backlog는 2,000 spans를 사용했다.
+
+```text
+queue capacity = 200,000
+queue size     = 2,000
+utilization    = 1.00%
+```
+
+첫 번째 테스트 threshold:
+
+```text
+WARNING  = 0.5%
+CRITICAL = 2.0%
+```
+
+이 기준에서 1% queue는 WARNING이다.
+
+Backend를 pause하고 실제 2,000 spans를 Collector로 전송했다.
+
+Sender 결과:
+
+```text
+Requested spans: 2000
+Accepted spans: 2000
+Failed requests: 0
+Observed accepted spans/sec: 999.87
+Rate error pct: 0.013
+Delivery success: PASS
+Sustained-rate validity: PASS
+```
+
+Collector queue:
+
+```text
+queue_size=2000
+queue_capacity=200000
+queue_utilization_pct=1.00
+```
+
+Production checker를 직접 실행하면 기존 50%/80% threshold가 그대로 적용되므로:
+
+```text
+status=OK
+```
+
+이었다.
+
+반면 runtime-only test threshold를 사용하는 systemd evaluator는 자동으로 다음 이벤트를 생성했다.
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=WARNING
+checker_exit_code=1
+queue_size=2000
+queue_utilization_pct=1.00
+```
+
+동일 WARNING 상태가 유지되는 동안:
+
+```text
+warning_alert_count=1
+```
+
+로 중복 ALERT가 억제됐다.
+
+Backend 복구 후 queue가 0으로 drain되자 다음 이벤트가 자동 생성됐다.
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=WARNING
+current_status=OK
+checker_exit_code=0
+```
+
+테스트 span은 DB에 모두 저장됐다.
+
+```text
+2000 / 2000
+```
+
+### 실제 WARNING → CRITICAL 승격 검증
+
+두 번째 실험에서도 실제 2,000 spans backlog를 사용했다.
+
+Sender 결과:
+
+```text
+Requested spans: 2000
+Accepted spans: 2000
+Failed requests: 0
+Observed accepted spans/sec: 999.91
+Rate error pct: 0.009
+Delivery success: PASS
+Sustained-rate validity: PASS
+```
+
+Collector queue:
+
+```text
+queue_size=2000
+queue_utilization_pct=1.00
+```
+
+첫 번째 테스트 threshold:
+
+```text
+WARNING  = 0.5%
+CRITICAL = 2.0%
+```
+
+에서 systemd evaluator가 자동으로:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=WARNING
+checker_exit_code=1
+```
+
+을 생성했다.
+
+Backend를 pause 상태로 유지해 실제 queue를 그대로 둔 뒤 threshold만 다음과 같이 변경했다.
+
+```text
+WARNING  = 0.1%
+CRITICAL = 0.5%
+```
+
+동일한 1% queue가 이제 CRITICAL 조건을 만족하면서 systemd evaluator는 자동으로 다음 상태 전이를 감지했다.
+
+```text
+event=STATUS_CHANGE
+alert_required=true
+previous_status=WARNING
+current_status=CRITICAL
+checker_exit_code=2
+queue_size=2000
+queue_utilization_pct=1.00
+```
+
+이벤트 수는 다음과 같았다.
+
+```text
+alert_count=1
+status_change_count=1
+```
+
+따라서 동일 WARNING 반복과 WARNING → CRITICAL severity 상승을 서로 다른 운영 이벤트로 구분할 수 있음을 확인했다.
+
+### CRITICAL Recovery 검증
+
+Backend를 unpause한 뒤 queue는 다음과 같이 drain됐다.
+
+```text
+1000
+1000
+0
+```
+
+systemd evaluator는 queue가 0으로 복구된 것을 자동 감지했다.
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=CRITICAL
+current_status=OK
+checker_exit_code=0
+```
+
+최종 결과:
+
+```text
+recovery_count=1
+db=2000/2000
+queue_size=0
+current_status=OK
+timer_enabled=enabled
+timer_active=active
+```
+
+### 최종 결정
+
+Production threshold는 기존 운영 초기값을 유지한다.
+
+```text
+WARNING  = 50%
+CRITICAL = 80%
+```
+
+`--checker-arg`는 테스트나 명시적인 deployment adapter에서 checker option을 전달해야 할 때 사용할 수 있는 범용 실행 기능으로 제공한다.
+
+운영 기본 systemd unit에는 테스트 threshold를 포함하지 않는다.
+
+실제 Collector queue metric을 이용해 다음 severity state machine 전체를 검증했다.
+
+```text
+OK
+→ WARNING
+→ CRITICAL
+→ OK
+```
+
+각 상태 전이에 대응하는 이벤트는 다음과 같다.
+
+```text
+OK → WARNING
+= ALERT
+
+WARNING → CRITICAL
+= STATUS_CHANGE
+
+CRITICAL → OK
+= RECOVERY
+```
+
+### 재검토 조건
+
+다음 상황에서 production threshold를 재검토한다.
+
+- 실제 production ingest rate가 현재 기준에서 크게 변하는 경우
+- persistent queue capacity를 변경하는 경우
+- 실제 장애 대응 시간을 측정한 경우
+- WARNING 시점이 운영자가 대응하기에 너무 늦거나 너무 빠른 경우
+- queue drain 속도와 ingest rate를 함께 고려한 동적 headroom 판단이 필요한 경우
+- tenant별 workload 특성이 크게 달라지는 경우
+
+현재 50%/80% 값은 운영 초기 기준이며 실제 사용자 workload와 장애 대응 데이터를 수집한 뒤 조정한다.
