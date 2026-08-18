@@ -7,6 +7,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 VALID_EVENTS = {
@@ -48,6 +49,36 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Directory containing successful delivery receipts. "
             "--delivered-dir is retained as a compatibility alias."
+        ),
+    )
+
+    parser.add_argument(
+        "--transport",
+        choices=("local-file", "webhook"),
+        default="local-file",
+        help=(
+            "Notification transport. "
+            "Defaults to local-file."
+        ),
+    )
+
+    parser.add_argument(
+        "--webhook-url",
+        default=None,
+        help=(
+            "Webhook URL for local/manual testing. "
+            "For deployment, prefer the "
+            "AEROTRACE_WEBHOOK_URL environment variable."
+        ),
+    )
+
+    parser.add_argument(
+        "--webhook-timeout-sec",
+        type=float,
+        default=5.0,
+        help=(
+            "Webhook request timeout in seconds. "
+            "Defaults to 5."
         ),
     )
 
@@ -217,13 +248,14 @@ def utc_now_iso() -> str:
 
 def build_delivery_receipt(
     payload: dict[str, Any],
+    transport: str,
 ) -> dict[str, Any]:
     event_id = payload["event_id"]
 
     return {
         "receipt_schema_version": 1,
         "event_id": event_id,
-        "transport": "local-file",
+        "transport": transport,
         "delivered_at": utc_now_iso(),
         "event": payload,
     }
@@ -233,6 +265,7 @@ def validate_delivery_receipt(
     path: Path,
     receipt: dict[str, Any],
     payload: dict[str, Any],
+    expected_transport: str,
 ) -> None:
     if receipt.get(
         "receipt_schema_version"
@@ -248,7 +281,7 @@ def validate_delivery_receipt(
             f"{path}: receipt event_id mismatch"
         )
 
-    if receipt.get("transport") != "local-file":
+    if receipt.get("transport") != expected_transport:
         raise ValueError(
             f"{path}: unexpected receipt transport"
         )
@@ -296,6 +329,7 @@ def deliver_to_local_sink(
             receipt_path,
             receipt,
             payload,
+            expected_transport="local-file",
         )
 
         pending_path.unlink()
@@ -306,7 +340,8 @@ def deliver_to_local_sink(
         return "ACK_EXISTING"
 
     receipt = build_delivery_receipt(
-        payload
+        payload,
+        transport="local-file",
     )
 
     temporary_path = (
@@ -360,6 +395,66 @@ def deliver_to_local_sink(
     return "DELIVERED"
 
 
+def resolve_webhook_url(
+    cli_url: str | None,
+) -> str | None:
+    if cli_url is not None:
+        value = cli_url.strip()
+
+        if value:
+            return value
+
+    environment_value = os.environ.get(
+        "AEROTRACE_WEBHOOK_URL"
+    )
+
+    if environment_value is None:
+        return None
+
+    value = environment_value.strip()
+
+    return value or None
+
+
+def validate_webhook_url(
+    url: str,
+) -> None:
+    try:
+        parsed = urlsplit(
+            url
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "webhook URL is invalid"
+        ) from exc
+
+    if parsed.scheme not in {
+        "http",
+        "https",
+    }:
+        raise ValueError(
+            "webhook URL scheme must be http or https"
+        )
+
+    if parsed.hostname is None:
+        raise ValueError(
+            "webhook URL must include a host"
+        )
+
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError(
+            "webhook URL must not contain userinfo credentials"
+        )
+
+    if parsed.fragment:
+        raise ValueError(
+            "webhook URL must not contain a fragment"
+        )
+
+
 def count_pending(
     outbox_dir: Path,
 ) -> int:
@@ -380,6 +475,59 @@ def main() -> int:
         print(
             "adapter_error="
             "--max-events must be > 0",
+            file=sys.stderr,
+        )
+        return 4
+
+    if args.webhook_timeout_sec <= 0:
+        print(
+            "adapter_error="
+            "--webhook-timeout-sec must be > 0",
+            file=sys.stderr,
+        )
+        return 4
+
+    webhook_url = None
+
+    if args.transport == "local-file":
+        if args.webhook_url is not None:
+            print(
+                "adapter_error="
+                "--webhook-url requires "
+                "--transport webhook",
+                file=sys.stderr,
+            )
+            return 4
+    else:
+        webhook_url = resolve_webhook_url(
+            args.webhook_url
+        )
+
+        if webhook_url is None:
+            print(
+                "adapter_error="
+                "webhook URL is required via "
+                "--webhook-url or "
+                "AEROTRACE_WEBHOOK_URL",
+                file=sys.stderr,
+            )
+            return 4
+
+        try:
+            validate_webhook_url(
+                webhook_url
+            )
+        except ValueError as exc:
+            print(
+                f"adapter_error={exc}",
+                file=sys.stderr,
+            )
+            return 4
+
+        print(
+            "adapter_error="
+            "webhook transport is configured "
+            "but HTTP delivery is not implemented yet",
             file=sys.stderr,
         )
         return 4
