@@ -99,6 +99,26 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--output-format",
+        choices=("text", "json"),
+        default="text",
+        help=(
+            "Output format for a successfully evaluated event. "
+            "Defaults to text."
+        ),
+    )
+
+    parser.add_argument(
+        "--event-outbox-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Persist alert-required events as JSON files "
+            "before updating evaluator state."
+        ),
+    )
+
+    parser.add_argument(
         "--quiet-no-event",
         action="store_true",
         help=(
@@ -330,6 +350,93 @@ def print_checker_output(
     print("checker_output_end")
 
 
+def build_event_payload(
+    event_id: str,
+    event: str,
+    alert_required: bool,
+    previous_status: str | None,
+    current_status: str,
+    checker_exit_code: int | None,
+    state_file: Path,
+    evaluated_at: str,
+    checker_stdout: str,
+    checker_stderr: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "event_id": event_id,
+        "event": event,
+        "alert_required": alert_required,
+        "previous_status": previous_status,
+        "current_status": current_status,
+        "checker_exit_code": checker_exit_code,
+        "state_file": str(state_file),
+        "evaluated_at": evaluated_at,
+        "checker_output": {
+            "stdout": checker_stdout.rstrip(),
+            "stderr": checker_stderr.rstrip(),
+        },
+    }
+
+
+def write_event_outbox(
+    outbox_dir: Path,
+    payload: dict[str, object],
+) -> Path:
+    event_id = payload.get("event_id")
+
+    if not isinstance(event_id, str) or not event_id:
+        raise ValueError(
+            "event payload requires a non-empty event_id"
+        )
+
+    outbox_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    final_path = (
+        outbox_dir
+        / f"{event_id}.json"
+    )
+
+    temporary_path = (
+        outbox_dir
+        / f".{event_id}.tmp"
+    )
+
+    try:
+        with temporary_path.open(
+            "x",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                payload,
+                file,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+
+        temporary_path.replace(
+            final_path
+        )
+    except Exception:
+        try:
+            temporary_path.unlink(
+                missing_ok=True
+            )
+        except OSError:
+            pass
+
+        raise
+
+    return final_path
+
+
 def main() -> int:
     args = parse_args()
 
@@ -436,6 +543,40 @@ def main() -> int:
             now_epoch
         )
 
+    event_id = (
+        f"{time.time_ns()}-{os.getpid()}"
+    )
+
+    event_payload = build_event_payload(
+        event_id=event_id,
+        event=event,
+        alert_required=alert_required,
+        previous_status=previous_status,
+        current_status=current_status,
+        checker_exit_code=checker_exit_code,
+        state_file=args.state_file,
+        evaluated_at=now_iso,
+        checker_stdout=checker_stdout,
+        checker_stderr=checker_stderr,
+    )
+
+    if (
+        args.event_outbox_dir is not None
+        and alert_required
+    ):
+        try:
+            write_event_outbox(
+                args.event_outbox_dir,
+                event_payload,
+            )
+        except (OSError, ValueError) as exc:
+            print(
+                "evaluator_error="
+                f"event outbox write failed: {exc}",
+                file=sys.stderr,
+            )
+            return 4
+
     try:
         write_state(
             args.state_file,
@@ -449,6 +590,17 @@ def main() -> int:
         return 4
 
     if args.quiet_no_event and event == "NONE":
+        return 0
+
+    if args.output_format == "json":
+        print(
+            json.dumps(
+                event_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
         return 0
 
     previous_display = (

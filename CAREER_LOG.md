@@ -2917,3 +2917,388 @@ RECOVERY
 이벤트를 실제 운영자에게 전달하는 경로를 구성한다.
 
 Notification 전송 실패가 Collector queue monitoring 자체를 막지 않도록 timeout, retry, duplicate notification 정책을 별도로 설계한다.
+
+---
+
+### Portfolio Checkpoint — Durable Notification Pipeline과 Failure Isolation
+
+OpenTelemetry Collector의 queue 상태를 판단하는 monitoring 경로와 운영자 notification 전달 경로를 독립적으로 분리했다.
+
+### 해결한 문제
+
+기존에는 Collector 장애를 자동으로 감지해도 결과가 systemd journal에서 끝났다.
+
+외부 notification을 evaluator에 직접 넣으면 Slack, Discord 또는 webhook 장애가 monitoring 자체의 실행에 영향을 줄 수 있다.
+
+이를 방지하기 위해 다음 구조를 구현했다.
+
+```text
+Collector metrics
+→ queue checker
+→ alert evaluator
+→ durable JSON outbox
+→ independent notification adapter
+→ transport
+```
+
+### 직접 검증한 Event Contract
+
+Evaluator는 기존 text 출력을 유지하면서 opt-in JSON contract를 제공한다.
+
+```text
+schema_version
+event_id
+event
+alert_required
+previous_status
+current_status
+checker_exit_code
+evaluated_at
+checker_output
+```
+
+JSON contract:
+
+```text
+한 이벤트당 한 줄
+schema_version=1
+previous status 없음은 null
+boolean/int/null 타입 보존
+```
+
+을 자동 assertion으로 검증했다.
+
+### Alert Event 유실 방지
+
+Outbox를 evaluator state보다 먼저 저장하도록 구성했다.
+
+Outbox write를 의도적으로 실패시킨 결과:
+
+```text
+outbox_failure_rc=4
+state_after_outbox_failure=PASS_not_written
+```
+
+이었다.
+
+Outbox 경로 복구 후 동일 Collector 상태에서 최초 ALERT를 다시 생성할 수 있음을 확인했다.
+
+따라서 state만 진행되고 alert event가 사라지는 failure mode를 방지했다.
+
+### Notification Adapter Failure Semantics
+
+독립 notification adapter를 구현해:
+
+```text
+pending event
+→ delivery
+→ 성공 시 ACK
+→ 실패 시 pending 유지
+```
+
+로 동작하게 했다.
+
+정상:
+
+```text
+pending 1 → 0
+delivered 0 → 1
+DELIVERED
+```
+
+전송 실패:
+
+```text
+delivery_failure_rc=2
+pending=1
+```
+
+전송 복구:
+
+```text
+pending=0
+delivered=1
+DELIVERED
+```
+
+을 검증했다.
+
+### Crash Window 중복 처리
+
+전송은 성공했지만 pending ACK 전에 process가 종료되는 상황을 재현했다.
+
+동일 event_id가 이미 delivered돼 있는 경우:
+
+```text
+delivery_result=ACK_EXISTING
+```
+
+으로 처리해 중복 local delivery를 발생시키지 않았다.
+
+### 실제 systemd 자동 E2E
+
+Evaluator와 notification adapter를 별도 systemd timer로 실행했다.
+
+사람이 evaluator 또는 adapter를 수동 실행하지 않은 상태에서 Collector를 실제 중단했다.
+
+자동 경로:
+
+```text
+Collector stop
+→ OK → UNKNOWN
+→ ALERT
+→ outbox
+→ notification timer
+→ DELIVERED
+```
+
+실제 로그:
+
+```text
+event=ALERT
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+```
+
+Notification:
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+processed_events=1
+remaining_events=0
+```
+
+Collector를 다시 시작하자:
+
+```text
+UNKNOWN → OK
+→ RECOVERY
+→ outbox
+→ notification timer
+→ DELIVERED
+```
+
+까지 자동 실행됐다.
+
+최종:
+
+```text
+delivered_event_sequence=PASS
+final_pending=0
+final_delivered=2
+```
+
+### Notification 장애 격리 실험
+
+Notification transport만 의도적으로 실패시켰다.
+
+Collector 장애 발생 후:
+
+```text
+state=UNKNOWN
+pending=1
+```
+
+이 됐고 adapter journal에는:
+
+```text
+adapter_error=delivery failed
+failed_event_id=1787035511951348652-1520983
+remaining_events=1
+```
+
+이 기록됐다.
+
+동시에 evaluator는 계속 실행됐다.
+
+```text
+last_evaluated_at
+06:44:47
+→
+06:45:29
+
+evaluator_independent_from_notification=PASS
+```
+
+Timer 상태:
+
+```text
+evaluator_timer=active
+notification_timer=active
+```
+
+Evaluator service:
+
+```text
+Result=success
+ExecMainStatus=0
+```
+
+따라서 실제 systemd 환경에서:
+
+```text
+Notification 장애
+≠
+Collector monitoring 장애
+```
+
+를 검증했다.
+
+### 자동 Retry
+
+Notification transport를 복구한 뒤 adapter를 수동 실행하지 않았다.
+
+다음 timer trigger에서 기존 pending ALERT가 자동 처리됐다.
+
+```text
+pending=0
+delivered=3
+automatic_pending_retry=PASS
+```
+
+원래 event_id:
+
+```text
+1787035511951348652-1520983
+```
+
+가 그대로 전달됐다.
+
+Collector 복구 후 RECOVERY도 자동 전달됐다.
+
+```text
+delivered=4
+automatic_recovery_after_notification_failure=PASS
+failure_recovery_sequence=PASS
+```
+
+마지막 event lifecycle:
+
+```text
+ALERT
+OK → UNKNOWN
+
+RECOVERY
+UNKNOWN → OK
+```
+
+### 운영 환경 복구
+
+모든 notification systemd 설정은 `/run/systemd/system`의 runtime-only configuration으로 검증했다.
+
+실험 종료 후 모두 제거했다.
+
+```text
+production_evaluator=PASS
+notification_runtime_cleanup=PASS
+
+evaluator_timer_enabled=enabled
+evaluator_timer_active=active
+
+Collector running
+queue_size=0
+current_status=OK
+```
+
+### 이력서 성과 문장 초안
+
+- OpenTelemetry Collector 장애 감지와 notification 전달 경로를 JSON outbox 기반으로 분리하고, notification transport 장애 중에도 alert event를 pending 상태로 보존하면서 Collector 상태 평가 timer가 계속 실행되는 failure isolation 구조를 구현·E2E 검증
+- systemd 기반 독립 evaluator/notification timer를 구성해 실제 Collector 중단 시 `OK → UNKNOWN → ALERT`, 복구 시 `UNKNOWN → OK → RECOVERY`가 자동 전달되는 것을 검증하고, notification 실패 후 기존 event_id의 자동 retry와 최종 `pending=0` 복구를 확인
+- Notification 전송 성공 후 ACK 전 process crash를 가정한 중복 event 시나리오에서 event_id 기반 `ACK_EXISTING` 처리를 적용해 동일 local delivery의 중복 생성을 방지
+
+### 면접에서 설명할 수 있는 내용
+
+```text
+왜 evaluator가 Slack을 직접 호출하지 않게 설계했는가?
+
+왜 단순 stdout pipe 대신 durable outbox가 필요한가?
+
+왜 outbox를 evaluator state보다 먼저 저장하는가?
+
+Outbox 성공 후 state 저장 전에 crash하면 어떤 일이 생기는가?
+
+Delivery 성공 후 pending 삭제 전에 crash하면 어떻게 처리하는가?
+
+Notification adapter 장애가 evaluator에 전파되지 않는다는 것을 어떻게 검증했는가?
+
+같은 UNKNOWN 상태가 계속될 때 pending ALERT가 증가하지 않는 이유는 무엇인가?
+
+systemd timer의 Result=success만 보고 과거 실행 실패 여부를 판단하면 왜 위험한가?
+
+왜 local sink 테스트 이후 바로 Slack을 붙이지 않았는가?
+
+At-most-once와 at-least-once 중 현재 구조는 어느 쪽에 가까운가?
+```
+
+### 보존할 증거
+
+```text
+json_contract=PASS
+alert_json_contract=PASS
+
+stdout_outbox_match=PASS
+outbox_contract=PASS
+
+state_after_outbox_failure=PASS_not_written
+
+delivery_result=DELIVERED
+delivery_result=ACK_EXISTING
+
+delivery_failure_rc=2
+pending_after_delivery_failure=1
+
+automatic_alert_delivery=PASS
+automatic_recovery_delivery=PASS
+delivered_event_sequence=PASS
+
+evaluator_independent_from_notification=PASS
+
+pending_during_failure=1
+
+automatic_pending_retry=PASS
+retried_alert_contract=PASS
+
+automatic_recovery_after_notification_failure=PASS
+failure_recovery_sequence=PASS
+
+production_evaluator=PASS
+notification_runtime_cleanup=PASS
+```
+
+### 아직 과장하면 안 되는 부분
+
+현재 outbox는 process/systemd failure 경계에서 검증됐다.
+
+아직 다음까지 증명하지 않았다.
+
+```text
+abrupt host power loss 직전 outbox durability
+filesystem corruption
+disk full
+외부 webhook timeout 후 실제 수신 여부가 불명확한 상황
+Slack/Discord 등 provider 자체의 duplicate semantics
+```
+
+따라서 포트폴리오에서는 현재 구조를 “process/systemd notification failure isolation 및 retry 검증”으로 표현하고 “power-loss safe exactly-once notification”으로 표현하지 않는다.
+
+### 다음 한 단계 높은 과제
+
+실제 외부 notification transport를 연결하기 전에 다음 두 의미를 정리한다.
+
+```text
+Evaluator가 notification event를 발생시킨 시각
+외부 transport가 실제 delivery에 성공한 시각
+```
+
+현재 evaluator의:
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+는 실제 외부 delivery 시각이 아니므로 책임과 명칭을 재검토한다.
+
+그 다음 Generic Webhook / Slack / Discord 중 MVP transport를 선택하고 HTTP timeout, retry, ambiguous delivery, credential 관리까지 검증한다.

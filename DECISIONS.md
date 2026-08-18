@@ -4127,3 +4127,574 @@ CRITICAL → OK
 - tenant별 workload 특성이 크게 달라지는 경우
 
 현재 50%/80% 값은 운영 초기 기준이며 실제 사용자 workload와 장애 대응 데이터를 수집한 뒤 조정한다.
+
+---
+
+## Notification Event Contract와 Durable Outbox 기반 전달 경계
+
+### 해결하려는 문제
+
+Collector queue alert evaluator는 기존에 다음 운영 이벤트를 판단할 수 있었다.
+
+```text
+ALERT
+STATUS_CHANGE
+REMINDER
+RECOVERY
+```
+
+하지만 이벤트는 stdout과 systemd journal에만 출력됐다.
+
+외부 notification을 추가할 때 evaluator가 Slack, Discord 또는 HTTP webhook을 직접 호출하도록 만들면 다음 책임이 한 프로세스에 결합된다.
+
+```text
+Collector 상태 판단
+상태 전이 판단
+중복 alert 억제
+notification transport
+HTTP timeout
+transport retry
+외부 서비스 장애 처리
+```
+
+이 구조에서는 notification provider 장애가 Collector monitoring 자체에 영향을 줄 위험이 있다.
+
+또한 evaluator stdout을 notification process에 단순 pipe하는 경우 downstream process가 실패했을 때 notification event를 재처리할 durable source가 없다.
+
+### 선택한 구조
+
+Evaluator와 notification transport 사이에 JSON event contract와 filesystem outbox를 추가했다.
+
+```text
+check-collector-queue.py
+        ↓
+evaluate-collector-queue-alert.py
+        ↓
+JSON event contract
+        ↓
+persistent outbox
+        ↓
+process-notification-outbox.py
+        ↓
+notification transport
+```
+
+Evaluator의 책임:
+
+```text
+현재 queue 상태 판단
+상태 전이 판단
+ALERT / STATUS_CHANGE / REMINDER / RECOVERY 결정
+duplicate notification eligibility 억제
+notification event를 outbox에 handoff
+```
+
+Notification adapter의 책임:
+
+```text
+pending event 조회
+event contract 검증
+전송
+전송 실패 시 pending 유지
+성공 시 pending ACK
+중복 event_id 처리
+```
+
+외부 transport는 아직 연결하지 않았다.
+
+현재 adapter는 전달 의미와 실패 처리 검증을 위해 local filesystem sink를 사용한다.
+
+### Machine-readable Event Contract
+
+기존 사람이 읽는 text 출력은 기본값으로 유지했다.
+
+```text
+--output-format text
+```
+
+Notification consumer가 필요한 경우:
+
+```text
+--output-format json
+```
+
+을 명시한다.
+
+Schema version 1의 기본 구조:
+
+```json
+{
+  "schema_version": 1,
+  "event_id": "...",
+  "event": "ALERT",
+  "alert_required": true,
+  "previous_status": "OK",
+  "current_status": "UNKNOWN",
+  "checker_exit_code": 3,
+  "state_file": "...",
+  "evaluated_at": "...",
+  "checker_output": {
+    "stdout": "...",
+    "stderr": "..."
+  }
+}
+```
+
+JSON stdout은 한 이벤트당 정확히 한 줄이다.
+
+이전 상태가 없는 경우 text 표현:
+
+```text
+previous_status=NONE
+```
+
+과 달리 JSON contract에서는 실제 값:
+
+```json
+"previous_status": null
+```
+
+을 사용한다.
+
+### Event ID
+
+각 notification event에는 고유한:
+
+```text
+event_id
+```
+
+를 부여한다.
+
+현재 생성 방식:
+
+```text
+time.time_ns() + process id
+```
+
+event_id는 notification adapter가 동일 event를 식별하고 중복 ACK를 처리하기 위한 식별자다.
+
+### Outbox 저장 순서
+
+Notification이 필요한 event에서는 evaluator state보다 outbox를 먼저 저장한다.
+
+```text
+event 결정
+→ outbox 저장
+→ evaluator state 저장
+```
+
+이 순서를 선택한 이유는 반대 순서에서 발생할 수 있는 alert 유실 때문이다.
+
+잘못된 순서:
+
+```text
+state 저장
+→ outbox 저장 실패
+```
+
+이면 state는 이미 WARNING/UNKNOWN 등으로 진행했지만 최초 ALERT event는 저장되지 않을 수 있다.
+
+다음 cycle에서는 동일 상태이므로:
+
+```text
+UNKNOWN → UNKNOWN
+```
+
+이 되고 event가 `NONE`이 되어 최초 alert를 잃을 가능성이 있다.
+
+현재 방식에서는 outbox 저장에 실패하면 evaluator가:
+
+```text
+rc=4
+```
+
+로 종료하고 state를 갱신하지 않는다.
+
+실제 검증:
+
+```text
+evaluator_error=event outbox write failed: ...
+outbox_failure_rc=4
+state_after_outbox_failure=PASS_not_written
+```
+
+outbox 문제를 제거한 뒤 같은 상태를 다시 평가하면 ALERT를 다시 생성할 수 있음을 확인했다.
+
+### Notification Adapter Delivery Semantics
+
+새 adapter:
+
+```text
+scripts/process-notification-outbox.py
+```
+
+는 pending JSON event를 순서대로 처리한다.
+
+정상 전달:
+
+```text
+pending
+→ local sink fsync
+→ delivered directory fsync
+→ pending unlink
+→ outbox directory fsync
+```
+
+정상 결과:
+
+```text
+delivery_result=DELIVERED
+processed_events=1
+remaining_events=0
+```
+
+전송 완료 후 pending은 제거된다.
+
+### Crash Window 중복 처리
+
+다음 crash window를 고려했다.
+
+```text
+transport delivery 성공
+→ process crash
+→ pending ACK 수행 전 종료
+```
+
+동일 event_id가 delivered sink와 pending에 동시에 존재하는 상태를 인위적으로 만들었다.
+
+Adapter는 delivered payload가 동일하면 재전송하지 않고:
+
+```text
+delivery_result=ACK_EXISTING
+```
+
+으로 pending만 제거했다.
+
+검증:
+
+```text
+pending_before_ack_existing=1
+pending_after_ack_existing=0
+delivered_after_ack_existing=1
+```
+
+### Notification Failure Isolation
+
+Notification delivery 실패는 evaluator state를 rollback하지 않는다.
+
+실제 local adapter 테스트:
+
+```text
+adapter_error=delivery failed: ...
+delivery_failure_rc=2
+pending_after_delivery_failure=1
+```
+
+동시에 evaluator state:
+
+```text
+current_status=UNKNOWN
+```
+
+은 유지됐다.
+
+전송 경로를 복구한 뒤 adapter 재실행 시 기존 pending event가 정상 전달됐다.
+
+```text
+delivery_result=DELIVERED
+pending_after_retry=0
+delivered_after_retry=1
+```
+
+### systemd 실행 구조
+
+실제 운영 구조 검증을 위해 runtime-only systemd 환경에서 evaluator와 notification adapter를 별도 timer로 실행했다.
+
+```text
+aerotrace-collector-queue-alert.timer
+        ↓
+evaluator
+        ↓
+notification-outbox
+
+aerotrace-notification-outbox.timer
+        ↓
+notification adapter
+        ↓
+local delivery sink
+```
+
+두 timer 모두 약 5초 주기로 독립적으로 실행했다.
+
+정상 상태에서는:
+
+```text
+pending=0
+delivered=0
+```
+
+이며 evaluator의 `--quiet-no-event`와 adapter의 `--quiet-idle`을 사용해 systemd journal에 Python 정상 상태 로그가 반복되지 않도록 했다.
+
+### 실제 ALERT → RECOVERY 자동 E2E
+
+Collector를 실제 중단했다.
+
+```text
+running=false
+status=exited
+```
+
+Evaluator timer가 자동 감지:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+```
+
+Notification adapter timer가 자동 처리:
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+processed_events=1
+remaining_events=0
+```
+
+Collector를 다시 시작한 뒤 evaluator가:
+
+```text
+RECOVERY
+UNKNOWN → OK
+```
+
+를 자동 생성하고 adapter가 자동 전달했다.
+
+최종 delivered event sequence:
+
+```text
+1. ALERT
+   OK → UNKNOWN
+
+2. RECOVERY
+   UNKNOWN → OK
+```
+
+검증:
+
+```text
+delivered_event_sequence=PASS
+final_pending=0
+final_delivered=2
+```
+
+### systemd Notification 장애 격리 검증
+
+Notification delivery directory를 의도적으로 사용할 수 없는 path로 변경해 adapter만 실패시켰다.
+
+Collector를 중단하자 evaluator는 정상적으로:
+
+```text
+OK → UNKNOWN
+```
+
+을 감지했고 pending ALERT를 생성했다.
+
+```text
+state=UNKNOWN
+pending=1
+pending_alert_after_delivery_failure=PASS
+```
+
+Notification journal:
+
+```text
+adapter_error=delivery failed: [Errno 17] File exists: ...
+failed_event_id=1787035511951348652-1520983
+remaining_events=1
+```
+
+Notification failure 동안 evaluator는 계속 실행됐다.
+
+```text
+before_failure_evaluated=2026-08-18T06:44:47+00:00
+after_failure_evaluated=2026-08-18T06:45:29+00:00
+
+evaluator_independent_from_notification=PASS
+```
+
+동시에:
+
+```text
+pending_during_failure=1
+evaluator_timer=active
+notification_timer=active
+```
+
+였으며 evaluator 자체는:
+
+```text
+Result=success
+ExecMainStatus=0
+```
+
+을 유지했다.
+
+따라서 notification transport 장애와 monitoring 상태 평가가 독립적으로 동작함을 실제 systemd 환경에서 검증했다.
+
+### Notification 자동 재시도
+
+Notification failure override를 제거한 뒤 adapter를 사람이 직접 실행하지 않았다.
+
+다음 timer trigger에서 기존 pending ALERT가 자동 처리됐다.
+
+```text
+pending=0
+delivered=3
+automatic_pending_retry=PASS
+```
+
+재전송된 event:
+
+```text
+event=ALERT
+previous=OK
+current=UNKNOWN
+event_id=1787035511951348652-1520983
+```
+
+으로 원래 pending event와 동일했다.
+
+Collector 복구 후 RECOVERY도 자동 전달됐다.
+
+```text
+state=OK
+delivered=4
+
+automatic_recovery_after_notification_failure=PASS
+failure_recovery_sequence=PASS
+```
+
+최종 sequence:
+
+```text
+ALERT
+OK → UNKNOWN
+
+RECOVERY
+UNKNOWN → OK
+```
+
+### systemctl Result 해석
+
+Notification failure 실험 중 다음 조회가:
+
+```text
+Result=success
+ExecMainStatus=0
+```
+
+으로 보인 시점이 있었다.
+
+그러나 같은 실험 구간 journal에는 실제 delivery failure가 기록돼 있었다.
+
+이 notification service는 timer에 의해 반복 실행되는 oneshot unit이므로 `systemctl show`의 Result와 ExecMainStatus는 조회 시점의 최근 invocation 결과를 나타낼 수 있다.
+
+따라서 반복 timer의 과거 실패를 확인할 때는 단순 최신 `systemctl show` 값만 사용하지 않고 다음을 함께 확인한다.
+
+```text
+journal의 failure log
+event_id
+pending event 유지
+전송 후 delivered 상태
+```
+
+### 운영 설정 복원
+
+모든 notification systemd 검증은 `/run/systemd/system` runtime-only 설정으로 수행했다.
+
+테스트 종료 후:
+
+```text
+notification runtime service 제거
+notification runtime timer 제거
+evaluator outbox runtime override 제거
+test outbox/delivered data 제거
+systemctl daemon-reload
+```
+
+를 수행했다.
+
+최종 확인:
+
+```text
+production_evaluator=PASS
+notification_runtime_cleanup=PASS
+
+evaluator_timer_enabled=enabled
+evaluator_timer_active=active
+
+Collector:
+running=true
+status=running
+
+queue:
+status=OK
+queue_size=0
+
+evaluator:
+current_status=OK
+```
+
+### 현재 보장 범위
+
+현재 실험으로 확인한 것은 다음이다.
+
+```text
+process 실행 중 outbox write 실패 방지
+notification process 실패 시 pending 유지
+systemd 반복 실행을 통한 자동 retry
+event_id 기반 local duplicate ACK
+notification 장애와 evaluator 실행 격리
+ALERT와 RECOVERY의 순서 보존
+```
+
+아직 다음은 검증하지 않았다.
+
+```text
+호스트 전원 차단 직전 outbox directory entry durability
+filesystem corruption
+disk full
+외부 HTTP transport의 ambiguous timeout
+외부 provider에서의 실제 duplicate delivery
+외부 notification provider 인증 정보 관리
+```
+
+Evaluator의 outbox write는 파일 자체를 fsync한 뒤 rename하지만 현재 outbox directory fsync까지 수행하지 않으므로 갑작스러운 power loss까지 포함한 완전한 filesystem crash durability를 주장하지 않는다.
+
+### 상태 필드 의미 주의
+
+현재 evaluator state의:
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+는 실제 외부 notification 전달 완료 시각이 아니다.
+
+현재 의미는 evaluator가:
+
+```text
+notification-required event를 결정하고
+outbox handoff를 수행한 시각
+```
+
+에 더 가깝다.
+
+따라서 실제 외부 transport를 production에 연결하기 전에 해당 상태 필드의 이름과 책임을 재검토한다.
+
+실제 delivery 성공 시각은 notification adapter의 책임으로 분리하는 것이 적절하다.

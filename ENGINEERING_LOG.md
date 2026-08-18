@@ -9560,3 +9560,639 @@ alert_required=true
 Evaluator의 상태 판단 로직과 notification transport는 분리한다.
 
 Notification 실패가 Collector queue monitoring 자체를 방해하지 않도록 timeout, retry, duplicate notification 정책도 별도로 설계한다.
+
+---
+
+## Durable Notification Outbox 및 systemd Failure Isolation 검증
+
+### 목표
+
+Collector queue alert의 상태 판단과 외부 notification transport를 분리하고 notification provider 장애가 monitoring 자체를 중단시키지 않는 구조를 구현·검증했다.
+
+기존:
+
+```text
+Collector metrics
+→ checker
+→ evaluator
+→ journal
+```
+
+변경 후:
+
+```text
+Collector metrics
+→ checker
+→ evaluator
+→ notification JSON outbox
+→ independent notification adapter
+→ transport
+```
+
+### 변경 파일
+
+```text
+scripts/evaluate-collector-queue-alert.py
+scripts/process-notification-outbox.py
+```
+
+### Evaluator JSON Event Contract
+
+Evaluator에:
+
+```text
+--output-format text|json
+```
+
+을 추가했다.
+
+기본값은:
+
+```text
+text
+```
+
+이므로 기존 production systemd 실행과 호환된다.
+
+JSON mode:
+
+```text
+--output-format json
+```
+
+에서는 한 이벤트당 JSON 한 줄만 출력한다.
+
+NONE event 검증:
+
+```text
+json_rc=0
+json_lines=1
+json_contract=PASS
+```
+
+주요 값:
+
+```text
+schema_version=1
+event=NONE
+alert_required=false
+previous_status=null
+current_status=OK
+checker_exit_code=0
+```
+
+`--quiet-no-event`와 JSON을 같이 사용한 경우:
+
+```text
+quiet_json_rc=0
+quiet_json_bytes=0
+```
+
+을 확인했다.
+
+잘못된 checker threshold를 이용한 ALERT JSON:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=null
+current_status=UNKNOWN
+checker_exit_code=3
+```
+
+검증:
+
+```text
+alert_json_contract=PASS
+```
+
+### Event Outbox
+
+Evaluator에:
+
+```text
+--event-outbox-dir
+```
+
+을 추가했다.
+
+Notification event에는:
+
+```text
+event_id
+```
+
+가 추가됐다.
+
+최초 ALERT:
+
+```text
+outbox_alert_rc=0
+outbox JSON file=1
+stdout_outbox_match=PASS
+outbox_contract=PASS
+```
+
+동일 UNKNOWN 상태를 다시 평가하면:
+
+```text
+repeat_rc=0
+repeat_output_bytes=0
+outbox_file_count=1
+```
+
+로 새로운 notification event가 추가되지 않았다.
+
+### Outbox Failure Ordering
+
+Outbox path가 directory가 될 수 없도록 의도적으로 실패시켰다.
+
+결과:
+
+```text
+evaluator_error=event outbox write failed: [Errno 20] Not a directory
+outbox_failure_rc=4
+state_after_outbox_failure=PASS_not_written
+```
+
+Outbox 문제를 해결한 뒤 재실행:
+
+```text
+retry_rc=0
+event=ALERT
+current_status=UNKNOWN
+retry_outbox_count=1
+```
+
+Evaluator state도 이후 정상 생성됐다.
+
+따라서 outbox 저장 실패 때문에 최초 notification event가 사라지는 것을 방지했다.
+
+### Notification Adapter
+
+새 스크립트:
+
+```text
+scripts/process-notification-outbox.py
+```
+
+기능:
+
+```text
+pending JSON 조회
+schema_version 검증
+event_id 검증
+event/status contract 검증
+순서대로 event 처리
+delivery 성공 시 pending 제거
+delivery 실패 시 pending 유지
+event_id duplicate ACK
+```
+
+정상 local delivery:
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+processed_events=1
+remaining_events=0
+adapter_rc=0
+```
+
+파일 상태:
+
+```text
+pending_before=1
+pending_after=0
+delivered_after=1
+```
+
+### Duplicate ACK
+
+이미 delivered된 event를 pending에 다시 놓아 crash window를 재현했다.
+
+Adapter:
+
+```text
+delivery_result=ACK_EXISTING
+```
+
+결과:
+
+```text
+pending_after_ack_existing=0
+delivered_after_ack_existing=1
+```
+
+로 동일 event가 이중 저장되지 않았다.
+
+### Adapter Delivery Failure
+
+Delivered path를 일반 파일로 만들어 delivery를 실패시켰다.
+
+결과:
+
+```text
+adapter_error=delivery failed: [Errno 17] File exists: ...
+delivery_failure_rc=2
+pending_after_delivery_failure=1
+```
+
+Evaluator state:
+
+```text
+current_status=UNKNOWN
+```
+
+은 그대로 유지됐다.
+
+Delivery path 복구 후:
+
+```text
+delivery_result=DELIVERED
+delivery_retry_rc=0
+pending_after_retry=0
+delivered_after_retry=1
+```
+
+로 재처리됐다.
+
+### IDLE Log Suppression
+
+5초 systemd timer의 정상 상태 로그를 억제하기 위해 adapter에:
+
+```text
+--quiet-idle
+```
+
+을 추가했다.
+
+기존 기본 동작:
+
+```text
+adapter_status=IDLE
+processed_events=0
+remaining_events=0
+normal_idle_rc=0
+```
+
+`--quiet-idle`:
+
+```text
+quiet_idle_rc=0
+quiet_idle_bytes=0
+```
+
+Outbox directory 자체가 없는 경우에도:
+
+```text
+missing_outbox_rc=0
+missing_outbox_bytes=0
+```
+
+실제 event가 존재하면 quiet 옵션과 관계없이 delivery 로그는 출력됐다.
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+processed_events=1
+remaining_events=0
+event_delivery_rc=0
+```
+
+### systemd Normal Pipeline
+
+Runtime-only systemd 설정으로 다음 두 독립 timer를 구성했다.
+
+```text
+aerotrace-collector-queue-alert.timer
+aerotrace-notification-outbox.timer
+```
+
+Evaluator에는 runtime-only:
+
+```text
+--event-outbox-dir /var/lib/aerotrace-monitoring/notification-outbox
+```
+
+을 추가했다.
+
+Production checker threshold argument는 추가하지 않았다.
+
+검증:
+
+```text
+evaluator_outbox=PASS
+production_threshold=PASS_default
+```
+
+Notification timer:
+
+```text
+notification_timer_active=active
+```
+
+Evaluator 반복 실행:
+
+```text
+before_evaluated=2026-08-18T06:35:57+00:00
+after_evaluated=2026-08-18T06:36:14+00:00
+evaluator_still_running=PASS
+```
+
+정상 상태:
+
+```text
+pending_events=0
+delivered_events=0
+```
+
+Notification service:
+
+```text
+Result=success
+ExecMainStatus=0
+```
+
+Journal에는 Python IDLE/OK metric spam 없이 systemd lifecycle log만 남았다.
+
+### systemd ALERT / RECOVERY E2E
+
+초기:
+
+```text
+current_status=OK
+Collector running
+pending=0
+delivered=0
+```
+
+Collector를 실제 중단했다.
+
+```text
+running=false
+status=exited
+exit=0
+```
+
+Evaluator 자동 상태 전이:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+checker_stderr=UNKNOWN: <urlopen error [Errno 111] Connection refused>
+```
+
+Notification adapter timer 자동 처리:
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+processed_events=1
+remaining_events=0
+```
+
+결과:
+
+```text
+pending_after_alert=0
+delivered_after_alert=1
+automatic_alert_delivery=PASS
+```
+
+Collector를 다시 시작하고 metrics endpoint 준비를 확인했다.
+
+Evaluator가 자동으로:
+
+```text
+UNKNOWN → OK
+RECOVERY
+```
+
+를 생성했고 notification adapter가 자동 전달했다.
+
+최종 sequence:
+
+```text
+1: event=ALERT previous=OK current=UNKNOWN
+2: event=RECOVERY previous=UNKNOWN current=OK
+```
+
+검증:
+
+```text
+automatic_recovery_delivery=PASS
+delivered_event_sequence=PASS
+
+final_pending=0
+final_delivered=2
+```
+
+Delivered JSON 파일 권한:
+
+```text
+owner=huning
+group=huning
+mode=640
+```
+
+으로 systemd service의 `UMask=0027`이 적용됨을 확인했다.
+
+### systemd Notification Failure Isolation
+
+Baseline:
+
+```text
+delivered_baseline=2
+pending_baseline=0
+before_failure_evaluated=2026-08-18T06:44:47+00:00
+```
+
+Notification service의 delivered-dir만 runtime override로 고장냈다.
+
+Collector 중단 후:
+
+```text
+attempt=03
+state=UNKNOWN
+pending=1
+
+pending_alert_after_delivery_failure=PASS
+```
+
+Notification journal:
+
+```text
+adapter_error=delivery failed: [Errno 17] File exists: '/var/lib/aerotrace-monitoring/notification-delivery-blocker'
+failed_event_id=1787035511951348652-1520983
+remaining_events=1
+```
+
+Notification failure를 유지한 채 14초 후 evaluator:
+
+```text
+before_failure_evaluated=2026-08-18T06:44:47+00:00
+after_failure_evaluated=2026-08-18T06:45:29+00:00
+
+evaluator_independent_from_notification=PASS
+```
+
+동시에:
+
+```text
+pending_during_failure=1
+evaluator_timer=active
+notification_timer=active
+
+Evaluator:
+Result=success
+ExecMainStatus=0
+```
+
+이었다.
+
+따라서 notification delivery 실패가 Collector 상태 평가 주기를 중단시키지 않았다.
+
+### 자동 Pending Retry
+
+Notification failure override만 제거하고 adapter를 수동 실행하지 않았다.
+
+첫 확인에서:
+
+```text
+pending=0
+delivered=3
+
+automatic_pending_retry=PASS
+```
+
+가 됐다.
+
+Retry된 event:
+
+```text
+latest_event=ALERT
+previous=OK
+current=UNKNOWN
+event_id=1787035511951348652-1520983
+
+retried_alert_contract=PASS
+```
+
+원래 pending event_id가 그대로 전달됐다.
+
+Collector를 복구한 뒤:
+
+```text
+state=OK
+delivered=4
+
+automatic_recovery_after_notification_failure=PASS
+```
+
+마지막 두 event:
+
+```text
+1: ALERT
+   OK → UNKNOWN
+
+2: RECOVERY
+   UNKNOWN → OK
+
+failure_recovery_sequence=PASS
+```
+
+### Runtime Cleanup
+
+Notification test timer 중단 후 다음을 제거했다.
+
+```text
+runtime evaluator outbox override
+runtime notification service
+runtime notification timer
+notification failure override
+test outbox
+test delivered sink
+```
+
+최종:
+
+```text
+production_evaluator=PASS
+notification_runtime_cleanup=PASS
+
+evaluator_timer_enabled=enabled
+evaluator_timer_active=active
+
+Collector:
+running=true
+status=running
+
+queue:
+status=OK
+queue_size=0
+
+state:
+current_status=OK
+```
+
+Collector restart 이후 일부 metric:
+
+```text
+in_flight=N/A
+sent_spans=N/A
+accepted_spans=N/A
+refused_spans=N/A
+```
+
+은 새로운 Collector process에서 아직 해당 metric series가 생성되지 않은 상태로 해석한다.
+
+Checker는 missing metric을 0으로 변환하지 않고 `N/A`로 표시하도록 설계되어 있으므로 정상 동작이다.
+
+### 확인된 운영 특성
+
+이번 실험으로 다음을 실제 검증했다.
+
+```text
+notification failure가 evaluator를 중단시키지 않음
+pending event가 notification 실패 중 유지됨
+동일 UNKNOWN 반복으로 pending ALERT가 증가하지 않음
+transport 복구 후 timer가 pending event를 자동 retry
+ALERT 전달 후 RECOVERY가 순서대로 전달됨
+normal state log spam 억제
+runtime-only systemd 테스트 후 production configuration 복구
+```
+
+### 남은 기술 부채
+
+Evaluator outbox writer는 현재:
+
+```text
+file fsync
+→ rename
+```
+
+까지 수행하지만 rename 이후 outbox directory fsync는 수행하지 않는다.
+
+따라서 다음 경계는 아직 검증되지 않았다.
+
+```text
+호스트 abrupt power loss
+rename 직후 filesystem metadata durability
+disk full
+filesystem corruption
+```
+
+또한 evaluator state의:
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+는 실제 transport delivery 완료 시간이 아니라 alert-required event를 생성하고 handoff한 시간에 가깝다.
+
+실제 외부 notification transport를 production에 연결하기 전에 이 의미를 명확하게 분리해야 한다.
