@@ -3302,3 +3302,395 @@ last_notification_epoch
 는 실제 외부 delivery 시각이 아니므로 책임과 명칭을 재검토한다.
 
 그 다음 Generic Webhook / Slack / Discord 중 MVP transport를 선택하고 HTTP timeout, retry, ambiguous delivery, credential 관리까지 검증한다.
+
+---
+
+### Portfolio Checkpoint — Notification Outbox 적체와 실제 장애 지속 상태 관측
+
+Webhook notification을 단순히 재시도하는 것에서 끝내지 않고, 전달 장애가 장기화될 때 미전송 event가 얼마나 쌓이고 얼마나 오래 대기하고 있는지 확인할 수 있는 Notification Outbox checker를 구현하고 실제 장애를 발생시켜 상태 전이를 검증했다.
+
+### 구현한 관측 구조
+
+Notification Outbox에서 다음 지표를 확인할 수 있도록 했다.
+
+```text
+pending event count
+pending bytes
+oldest pending age
+oldest event ID
+oldest evaluated_at
+```
+
+상태와 exit code:
+
+```text
+OK       = 0
+WARNING  = 1
+CRITICAL = 2
+UNKNOWN  = 3
+```
+
+Count와 age threshold를 독립적으로 설정할 수 있으며 두 상태 중 더 높은 severity를 전체 상태로 사용하도록 했다.
+
+### 기본 동작
+
+Threshold를 지정하지 않으면 pending event가 있더라도 관측값만 출력한다.
+
+```text
+pending_events > 0
+threshold 없음
+→ status=OK
+```
+
+운영 데이터를 측정하기 전에 테스트용 숫자를 production alert 기준으로 고정하지 않기 위한 선택이다.
+
+### Outbox 관측 검증
+
+Test event 두 개에서 다음 값을 실제로 확인했다.
+
+```text
+pending_events=2
+pending_bytes=585
+oldest_pending_age_sec=94.694
+oldest_event_id=v7b41-oldest
+```
+
+자동 검증:
+
+```text
+outbox_observability=PASS
+```
+
+### 데이터 손상 검출
+
+손상된 JSON:
+
+```text
+{broken json
+```
+
+을 Outbox에 배치했을 때:
+
+```text
+status=UNKNOWN
+broken_event_rc=3
+```
+
+을 반환하는 것을 확인했다.
+
+Outbox path가 directory가 아닌 일반 파일인 경우도:
+
+```text
+status=UNKNOWN
+outbox_path_error_rc=3
+```
+
+으로 처리했다.
+
+### Count Threshold 검증
+
+실제 pending 두 개에서:
+
+```text
+warn-count=2
+critical-count=3
+→ WARNING
+→ rc=1
+```
+
+그리고:
+
+```text
+warn-count=1
+critical-count=2
+→ CRITICAL
+→ rc=2
+```
+
+를 확인했다.
+
+### Age Threshold 검증
+
+약 120초 된 event에서:
+
+```text
+warn-age-sec=60
+critical-age-sec=3600
+→ WARNING / rc=1
+```
+
+그리고:
+
+```text
+warn-age-sec=60
+critical-age-sec=90
+→ CRITICAL / rc=2
+```
+
+를 확인했다.
+
+Count가 WARNING이고 age가 CRITICAL인 경우:
+
+```text
+overall=CRITICAL
+combined_status_rc=2
+```
+
+가 됐다.
+
+### 실제 장애 실험
+
+Synthetic event만 사용하는 것으로 끝내지 않고 실제 webhook connection failure를 발생시켰다.
+
+사용한 endpoint:
+
+```text
+http://127.0.0.1:1/aerotrace
+```
+
+실제 결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+delivery_failure_rc=2
+pending_after_failure=1
+receipts_after_failure=0
+```
+
+생성된 실제 pending event:
+
+```text
+1787182663140772001-653546
+```
+
+### 실제 시간 경과에 따른 상태 전이
+
+동일 event를 유지한 상태에서 실제 시간이 흐르도록 하고 age를 연속 측정했다.
+
+초기:
+
+```text
+oldest_pending_age_sec=5.853
+status=OK
+initial_rc=0
+```
+
+시간 경과 후:
+
+```text
+oldest_pending_age_sec=17.889
+status=WARNING
+warning_rc=1
+```
+
+추가 시간 경과 후:
+
+```text
+oldest_pending_age_sec=31.927
+status=CRITICAL
+critical_rc=2
+```
+
+검증:
+
+```text
+actual_pending_age_transition=PASS
+```
+
+세 시점 모두 동일 event ID를 유지했다.
+
+```text
+event_id=1787182663140772001-653546
+```
+
+최종 상태:
+
+```text
+final_pending=1
+final_receipts=0
+pending_event_identity_preserved=PASS
+```
+
+### 테스트 실패 원인 분석 경험
+
+첫 번째 상태 전이 실험에서는 baseline age가:
+
+```text
+23.407s
+```
+
+였고 WARNING threshold를:
+
+```text
+33.407s
+```
+
+로 설정했다.
+
+하지만 사람이 명령을 입력하는 사이 시간이 지나 최초 검사 값이:
+
+```text
+33.408s
+```
+
+가 되어 즉시 WARNING으로 진입했다.
+
+이 결과를 checker 버그로 수정하지 않고 실제 수치를 비교해 테스트 자체의 timing race임을 확인했다.
+
+이후 fresh event를 만들고 전체 상태 전이를 하나의 연속 shell 실행으로 묶어 사람의 입력 시간을 제거했다.
+
+이를 통해:
+
+```text
+OK → WARNING → CRITICAL
+```
+
+상태 전이를 안정적으로 재현했다.
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 다음 운영 관점을 직접 다뤘다.
+
+```text
+queue depth와 queue age의 차이
+oldest pending age
+event timestamp와 filesystem mtime의 차이
+threshold severity aggregation
+UNKNOWN 상태와 monitoring failure
+실제 장애 지속에 따른 상태 악화
+운영 threshold와 테스트 threshold의 분리
+시간 의존 테스트의 race condition
+측정 결과를 기반으로 한 테스트 원인 분석
+```
+
+특히 단순히 "pending file이 있다"는 사실보다 oldest pending age가 notification 장애 지속 정도를 파악하는 데 더 직접적인 지표가 될 수 있음을 실제 데이터로 확인했다.
+
+### 보존할 로그와 증거
+
+다음 결과는 포트폴리오와 기술 블로그 자료로 보존한다.
+
+```text
+outbox_observability=PASS
+
+pending_events=2
+pending_bytes=585
+oldest_pending_age_sec=94.694
+
+broken_event_rc=3
+outbox_path_error_rc=3
+
+count_warning_rc=1
+count_critical_rc=2
+
+age_warning_rc=1
+age_critical_rc=2
+combined_status_rc=2
+
+delivery_failure_rc=2
+pending_after_failure=1
+receipts_after_failure=0
+
+baseline_age=5.792
+warn_age=15.792
+critical_age=30.792
+
+initial_age=5.853
+warning_age=17.889
+critical_age=31.927
+
+actual_pending_age_transition=PASS
+pending_event_identity_preserved=PASS
+
+final_pending=1
+final_receipts=0
+```
+
+### 이력서 성과 문장 초안
+
+- Webhook 장애 장기화 시 알림 유실 여부뿐 아니라 미전송 Outbox의 pending 수, 저장량, oldest event age를 관측하는 checker를 구현하고 실제 connection failure 상태에서 동일 event의 age가 `5.853s → 17.889s → 31.927s`로 증가하며 `OK → WARNING → CRITICAL`로 전이되는 과정을 검증
+- 운영 임계값을 임의로 고정하지 않고 pending count와 oldest age threshold를 외부 설정으로 분리해 실제 장애 데이터 측정 후 정책을 결정할 수 있는 notification monitoring 구조를 설계
+- 시간 기반 상태 전이 테스트에서 명령 입력 지연으로 threshold가 먼저 초과되는 문제를 측정값으로 원인 분석하고, fresh event와 연속 실행 방식으로 테스트를 재설계해 안정적으로 상태 전이를 재현
+
+현재 테스트 threshold를 실제 production SLA처럼 표현하지 않는다.
+
+### 예상 면접 질문
+
+```text
+왜 queue count만 보지 않고 oldest age도 보는가?
+
+왜 filesystem mtime 대신 evaluated_at을 사용하는가?
+
+pending event가 하나뿐인데 CRITICAL이 될 수 있는 이유는 무엇인가?
+
+count WARNING, age CRITICAL이면 전체 상태는 어떻게 결정하는가?
+
+왜 production threshold를 지금 정하지 않았는가?
+
+모니터링 대상 JSON 자체가 손상되면 어떤 상태를 반환하는가?
+
+Outbox oldest age와 실제 transport failure duration은 항상 같은가?
+
+첫 번째 상태 전이 테스트가 실패한 이유는 무엇이었는가?
+
+시간 기반 테스트를 어떻게 안정화했는가?
+
+장애가 복구된 뒤 이 상태는 어떻게 정상화되어야 하는가?
+```
+
+### 블로그 소재
+
+제목 후보:
+
+```text
+Webhook 장애는 몇 초째 지속되고 있을까?
+Notification Outbox의 Depth와 Age를 함께 관측한 이유
+```
+
+또는:
+
+```text
+시간 기반 모니터링 테스트가 1ms 차이로 실패한 이유와 재현 가능한 테스트로 바꾼 과정
+```
+
+글의 핵심 흐름:
+
+```text
+1. Webhook retry만으로 부족했던 이유
+2. Pending count만 봤을 때의 한계
+3. Oldest pending age 도입
+4. evaluated_at과 filesystem mtime 비교
+5. Count / Age threshold 설계
+6. UNKNOWN 상태가 필요한 이유
+7. 실제 connection refused 장애 생성
+8. 동일 event의 age 증가 측정
+9. OK → WARNING → CRITICAL 전이
+10. 첫 테스트의 timing race
+11. 테스트 재설계 과정
+12. Production threshold를 아직 정하지 않은 이유
+```
+
+### 다음 한 단계 높은 과제
+
+Outbox age는 "미전송 event가 얼마나 오래됐는가"를 보여주지만 transport 자체의 연속 실패 횟수와 최초 실패 시각을 직접 기록하지는 않는다.
+
+다음 단계에서는 notification adapter에 persistent failure state를 추가해 다음 정보를 기록한다.
+
+```text
+first_failed_at
+last_failed_at
+failure_count
+failure_kind
+failed_event_id
+```
+
+성공 시 이 상태를 어떻게 초기화하거나 보존할지도 함께 검증한다.
+
+이를 통해 다음 두 개념을 분리해서 관찰할 수 있게 한다.
+
+```text
+oldest pending age
+vs
+actual transport failure duration
+```

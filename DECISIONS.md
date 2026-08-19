@@ -5557,3 +5557,199 @@ TLS certificate failure 테스트
 ```
 
 현재 MVP에서는 HTTP 실패 시 pending event를 보존하고 systemd의 반복 실행을 통해 retry하는 단순 구조를 유지한다.
+
+---
+
+## Notification Outbox 적체 관측 기준과 Threshold 정책
+
+### 해결하려는 문제
+
+Webhook endpoint가 장기간 실패하면 notification event는 Outbox에 보존되지만, 단순히 파일이 존재한다는 사실만으로는 운영자가 장애의 심각도를 판단하기 어렵다.
+
+다음 정보를 최소 관측 단위로 사용하기로 했다.
+
+- pending event 수
+- pending JSON 전체 크기
+- 가장 오래된 pending event의 age
+- 가장 오래된 event ID
+- 가장 오래된 event의 `evaluated_at`
+
+### Pending Age 기준
+
+파일의 mtime이 아니라 notification event 내부의 `evaluated_at`을 age 계산 기준으로 사용한다.
+
+이유는 파일 이동, 복원 또는 파일시스템 변경으로 mtime이 달라져도 실제 alert가 발생한 시점 자체는 변하지 않기 때문이다.
+
+따라서 다음과 같이 계산한다.
+
+```text
+oldest_pending_age
+= 현재 시각 - event.evaluated_at
+```
+
+### 상태 코드
+
+Notification Outbox checker의 상태와 exit code는 다음과 같다.
+
+```text
+OK       = 0
+WARNING  = 1
+CRITICAL = 2
+UNKNOWN  = 3
+```
+
+손상된 JSON, 잘못된 outbox path, 잘못된 threshold 설정은 `UNKNOWN`으로 처리한다.
+
+### Threshold 정책
+
+다음 threshold를 CLI로 선택적으로 주입할 수 있도록 했다.
+
+```text
+--warn-count
+--critical-count
+--warn-age-sec
+--critical-age-sec
+```
+
+count와 age는 독립적으로 평가하며 둘 중 더 높은 severity를 전체 status로 사용한다.
+
+예:
+
+```text
+count = WARNING
+age   = CRITICAL
+
+overall = CRITICAL
+```
+
+### 기본값 결정
+
+현재 production 기본 WARNING/CRITICAL threshold는 지정하지 않는다.
+
+Threshold를 전달하지 않은 경우 pending event가 존재하더라도 관측값만 출력하고 상태는 `OK`로 유지한다.
+
+```text
+pending event 존재
+threshold 미설정
+→ status=OK
+```
+
+이는 테스트를 위해 임의로 사용한 숫자를 운영 정책으로 고정하지 않기 위한 결정이다.
+
+실제 운영 failure duration, notification 발생 빈도, 허용 가능한 전달 지연 시간을 추가로 측정한 뒤 production threshold를 결정한다.
+
+### Empty Outbox 정책
+
+Outbox directory가 존재하지 않는 경우 pending event가 없는 정상 상태로 취급한다.
+
+```text
+status=OK
+pending_events=0
+pending_bytes=0
+oldest_pending_age_sec=N/A
+oldest_event_id=N/A
+oldest_evaluated_at=N/A
+```
+
+Notification adapter가 outbox directory를 필요할 때 생성하는 구조이므로 directory 자체가 없다는 이유만으로 장애 상태로 판단하지 않는다.
+
+### 손상된 Pending Event 정책
+
+Outbox에 JSON 파일이 존재하지만 파싱할 수 없거나 필요한 event metadata가 잘못된 경우 정상 상태로 처리하지 않는다.
+
+다음과 같이 처리한다.
+
+```text
+status=UNKNOWN
+exit code=3
+```
+
+이유는 notification queue 자체의 데이터 손상을 운영자가 인지할 수 있어야 하기 때문이다.
+
+### 실제 장애 기반 상태 전이 검증
+
+Synthetic JSON의 timestamp를 조작하는 방식뿐 아니라 실제 notification delivery 실패를 발생시켜 검증했다.
+
+Webhook endpoint를 다음과 같이 설정해 connection refused를 발생시켰다.
+
+```text
+http://127.0.0.1:1/aerotrace
+```
+
+결과:
+
+```text
+delivery_failure_rc=2
+pending_after_failure=1
+receipts_after_failure=0
+```
+
+동일 pending event의 실제 age가 시간에 따라 증가했다.
+
+```text
+event_id=1787182663140772001-653546
+
+5.853s
+→ OK
+→ rc=0
+
+17.889s
+→ WARNING
+→ rc=1
+
+31.927s
+→ CRITICAL
+→ rc=2
+```
+
+검증:
+
+```text
+actual_pending_age_transition=PASS
+pending_event_identity_preserved=PASS
+```
+
+최종 상태:
+
+```text
+final_pending=1
+final_receipts=0
+```
+
+따라서 실제 전달 장애가 지속되는 동안 동일 미전송 event를 유지하면서 age 기반 상태가 단계적으로 악화되는 것을 확인했다.
+
+### 테스트 Threshold와 Production Threshold 분리
+
+상태 전이 검증 과정에서 사용한 다음 값들은 production 정책이 아니다.
+
+```text
+count 1 / 2 / 3
+age 10초 / 25초 / 60초 / 90초
+```
+
+테스트 목적은 threshold 동작과 severity 전이를 검증하는 것이다.
+
+실제 production threshold는 다음 근거를 수집한 뒤 결정한다.
+
+- notification 정상 발생 빈도
+- 실제 webhook 장애 지속 시간
+- 운영자가 허용할 수 있는 notification 지연
+- systemd retry 주기
+- 장기 장애 시 outbox 증가 속도
+- 실제 notification event 평균 크기
+
+### 현재 남은 과제
+
+현재 Outbox checker는 적체 상태를 관측할 수 있지만 notification adapter 자체의 연속 실패 상태는 아직 영속적으로 기록하지 않는다.
+
+다음 단계에서는 다음 값을 별도 persistent failure state로 관리하는 것을 검토한다.
+
+```text
+first_failed_at
+last_failed_at
+failure_count
+failure_kind
+failed_event_id
+```
+
+이를 통해 단순 oldest pending age와 별도로 실제 transport failure duration을 측정할 수 있게 한다.

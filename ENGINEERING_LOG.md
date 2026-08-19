@@ -11234,3 +11234,519 @@ oldest pending age
 ```
 
 을 운영자가 관찰할 수 있도록 만들고, 그 측정 결과를 바탕으로 backoff / retry budget / dead-letter 정책 도입 여부를 결정한다.
+
+---
+
+## Notification Outbox 적체 관측 및 실제 Age 상태 전이 검증
+
+### 구현 파일
+
+```text
+scripts/check-notification-outbox.py
+```
+
+### 목표
+
+Webhook notification 전달 실패가 장기화될 때 단순히 pending 파일이 존재하는지 확인하는 것을 넘어 다음 상태를 운영자가 직접 확인할 수 있도록 했다.
+
+```text
+pending event 수
+pending 전체 bytes
+가장 오래된 pending event age
+가장 오래된 event ID
+가장 오래된 event evaluated_at
+```
+
+### 제공하는 관측값
+
+Checker는 다음 값을 출력한다.
+
+```text
+status
+pending_events
+pending_bytes
+oldest_pending_age_sec
+oldest_event_id
+oldest_evaluated_at
+count_threshold_status
+age_threshold_status
+```
+
+상태별 exit code:
+
+```text
+OK       = 0
+WARNING  = 1
+CRITICAL = 2
+UNKNOWN  = 3
+```
+
+### Empty Outbox 검증
+
+존재하지 않는 outbox directory는 pending event가 없는 정상 상태로 처리했다.
+
+결과:
+
+```text
+status=OK
+pending_events=0
+pending_bytes=0
+oldest_pending_age_sec=N/A
+oldest_event_id=N/A
+oldest_evaluated_at=N/A
+missing_outbox_rc=0
+```
+
+### 실제 Pending 파일 관측
+
+테스트 event 두 개를 생성해 관측값을 검증했다.
+
+실제 결과:
+
+```text
+pending_events=2
+pending_bytes=585
+oldest_pending_age_sec=94.694
+oldest_event_id=v7b41-oldest
+```
+
+자동 검증:
+
+```text
+outbox_observability=PASS
+```
+
+### Pending Age 계산 기준
+
+파일의 mtime 대신 event JSON의 `evaluated_at`을 사용한다.
+
+계산:
+
+```text
+현재 시각 - evaluated_at
+```
+
+파일이 이동되거나 복구되면서 mtime이 변경되더라도 실제 notification event가 발생한 시각을 유지하기 위한 선택이다.
+
+### Corruption Detection
+
+손상된 pending JSON을 추가했다.
+
+```text
+{broken json
+```
+
+결과:
+
+```text
+status=UNKNOWN
+pending_events=3
+checker_error=invalid pending event: ...
+broken_event_rc=3
+```
+
+따라서 notification outbox 내부 데이터가 손상된 상태를 정상으로 숨기지 않는다.
+
+### 잘못된 Outbox Path
+
+Outbox path에 directory 대신 일반 파일을 배치했다.
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=outbox path is not a directory: ...
+outbox_path_error_rc=3
+```
+
+### Configurable Threshold 구현
+
+추가한 옵션:
+
+```text
+--warn-count
+--critical-count
+--warn-age-sec
+--critical-age-sec
+```
+
+Threshold가 없을 경우 관측 전용 동작을 유지한다.
+
+실제 pending 두 개가 있어도:
+
+```text
+status=OK
+count_threshold_status=OK
+age_threshold_status=OK
+default_threshold_rc=0
+```
+
+으로 동작했다.
+
+### Count WARNING 검증
+
+조건:
+
+```text
+pending_events=2
+warn-count=2
+critical-count=3
+```
+
+결과:
+
+```text
+status=WARNING
+count_threshold_status=WARNING
+age_threshold_status=OK
+count_warning_rc=1
+```
+
+### Count CRITICAL 검증
+
+조건:
+
+```text
+pending_events=2
+warn-count=1
+critical-count=2
+```
+
+결과:
+
+```text
+status=CRITICAL
+count_threshold_status=CRITICAL
+age_threshold_status=OK
+count_critical_rc=2
+```
+
+### Age WARNING 검증
+
+약 120초 된 test event 하나를 사용했다.
+
+조건:
+
+```text
+warn-age-sec=60
+critical-age-sec=3600
+```
+
+결과:
+
+```text
+status=WARNING
+pending_events=1
+count_threshold_status=OK
+age_threshold_status=WARNING
+age_warning_rc=1
+```
+
+### Age CRITICAL 검증
+
+동일 event에서 다음 threshold를 사용했다.
+
+```text
+warn-age-sec=60
+critical-age-sec=90
+```
+
+결과:
+
+```text
+status=CRITICAL
+count_threshold_status=OK
+age_threshold_status=CRITICAL
+age_critical_rc=2
+```
+
+### Combined Severity 검증
+
+Count와 age가 서로 다른 상태일 때 더 높은 severity를 전체 상태로 사용한다.
+
+실제 조건:
+
+```text
+count_threshold_status=WARNING
+age_threshold_status=CRITICAL
+```
+
+결과:
+
+```text
+status=CRITICAL
+combined_status_rc=2
+```
+
+### Threshold Configuration Error 검증
+
+다음 잘못된 설정을 테스트했다.
+
+```text
+warn-count >= critical-count
+warn-age-sec >= critical-age-sec
+threshold <= 0
+```
+
+결과는 모두:
+
+```text
+status=UNKNOWN
+exit code=3
+```
+
+이었다.
+
+실제 결과 예:
+
+```text
+checker_error=--warn-count must be lower than --critical-count
+bad_count_threshold_rc=3
+```
+
+```text
+checker_error=--warn-age-sec must be lower than --critical-age-sec
+bad_age_threshold_rc=3
+```
+
+```text
+checker_error=--warn-age-sec must be > 0
+zero_threshold_rc=3
+```
+
+### Threshold 추가 후 Corruption Detection 회귀 검증
+
+Threshold 기능을 추가한 뒤에도 손상 JSON 검출이 유지되는지 다시 검증했다.
+
+결과:
+
+```text
+status=UNKNOWN
+pending_events=1
+checker_error=invalid pending event: ...
+broken_regression_rc=3
+```
+
+### 실제 Notification Failure 기반 상태 전이 검증
+
+Synthetic timestamp가 아니라 실제 webhook 전달 실패로 pending event를 생성했다.
+
+Fake checker 결과:
+
+```text
+status=WARNING
+queue_size=1000
+```
+
+Evaluator:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=NONE
+current_status=WARNING
+checker_exit_code=1
+evaluator_rc=0
+```
+
+실제 사용하지 않는 localhost port에 webhook을 전송했다.
+
+```text
+http://127.0.0.1:1/aerotrace
+```
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+delivery_failure_rc=2
+pending_after_failure=1
+receipts_after_failure=0
+```
+
+생성된 실제 pending event:
+
+```text
+event_id=1787182663140772001-653546
+```
+
+### 첫 번째 상태 전이 테스트에서 발견한 테스트 설계 문제
+
+초기 실험에서는 baseline age가:
+
+```text
+23.407s
+```
+
+이었다.
+
+WARNING threshold를:
+
+```text
+33.407s
+```
+
+로 설정했다.
+
+하지만 사람이 다음 명령을 입력하는 동안 실제 시간이 흘렀고 최초 threshold 검사 시점에는:
+
+```text
+33.408s
+```
+
+가 됐다.
+
+따라서 결과는:
+
+```text
+status=WARNING
+```
+
+이었다.
+
+이는 checker 오류가 아니라 다음 비교가 정확하게 동작한 결과였다.
+
+```text
+33.408 >= 33.407
+```
+
+이후 WARNING 확인을 위해 추가 대기했을 때 age가:
+
+```text
+50.324s
+```
+
+까지 증가해 이미 critical threshold:
+
+```text
+43.407s
+```
+
+도 넘었기 때문에 CRITICAL로 전이했다.
+
+### 상태 전이 테스트 개선
+
+사람의 명령 입력 시간을 테스트 결과에서 제거하기 위해 fresh pending event를 다시 생성하고 하나의 연속 shell 실행 안에서 다음 과정을 수행했다.
+
+```text
+baseline 측정
+→ threshold 계산
+→ 즉시 최초 검사
+→ sleep
+→ WARNING 검사
+→ sleep
+→ CRITICAL 검사
+```
+
+테스트용 threshold:
+
+```text
+WARNING  = baseline + 10초
+CRITICAL = baseline + 25초
+```
+
+이 값은 production threshold가 아니다.
+
+### 실제 Age 상태 전이 결과
+
+Baseline:
+
+```text
+baseline_age=5.792
+warn_age=15.792
+critical_age=30.792
+```
+
+초기 검사:
+
+```text
+status=OK
+pending_events=1
+oldest_pending_age_sec=5.853
+oldest_event_id=1787182663140772001-653546
+age_threshold_status=OK
+initial_rc=0
+```
+
+시간 경과 후:
+
+```text
+status=WARNING
+pending_events=1
+oldest_pending_age_sec=17.889
+oldest_event_id=1787182663140772001-653546
+age_threshold_status=WARNING
+warning_rc=1
+```
+
+추가 시간 경과 후:
+
+```text
+status=CRITICAL
+pending_events=1
+oldest_pending_age_sec=31.927
+oldest_event_id=1787182663140772001-653546
+age_threshold_status=CRITICAL
+critical_rc=2
+```
+
+자동 검증:
+
+```text
+initial_age=5.853
+warning_age=17.889
+critical_age=31.927
+event_id=1787182663140772001-653546
+actual_pending_age_transition=PASS
+```
+
+세 시점 모두 동일 `event_id`가 유지됐다.
+
+최종:
+
+```text
+final_pending=1
+final_receipts=0
+pending_event_identity_preserved=PASS
+```
+
+### 확인된 동작
+
+이번 단계에서 다음을 실제로 확인했다.
+
+```text
+실제 webhook failure
+→ pending event 보존
+
+시간 경과
+→ 동일 event의 oldest age 증가
+
+age가 warning threshold 도달
+→ WARNING / rc=1
+
+age가 critical threshold 도달
+→ CRITICAL / rc=2
+
+delivery 성공 전까지
+→ receipt 없음
+→ 동일 pending event 유지
+```
+
+### 현재 한계
+
+현재 production WARNING/CRITICAL 숫자는 확정하지 않았다.
+
+테스트에서 사용한 다음 숫자는 상태 전이를 검증하기 위한 값일 뿐이다.
+
+```text
+count 1 / 2 / 3
+age 10초 / 25초 / 60초 / 90초
+```
+
+실제 운영 threshold는 notification 발생 빈도, systemd retry 주기, 허용 가능한 전달 지연, 장기 장애 시 outbox 증가량을 추가 측정한 뒤 결정해야 한다.
+
+또한 oldest pending age는 미전송 event의 나이를 보여주지만 transport 자체의 최초 실패 시각이나 연속 실패 횟수를 직접 나타내지는 않는다.
+
+다음 단계에서는 persistent transport failure state를 추가하는 방향을 검토한다.
