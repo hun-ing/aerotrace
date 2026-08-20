@@ -4051,3 +4051,504 @@ notification backlog age
 vs
 actual webhook transport failure duration
 ```
+
+---
+
+### Portfolio Checkpoint — Webhook 장애 지표를 실제 반복 실패로 분리 측정
+
+Persistent webhook failure state를 구현한 뒤 단순히 값을 저장하는 것에서 끝내지 않고, 운영자가 현재 장애 상태를 평가할 수 있는 checker를 추가하고 실제 connection failure를 반복 발생시켜 각 지표의 의미를 분리했다.
+
+### 구현한 Failure State Checker
+
+추가 파일:
+
+```text
+scripts/check-notification-failure-state.py
+```
+
+관측값:
+
+```text
+active_failure
+failure_kind
+failure_reason
+failure_count
+failure_duration_sec
+last_failure_age_sec
+first_failed_at
+last_failed_at
+```
+
+상태:
+
+```text
+OK
+WARNING
+CRITICAL
+UNKNOWN
+```
+
+을 제공한다.
+
+### 실제 Failure State 관측
+
+실제 connection refused를 발생시켰다.
+
+첫 관측:
+
+```text
+failure_count=1
+failure_duration_sec=6.718
+last_failure_age_sec=6.718
+persistent_failure_observability=PASS
+```
+
+동일 event에 다시 실패를 발생시킨 뒤:
+
+```text
+failure_count=2
+failure_duration_sec=17.820
+last_failure_age_sec=1.820
+persistent_failure_retry_observability=PASS
+```
+
+을 확인했다.
+
+이를 통해:
+
+```text
+failure_duration
+→ 최초 실패 이후 전체 장애 시간
+
+last_failure_age
+→ 가장 최근 실패 이후 경과 시간
+```
+
+이 서로 다른 지표임을 실제로 확인했다.
+
+### Retryable Severity Threshold
+
+Retryable failure는 threshold가 없으면 active failure가 있어도 관측 전용으로 `OK`를 유지한다.
+
+실제:
+
+```text
+failure_count=2
+failure_duration_sec=201.062
+active_failure=true
+status=OK
+default_retryable_rc=0
+```
+
+을 확인했다.
+
+Count threshold:
+
+```text
+failure_count=2
+warn=2
+critical=3
+→ WARNING / rc=1
+```
+
+```text
+failure_count=2
+warn=1
+critical=2
+→ CRITICAL / rc=2
+```
+
+Duration threshold도:
+
+```text
+WARNING / rc=1
+CRITICAL / rc=2
+```
+
+전이를 실제로 검증했다.
+
+### Permanent Failure 정책
+
+Permanent failure는 threshold를 기다리지 않고 즉시 CRITICAL로 처리했다.
+
+검증 fixture:
+
+```text
+failure_kind=permanent
+failure_reason=http_400
+failure_count=1
+failure_duration_sec=9.958
+```
+
+결과:
+
+```text
+failure_kind_status=CRITICAL
+status=CRITICAL
+permanent_failure_checker_rc=2
+```
+
+### 잘못된 Monitoring 설정 방어
+
+다음 잘못된 threshold를 모두 UNKNOWN으로 검출했다.
+
+```text
+warn-count >= critical-count
+warn-duration >= critical-duration
+threshold <= 0
+```
+
+또 failure state 자체가 존재하지 않아도 checker 설정 오류를 먼저 검증했다.
+
+```text
+status=UNKNOWN
+bad_config_without_state_rc=3
+```
+
+따라서 모니터링 설정 오류를 정상 상태로 숨기지 않는 구조를 검증했다.
+
+### 실제 반복 장애 실험
+
+동일 notification event에 대해 실제 connection refused를 4회 반복했다.
+
+Event:
+
+```text
+1787210007147775125-1271557
+```
+
+측정:
+
+```text
+Attempt 1
+failure_count=1
+failure_duration_sec=0.136
+last_failure_age_sec=0.136
+oldest_pending_age_sec=5.168
+
+Attempt 2
+failure_count=2
+failure_duration_sec=4.285
+last_failure_age_sec=0.285
+oldest_pending_age_sec=9.318
+
+Attempt 3
+failure_count=3
+failure_duration_sec=8.434
+last_failure_age_sec=0.434
+oldest_pending_age_sec=13.467
+
+Attempt 4
+failure_count=4
+failure_duration_sec=12.586
+last_failure_age_sec=0.586
+oldest_pending_age_sec=17.618
+```
+
+자동 검증:
+
+```text
+repeated_failure_measurement=PASS
+```
+
+네 번 모두:
+
+```text
+pending_events=1
+```
+
+이었고 동일 event ID를 유지했다.
+
+### Backlog Age와 Failure Duration의 차이
+
+실제 측정에서:
+
+```text
+oldest_pending_age
+-
+failure_duration
+```
+
+차이가:
+
+```text
+5.032 ~ 5.033초
+```
+
+로 거의 일정했다.
+
+이는 notification event가 생성된 뒤 실제 첫 webhook 전송 실패가 발생하기까지의 시간이다.
+
+따라서 다음 두 개념을 실제 데이터로 분리했다.
+
+```text
+oldest_pending_age
+→ 사용자가 받아야 할 notification이 전체적으로 얼마나 지연됐는가
+
+failure_duration
+→ webhook transport 자체가 실제로 얼마나 오래 실패했는가
+```
+
+### Failure Count에 대한 운영 판단
+
+실험에서는 retry 간격이 약 4초였으므로:
+
+```text
+failure_count
+1 → 2 → 3 → 4
+```
+
+로 증가했다.
+
+하지만 count는 retry cadence에 의존한다.
+
+같은 1분 장애도:
+
+```text
+5초 retry
+→ 약 12회
+
+30초 retry
+→ 약 2회
+```
+
+가 될 수 있다.
+
+따라서 단순 count를 장애 severity의 주 기준으로 삼는 것보다 실제 시간인 `failure_duration_sec`를 주 기준으로 삼는 것이 더 안정적이라는 판단을 얻었다.
+
+### Last Failure Age에 대한 운영 판단
+
+각 retry 직후:
+
+```text
+0.136
+0.285
+0.434
+0.586
+```
+
+으로 낮게 유지됐다.
+
+Retry를 멈춘 이후에는:
+
+```text
+last_failure_age_sec=18.185
+```
+
+까지 증가했다.
+
+따라서 `last_failure_age`는 장애 심각도 자체보다:
+
+```text
+retry loop가 최근에도 실제로 실행되고 있는가
+```
+
+를 관찰하는 liveness 지표 후보로 볼 수 있다.
+
+### 현재 지표 역할
+
+이번 실험을 통해 다음 운영 역할을 정리했다.
+
+```text
+failure_kind
+→ 장애 유형
+
+permanent
+→ 즉시 CRITICAL
+
+failure_duration
+→ retryable 장애 severity의 주 기준
+
+failure_count
+→ retry 횟수 및 보조 진단 정보
+
+last_failure_age
+→ retry loop liveness 후보
+
+oldest_pending_age
+→ notification 사용자 영향 / backlog age
+
+pending_events
+→ backlog 크기
+```
+
+### 최종 실험 상태
+
+Retry를 중단한 뒤 실제 상태:
+
+```text
+failure_count=4
+failure_duration_sec=30.185
+last_failure_age_sec=18.185
+
+pending_events=1
+oldest_pending_age_sec=35.218
+
+final_pending=1
+final_receipts=0
+```
+
+아직 webhook 전달이 성공하지 않았으므로 pending과 active failure가 남아 있는 것이 정상이다.
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 다음 운영 개념을 실제 failure injection과 측정으로 경험했다.
+
+```text
+failure duration
+retry count
+retry cadence
+last-attempt age
+backlog age
+user impact와 transport health의 차이
+monitoring configuration validation
+severity aggregation
+permanent failure policy
+retry loop liveness
+실제 측정을 바탕으로 한 alert 기준 설계
+```
+
+특히 비슷해 보이는 여러 시간 지표를 임의로 하나로 합치지 않고 각각 어떤 운영 질문에 답하는지 실제 수치로 검증했다.
+
+### 보존할 증거
+
+```text
+persistent_failure_observability=PASS
+
+failure_duration_sec=6.718
+last_failure_age_sec=6.718
+
+persistent_failure_retry_observability=PASS
+
+failure_count=2
+failure_duration_sec=17.820
+last_failure_age_sec=1.820
+
+failure_count_warning_rc=1
+failure_count_critical_rc=2
+
+failure_duration_warning_rc=1
+failure_duration_critical_rc=2
+
+permanent_failure_checker_rc=2
+
+bad_failure_count_threshold_rc=3
+bad_failure_duration_threshold_rc=3
+zero_failure_threshold_rc=3
+bad_config_without_state_rc=3
+corrupt_threshold_regression_rc=3
+
+event_id=1787210007147775125-1271557
+
+attempt1:
+failure_count=1
+failure_duration=0.136
+last_failure_age=0.136
+oldest_pending_age=5.168
+
+attempt2:
+failure_count=2
+failure_duration=4.285
+last_failure_age=0.285
+oldest_pending_age=9.318
+
+attempt3:
+failure_count=3
+failure_duration=8.434
+last_failure_age=0.434
+oldest_pending_age=13.467
+
+attempt4:
+failure_count=4
+failure_duration=12.586
+last_failure_age=0.586
+oldest_pending_age=17.618
+
+backlog_minus_failure_min_sec=5.032
+backlog_minus_failure_max_sec=5.033
+
+repeated_failure_measurement=PASS
+
+final failure_count=4
+final failure_duration_sec=30.185
+final last_failure_age_sec=18.185
+final oldest_pending_age_sec=35.218
+final_pending=1
+final_receipts=0
+```
+
+### 이력서 성과 문장 초안
+
+- Webhook transport 장애를 `failure duration`, `retry count`, `last retry age`, `notification backlog age`로 분리 관측하는 checker를 구현하고 실제 connection failure 4회 실험을 통해 동일 event에서 `failure_count 1→4`, `failure_duration 0.136s→12.586s`, `oldest pending age 5.168s→17.618s` 변화를 측정
+- Retry 횟수가 retry cadence에 종속된다는 점을 실제 장애 실험으로 검증하고, retryable alert severity는 `failure_duration`을 주 기준으로, `failure_count`는 보조 진단값, `last_failure_age`는 retry-loop liveness 지표로 분리하는 운영 정책을 설계
+- Notification event 생성부터 첫 transport failure까지 약 `5.032~5.033초` 차이를 실측해 사용자 관점의 backlog age와 transport 장애 지속시간을 구분하고, permanent failure는 threshold 없이 즉시 CRITICAL로 평가하도록 구성
+
+Production alert threshold 숫자가 실제 운영에서 확정된 것처럼 표현하지 않는다.
+
+### 예상 면접 질문
+
+```text
+failure_duration과 oldest_pending_age는 왜 다른가?
+
+failure_count를 주 alert 기준으로 사용하지 않은 이유는 무엇인가?
+
+retry cadence가 바뀌면 failure_count는 어떻게 달라지는가?
+
+last_failure_age는 어떤 운영 문제를 발견하는 데 사용할 수 있는가?
+
+active retryable failure인데 status=OK일 수 있는 이유는 무엇인가?
+
+왜 permanent failure는 즉시 CRITICAL인가?
+
+state 파일이 없는데 checker 설정이 잘못된 경우 왜 UNKNOWN이어야 하는가?
+
+사용자 영향과 transport health를 각각 어떤 지표로 보는가?
+
+Production WARNING/CRITICAL 값을 아직 정하지 않은 이유는 무엇인가?
+```
+
+### 블로그 소재
+
+제목 후보:
+
+```text
+Webhook 장애를 몇 번 실패했는지가 아니라 얼마나 오래 실패했는지 봐야 하는 이유
+```
+
+또는:
+
+```text
+Retry Count, Failure Duration, Queue Age는 같은 장애 지표가 아니다
+```
+
+구성:
+
+```text
+1. Persistent failure state 도입
+2. Failure checker 구현
+3. Count / Duration threshold
+4. Permanent 즉시 CRITICAL 정책
+5. Connection refused 4회 반복 실험
+6. Failure count 증가
+7. Failure duration 증가
+8. Last failure age의 의미
+9. Outbox age와 약 5초 차이가 난 이유
+10. Retry cadence가 count를 왜곡하는 방식
+11. Production threshold를 아직 정하지 않은 이유
+12. 실제 운영에서 사용할 지표 역할
+```
+
+### 다음 한 단계 높은 과제
+
+현재 checker와 threshold 구조는 준비됐지만 실제 production retry cadence와 alert threshold 숫자는 아직 없다.
+
+다음 단계에서는 systemd notification 실행 경로에 다음 요소를 연결하는 것을 검토한다.
+
+```text
+persistent failure state path
+failure state checker
+notification outbox checker
+실제 retry cadence
+```
+
+그 후 의도적인 장시간 webhook 장애를 만들어 실제 production 실행 주기에서 수치를 측정하고 WARNING/CRITICAL 기준을 결정할 수 있다.

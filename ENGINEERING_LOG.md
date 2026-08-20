@@ -12224,3 +12224,863 @@ dead-letter
 ```
 
 이들은 실제 운영 요구와 장애 데이터를 기준으로 후속 적용한다.
+
+---
+
+## Persistent Failure Checker 및 반복 장애 지표 비교 검증
+
+### 구현 파일
+
+```text
+scripts/check-notification-failure-state.py
+```
+
+### Checker 관측값
+
+Persistent webhook failure state에서 다음 값을 출력하도록 구현했다.
+
+```text
+status
+active_failure
+failure_kind_status
+count_threshold_status
+duration_threshold_status
+transport
+failed_event_id
+failure_kind
+failure_reason
+failure_count
+failure_duration_sec
+last_failure_age_sec
+first_failed_at
+last_failed_at
+```
+
+### Failure State 없음
+
+State 파일이 존재하지 않을 경우 현재 transport 장애가 없는 것으로 처리했다.
+
+```text
+status=OK
+active_failure=false
+failure_count=0
+failure_duration_sec=N/A
+last_failure_age_sec=N/A
+missing_failure_state_rc=0
+```
+
+### 실제 Connection Failure 관측
+
+실제 connection refused를 발생시킨 뒤 state를 읽었다.
+
+```text
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=1
+
+failure_duration_sec=6.718
+last_failure_age_sec=6.718
+```
+
+검증:
+
+```text
+persistent_failure_observability=PASS
+```
+
+### 동일 Event 두 번째 Failure
+
+동일 pending event를 다시 전송해 실패시켰다.
+
+```text
+failure_count=2
+failure_duration_sec=17.820
+last_failure_age_sec=1.820
+```
+
+`first_failed_at`은 유지됐고 `last_failed_at`은 갱신됐다.
+
+검증:
+
+```text
+persistent_failure_retry_observability=PASS
+```
+
+이를 통해 다음 두 값을 실제로 분리해 확인했다.
+
+```text
+failure_duration_sec
+→ 최초 failure부터의 전체 장애 지속시간
+
+last_failure_age_sec
+→ 최근 failure 이후 경과시간
+```
+
+### Severity Threshold
+
+Retryable failure에 optional threshold를 추가했다.
+
+```text
+--warn-count
+--critical-count
+--warn-duration-sec
+--critical-duration-sec
+```
+
+Threshold가 없을 때:
+
+```text
+active_failure=true
+failure_kind=retryable
+failure_count=2
+
+status=OK
+default_retryable_rc=0
+```
+
+을 유지했다.
+
+### Count Threshold 검증
+
+```text
+failure_count=2
+warn-count=2
+critical-count=3
+
+→ WARNING
+→ rc=1
+```
+
+```text
+failure_count=2
+warn-count=1
+critical-count=2
+
+→ CRITICAL
+→ rc=2
+```
+
+### Duration Threshold 검증
+
+실제 failure duration을 기준으로 테스트 threshold를 동적으로 계산했다.
+
+WARNING:
+
+```text
+status=WARNING
+duration_threshold_status=WARNING
+failure_duration_warning_rc=1
+```
+
+CRITICAL:
+
+```text
+status=CRITICAL
+duration_threshold_status=CRITICAL
+failure_duration_critical_rc=2
+```
+
+테스트에 사용한 숫자는 production policy가 아니다.
+
+### Permanent Failure 정책 검증
+
+Valid permanent state fixture:
+
+```text
+failure_kind=permanent
+failure_reason=http_400
+failure_count=1
+```
+
+결과:
+
+```text
+status=CRITICAL
+failure_kind_status=CRITICAL
+count_threshold_status=OK
+duration_threshold_status=OK
+permanent_failure_checker_rc=2
+```
+
+따라서 permanent failure는 count와 duration에 관계없이 즉시 CRITICAL이 됐다.
+
+### 잘못된 Threshold 검증
+
+다음 설정은 모두 UNKNOWN으로 처리했다.
+
+```text
+warn-count >= critical-count
+warn-duration-sec >= critical-duration-sec
+threshold <= 0
+```
+
+exit code:
+
+```text
+3
+```
+
+State 파일이 존재하지 않는 경우에도 configuration validation을 먼저 수행했다.
+
+```text
+status=UNKNOWN
+checker_error=--warn-count must be lower than --critical-count
+bad_config_without_state_rc=3
+```
+
+따라서 state 부재가 잘못된 checker configuration을 숨기지 않는다.
+
+### 손상 State 회귀 검증
+
+손상 JSON에서:
+
+```text
+status=UNKNOWN
+corrupt_threshold_regression_rc=3
+```
+
+을 유지했다.
+
+### 실제 반복 Retryable Failure 측정
+
+Fresh notification event를 생성하고 동일 event에 connection refused를 네 차례 발생시켰다.
+
+Event:
+
+```text
+1787210007147775125-1271557
+```
+
+실제 측정:
+
+```text
+attempt  adapter_rc  failure_count  failure_duration_sec  last_failure_age_sec  oldest_pending_age_sec  pending_events
+1        2           1              0.136                 0.136                 5.168                   1
+2        2           2              4.285                 0.285                 9.318                   1
+3        2           3              8.434                 0.434                13.467                   1
+4        2           4             12.586                 0.586                17.618                   1
+```
+
+네 번 모두:
+
+```text
+failed_event_id
+=
+oldest_event_id
+=
+1787210007147775125-1271557
+```
+
+이었다.
+
+검증:
+
+```text
+repeated_failure_measurement=PASS
+```
+
+Outbox age와 failure duration의 차이:
+
+```text
+backlog_minus_failure_min_sec=5.032
+backlog_minus_failure_max_sec=5.033
+```
+
+### 반복 장애 종료 시점 최종 상태
+
+추가 시간이 지난 뒤:
+
+```text
+active_failure=true
+failure_count=4
+failure_duration_sec=30.185
+last_failure_age_sec=18.185
+```
+
+Outbox:
+
+```text
+pending_events=1
+pending_bytes=341
+oldest_pending_age_sec=35.218
+```
+
+최종:
+
+```text
+final_pending=1
+final_receipts=0
+```
+
+아직 실제 notification delivery가 성공하지 않았으므로 정상적인 상태다.
+
+### 측정으로 확인한 지표 특성
+
+`failure_count`는 retry cadence에 종속된다.
+
+이번 실험에서는 약 4초마다 retry했기 때문에 다음과 같이 증가했다.
+
+```text
+1 → 2 → 3 → 4
+```
+
+반면 `failure_duration_sec`는 retry 횟수와 관계없이 실제 최초 transport failure 이후 시간을 표현한다.
+
+따라서 retryable failure의 production severity 주 기준 후보는 `failure_duration_sec`로 판단했다.
+
+`failure_count`는 retry storm, retry budget, retry 동작 확인을 위한 보조 지표로 유지한다.
+
+`last_failure_age_sec`는 retry 직후 다시 낮아지므로 현재 severity의 주 기준에는 사용하지 않는다.
+
+향후 active failure 상태인데 `last_failure_age_sec`가 비정상적으로 증가하면 retry scheduler/worker 정지를 탐지하는 용도로 검토할 수 있다.
+
+### 현재 남은 과제
+
+아직 production duration threshold 숫자는 확정하지 않았다.
+
+다음 근거가 필요하다.
+
+```text
+실제 systemd notification retry cadence
+허용 가능한 alert 전달 지연
+실제 webhook provider 장애 특성
+운영자가 원하는 notification SLA
+장기 장애 시 Outbox 증가량
+```
+
+실제 운영 근거를 확보하기 전에는 테스트 threshold를 production 값으로 사용하지 않는다.
+
+---
+
+## Persistent Failure State Checker 및 반복 Transport 장애 측정
+
+### 구현 파일
+
+```text
+scripts/check-notification-failure-state.py
+```
+
+### 목표
+
+Persistent webhook failure state를 사람이 JSON 파일을 직접 열지 않아도 운영 상태로 조회할 수 있도록 checker를 추가했다.
+
+관측 항목:
+
+```text
+active_failure
+failure_kind
+failure_reason
+failure_count
+failure_duration_sec
+last_failure_age_sec
+first_failed_at
+last_failed_at
+```
+
+이후 retryable failure에 count/duration threshold를 선택적으로 적용하고 permanent failure는 즉시 CRITICAL로 평가하도록 확장했다.
+
+### State 없음
+
+Failure state 파일이 없는 경우:
+
+```text
+status=OK
+active_failure=false
+transport=N/A
+failed_event_id=N/A
+failure_kind=N/A
+failure_reason=N/A
+failure_count=0
+failure_duration_sec=N/A
+last_failure_age_sec=N/A
+first_failed_at=N/A
+last_failed_at=N/A
+missing_failure_state_rc=0
+```
+
+을 확인했다.
+
+### 실제 Connection Failure 관측
+
+Adapter를 실제 사용하지 않는 localhost port에 연결했다.
+
+```text
+http://127.0.0.1:1/aerotrace
+```
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+failure_count=1
+failure_kind=retryable
+failure_reason=connection_error
+transport_failure_rc=2
+```
+
+2초 이상 경과 후 checker 결과:
+
+```text
+status=OK
+active_failure=true
+transport=webhook
+failed_event_id=1787209586391601425-1262022
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=1
+failure_duration_sec=6.718
+last_failure_age_sec=6.718
+first_failed_at=2026-08-20T07:06:26+00:00
+last_failed_at=2026-08-20T07:06:26+00:00
+failure_checker_rc=0
+```
+
+자동 검증:
+
+```text
+persistent_failure_observability=PASS
+```
+
+### 두 번째 실제 Failure
+
+동일 pending event를 다시 connection refused 상태로 전송했다.
+
+결과:
+
+```text
+failure_count=2
+failure_duration_sec=17.820
+last_failure_age_sec=1.820
+first_failed_at=2026-08-20T07:06:26+00:00
+last_failed_at=2026-08-20T07:06:42+00:00
+second_transport_failure_rc=2
+```
+
+자동 검증:
+
+```text
+persistent_failure_retry_observability=PASS
+```
+
+확인한 관계:
+
+```text
+first_failed_at
+→ 유지
+
+last_failed_at
+→ 갱신
+
+failure_count
+→ 1 → 2
+
+failure_duration
+→ 증가
+
+last_failure_age
+→ 최근 실패 직후 다시 작아짐
+```
+
+### 손상 State Checker
+
+손상 JSON:
+
+```text
+{broken json
+```
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=invalid failure state: ...
+corrupt_failure_checker_rc=3
+```
+
+### Directory Path 오류
+
+Failure state path로 directory를 전달했다.
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=failure state path is not a file: ...
+failure_state_path_rc=3
+```
+
+### Severity Threshold 구현
+
+추가한 CLI:
+
+```text
+--warn-count
+--critical-count
+--warn-duration-sec
+--critical-duration-sec
+```
+
+Threshold를 설정하지 않으면 retryable active failure가 있어도 관측 전용 상태를 유지한다.
+
+실제 값:
+
+```text
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=2
+failure_duration_sec=201.062
+last_failure_age_sec=185.062
+```
+
+결과:
+
+```text
+failure_kind_status=OK
+count_threshold_status=OK
+duration_threshold_status=OK
+status=OK
+default_retryable_rc=0
+```
+
+### Count WARNING
+
+조건:
+
+```text
+failure_count=2
+warn-count=2
+critical-count=3
+```
+
+결과:
+
+```text
+status=WARNING
+count_threshold_status=WARNING
+failure_count_warning_rc=1
+```
+
+### Count CRITICAL
+
+조건:
+
+```text
+failure_count=2
+warn-count=1
+critical-count=2
+```
+
+결과:
+
+```text
+status=CRITICAL
+count_threshold_status=CRITICAL
+failure_count_critical_rc=2
+```
+
+### Duration WARNING
+
+Baseline:
+
+```text
+current_failure_duration=213.903
+```
+
+현재 duration보다 낮은 warning threshold와 충분히 높은 critical threshold를 동적으로 설정했다.
+
+실제 검사 시:
+
+```text
+failure_duration_sec=220.768
+duration_threshold_status=WARNING
+failure_duration_warning_rc=1
+```
+
+### Duration CRITICAL
+
+현재 duration보다 낮은 critical threshold를 설정했다.
+
+실제 검사 시:
+
+```text
+failure_duration_sec=229.207
+duration_threshold_status=CRITICAL
+failure_duration_critical_rc=2
+```
+
+### Permanent Failure 즉시 CRITICAL
+
+Valid permanent failure fixture:
+
+```text
+failure_kind=permanent
+failure_reason=http_400
+failure_count=1
+```
+
+실제 검사:
+
+```text
+status=CRITICAL
+failure_kind_status=CRITICAL
+count_threshold_status=OK
+duration_threshold_status=OK
+failure_duration_sec=9.958
+last_failure_age_sec=6.958
+permanent_failure_checker_rc=2
+```
+
+Threshold가 없어도 permanent 자체로 CRITICAL이 됨을 확인했다.
+
+### 잘못된 Threshold
+
+Count:
+
+```text
+warn-count=10
+critical-count=5
+```
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=--warn-count must be lower than --critical-count
+bad_failure_count_threshold_rc=3
+```
+
+Duration:
+
+```text
+warn-duration-sec=30
+critical-duration-sec=10
+```
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=--warn-duration-sec must be lower than --critical-duration-sec
+bad_failure_duration_threshold_rc=3
+```
+
+0 threshold:
+
+```text
+warn-count=0
+```
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=--warn-count must be > 0
+zero_failure_threshold_rc=3
+```
+
+### State 없음 + 잘못된 Checker 설정
+
+Failure state 파일이 없는 상태에서도 configuration 검증을 먼저 수행했다.
+
+조건:
+
+```text
+warn-count=10
+critical-count=5
+```
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=--warn-count must be lower than --critical-count
+bad_config_without_state_rc=3
+```
+
+따라서 state 없음이 checker configuration 오류를 숨기지 않는다.
+
+### Corrupt State 회귀 검증
+
+Threshold 추가 후에도 손상 state 검출이 유지됐다.
+
+```text
+status=UNKNOWN
+corrupt_threshold_regression_rc=3
+```
+
+### 실제 반복 장애 측정
+
+Fresh ALERT event를 생성한 뒤 실제 connection refused를 네 번 반복했다.
+
+동일 event:
+
+```text
+1787210007147775125-1271557
+```
+
+측정 결과:
+
+```text
+attempt  adapter_rc  failure_count  failure_duration_sec  last_failure_age_sec  oldest_pending_age_sec  pending_events
+1        2           1              0.136                 0.136                 5.168                   1
+2        2           2              4.285                 0.285                 9.318                   1
+3        2           3              8.434                 0.434                 13.467                  1
+4        2           4              12.586                0.586                 17.618                  1
+```
+
+모든 시도에서:
+
+```text
+failure_kind=retryable
+failure_reason=connection_error
+pending_events=1
+```
+
+을 유지했다.
+
+자동 검증:
+
+```text
+repeated_failure_measurement=PASS
+```
+
+### Event Identity
+
+네 번의 실패 모두:
+
+```text
+failed_event_id
+=
+oldest_event_id
+=
+1787210007147775125-1271557
+```
+
+이었다.
+
+따라서 새로운 notification을 계속 생성한 것이 아니라 동일 미전송 event를 반복 retry했음을 확인했다.
+
+### Backlog Age와 Transport Failure Duration 차이
+
+각 측정에서:
+
+```text
+oldest_pending_age_sec >= failure_duration_sec
+```
+
+관계가 유지됐다.
+
+측정된 차이:
+
+```text
+backlog_minus_failure_min_sec=5.032
+backlog_minus_failure_max_sec=5.033
+```
+
+이는 notification event 생성 시점부터 첫 실제 webhook 실패 시점까지 약 5초가 있었기 때문이다.
+
+따라서:
+
+```text
+oldest_pending_age
+→ event 자체의 전체 대기시간
+
+failure_duration
+→ 최초 실제 transport failure 이후 시간
+```
+
+으로 의미를 분리했다.
+
+### Last Failure Age 동작
+
+각 retry 직후 측정:
+
+```text
+attempt1=0.136
+attempt2=0.285
+attempt3=0.434
+attempt4=0.586
+```
+
+으로 작게 유지됐다.
+
+Retry를 더 수행하지 않은 뒤 최종 확인:
+
+```text
+failure_count=4
+failure_duration_sec=30.185
+last_failure_age_sec=18.185
+```
+
+이었다.
+
+따라서 `last_failure_age`는 전체 장애 지속시간보다 최근 retry 실행 여부를 나타내는 값으로 해석하는 것이 적절함을 확인했다.
+
+### 최종 Outbox 상태
+
+실험 종료 시 notification은 아직 전달되지 않았다.
+
+Failure checker:
+
+```text
+status=OK
+active_failure=true
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=4
+failure_duration_sec=30.185
+last_failure_age_sec=18.185
+```
+
+Outbox checker:
+
+```text
+status=OK
+pending_events=1
+pending_bytes=341
+oldest_pending_age_sec=35.218
+oldest_event_id=1787210007147775125-1271557
+```
+
+파일 상태:
+
+```text
+final_pending=1
+final_receipts=0
+```
+
+이는 실제 delivery가 성공하지 않았으므로 정상이다.
+
+### 지표 역할 결론
+
+실제 측정 결과를 바탕으로 다음과 같이 구분했다.
+
+```text
+failure_duration_sec
+→ retryable 장애 severity의 주 시간 기준
+
+failure_count
+→ retry cadence에 의존하는 보조 진단 지표
+
+last_failure_age_sec
+→ retry worker/timer liveness 후보
+
+oldest_pending_age_sec
+→ notification backlog와 사용자 영향
+
+pending_events
+→ backlog 수량
+
+failure_kind=permanent
+→ 즉시 CRITICAL
+```
+
+### Production Threshold
+
+이번 단계에서는 production threshold 값을 확정하지 않았다.
+
+실험에 사용한 count와 duration 숫자는 코드 동작 검증용이다.
+
+Production 값은 실제 retry cadence와 운영 요구가 확정된 뒤 측정 근거와 함께 결정한다.
