@@ -3694,3 +3694,360 @@ oldest pending age
 vs
 actual transport failure duration
 ```
+
+---
+
+### Portfolio Checkpoint — Notification Transport 장애 상태 영속화와 Crash-window 복구
+
+Webhook notification의 미전송 event age뿐 아니라 실제 transport 장애가 언제 시작됐고 몇 번 연속 실패했는지 추적하기 위해 persistent failure state를 구현하고 실제 network/filesystem failure를 조합해 복구 semantics를 검증했다.
+
+### 구현한 Persistent Failure State
+
+현재 상태:
+
+```text
+failure_state_schema_version
+transport
+failed_event_id
+failure_kind
+failure_reason
+first_failed_at
+last_failed_at
+failure_count
+```
+
+을 저장한다.
+
+Failure state는 webhook transport에서 optional로 활성화할 수 있다.
+
+### 연속 장애 추적 실험
+
+사용하지 않는 localhost port에 webhook을 전송해 connection refused를 발생시켰다.
+
+첫 실패:
+
+```text
+failure_count=1
+failure_kind=retryable
+failure_reason=connection_error
+first_failed_at=2026-08-20T00:25:34+00:00
+last_failed_at=2026-08-20T00:25:34+00:00
+```
+
+검증:
+
+```text
+failure_state_first_attempt=PASS
+```
+
+동일 event 두 번째 실패:
+
+```text
+failure_count=2
+first_failed_at=2026-08-20T00:25:34+00:00
+last_failed_at=2026-08-20T00:25:49+00:00
+```
+
+검증:
+
+```text
+failure_state_second_attempt=PASS
+```
+
+이를 통해 최초 장애 시각과 최근 장애 시각을 분리해 추적할 수 있음을 확인했다.
+
+### Permanent Failure 구조화
+
+HTTP 400을 실제 서버에서 반환하도록 했다.
+
+결과:
+
+```text
+http_400_failure_rc=5
+failure_count=1
+failure_kind=permanent
+failure_reason=http_400
+```
+
+검증:
+
+```text
+permanent_failure_state=PASS
+```
+
+따라서 retryable/permanent를 로그 문자열이 아닌 구조화된 상태로 저장할 수 있게 했다.
+
+### 성공 Recovery
+
+연속 failure 이후 HTTP 204를 반환하는 local server로 동일 pending event를 성공시켰다.
+
+결과:
+
+```text
+failure_state_cleared=true
+delivery_result=DELIVERED
+remaining_events=0
+recovery_rc=0
+
+failure_state_removed=PASS
+pending_after_recovery=0
+receipts_after_recovery=1
+```
+
+현재 연속 장애가 끝나면 failure state를 제거하는 구조를 검증했다.
+
+### 성공 후 내부 상태 정리 실패 발견
+
+초기 구현 검토 중 다음 crash-window를 발견했다.
+
+```text
+HTTP 성공
+→ receipt 저장
+→ pending 삭제
+→ failure state 삭제 실패
+```
+
+이 경우 pending이 이미 없어 stale failure state만 남을 수 있었다.
+
+이를 방지하기 위해 성공 finalization 순서를 수정했다.
+
+```text
+HTTP 성공
+→ receipt 저장
+→ failure state 삭제
+→ pending ACK
+```
+
+### Filesystem Permission Failure 실험
+
+Failure state directory를 read/execute-only로 만들어 state unlink가 실패하도록 했다.
+
+```text
+chmod 500 <state-directory>
+```
+
+Receiver는 HTTP 204를 반환했지만 failure state clear는 permission denied로 실패했다.
+
+결과:
+
+```text
+clear_failure_rc=4
+
+pending_after_clear_failure=1
+receipts_after_clear_failure=1
+failure_state_after_clear_failure=1
+```
+
+즉 외부 notification 성공 증거인 receipt는 보존하면서 pending ACK를 하지 않아 복구 가능한 상태를 유지했다.
+
+### Duplicate HTTP Delivery 없는 Recovery
+
+위 실패 상태에서 HTTP server를 완전히 종료했다.
+
+서버가 없으므로 network 요청을 다시 실행했다면 connection refused가 발생해야 했다.
+
+하지만 adapter는 기존 receipt를 발견했다.
+
+결과:
+
+```text
+failure_state_cleared=true
+delivery_result=ACK_EXISTING
+ack_existing_rc=0
+```
+
+최종:
+
+```text
+final_pending=0
+final_receipts=1
+final_failure_state=0
+```
+
+즉 external delivery 성공 후 local bookkeeping 실패가 발생하더라도 receipt 기반으로 HTTP를 재전송하지 않고 복구하는 경로를 실제로 검증했다.
+
+### 손상 State 방어
+
+Failure state를:
+
+```text
+{broken json
+```
+
+으로 손상시켰다.
+
+실행 결과:
+
+```text
+corrupt_failure_state_rc=4
+```
+
+그리고 실행 전후 SHA-256 값이 동일했다.
+
+```text
+c3e7d1b00a65589b59f816c0b0b668d795a3c28123697d5ab9555bdb8aa04604
+```
+
+검증:
+
+```text
+corrupt_state_preserved=PASS
+```
+
+따라서 손상된 운영 상태를 조용히 덮어써 장애 정보를 숨기지 않고 명시적으로 실패하도록 했다.
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 다음 개념을 실제 코드와 failure injection으로 다뤘다.
+
+```text
+persistent failure state
+retryable vs permanent failure
+structured failure reason
+first failure timestamp
+last failure timestamp
+consecutive failure count
+durable state write
+file fsync
+directory fsync
+atomic replace
+success finalization ordering
+partial success
+crash-window
+receipt-based recovery
+idempotent ACK
+filesystem permission failure injection
+corrupted state detection
+```
+
+특히 단순 HTTP 오류 처리보다 외부 side effect와 로컬 상태 변경 사이에서 어느 순서로 durable state를 남겨야 복구 가능한지를 직접 검증했다.
+
+### 보존할 로그와 증거
+
+```text
+failure_state_first_attempt=PASS
+
+failure_count=1
+failure_kind=retryable
+failure_reason=connection_error
+
+failure_state_second_attempt=PASS
+
+failure_count=2
+first_failed_at=2026-08-20T00:25:34+00:00
+last_failed_at=2026-08-20T00:25:49+00:00
+
+failure_state_removed=PASS
+pending_after_recovery=0
+receipts_after_recovery=1
+
+clear_failure_rc=4
+
+pending_after_clear_failure=1
+receipts_after_clear_failure=1
+failure_state_after_clear_failure=1
+
+delivery_result=ACK_EXISTING
+ack_existing_rc=0
+
+final_pending=0
+final_receipts=1
+final_failure_state=0
+
+http_400_failure_rc=5
+failure_kind=permanent
+failure_reason=http_400
+permanent_failure_state=PASS
+
+corrupt_failure_state_rc=4
+corrupt_state_preserved=PASS
+corrupt_pending_after=1
+corrupt_receipts_after=0
+```
+
+### 이력서 성과 문장 초안
+
+- Webhook notification의 연속 transport 장애를 추적하기 위해 `first_failed_at`, `last_failed_at`, `failure_count`, 구조화된 failure reason을 persistent state로 저장하고 connection failure 및 HTTP 400 시나리오를 실제 서버로 검증
+- 외부 Webhook 전달 성공 후 로컬 failure-state 정리가 실패하는 partial-success 시나리오를 filesystem permission failure로 재현하고, `receipt → failure-state clear → pending ACK` 순서로 finalization을 재설계해 receipt 기반 `ACK_EXISTING` 복구 시 HTTP 중복 전송을 방지
+- 손상된 persistent failure state를 hash 비교로 검증해 자동 덮어쓰기 대신 delivery 이전에 `rc=4`로 중단하도록 설계하여 운영 상태 손실을 방지
+
+실제 production systemd 배포나 외부 SaaS webhook provider까지 완료된 것으로 표현하지 않는다.
+
+### 예상 면접 질문
+
+```text
+Outbox oldest age와 transport failure duration은 왜 다른가?
+
+왜 failure_count를 state에 저장하는가?
+
+왜 exception 문자열을 파싱하지 않고 failure_reason을 구조화했는가?
+
+왜 webhook URL을 failure state에 저장하지 않는가?
+
+HTTP 성공 후 failure state를 언제 삭제해야 하는가?
+
+왜 receipt보다 먼저 failure state를 삭제하지 않는가?
+
+왜 pending을 failure state보다 먼저 삭제하면 위험한가?
+
+ACK_EXISTING은 어떤 장애를 복구하는가?
+
+HTTP server를 종료했는데도 ACK_EXISTING이 성공한 이유는 무엇인가?
+
+failure state가 손상됐을 때 왜 자동 초기화하지 않았는가?
+
+이 구조가 exactly-once delivery를 보장하는가?
+```
+
+### 블로그 소재
+
+제목 후보:
+
+```text
+Webhook은 성공했는데 로컬 상태 저장이 실패한다면?
+Receipt와 ACK 순서를 장애 주입으로 검증한 과정
+```
+
+핵심 구성:
+
+```text
+1. Outbox age만으로 부족했던 이유
+2. Persistent failure state 도입
+3. 연속 실패 count와 timestamps
+4. Retryable / Permanent 구조화
+5. HTTP 성공 후 state clear 순서
+6. Permission denied 장애 주입
+7. Receipt는 있는데 pending도 남은 상태
+8. Server를 내리고 재시도
+9. ACK_EXISTING으로 network 호출 없이 복구
+10. exactly-once와 idempotency의 차이
+```
+
+### 다음 한 단계 높은 과제
+
+Persistent failure state는 현재 장애 정보를 저장할 수 있지만 운영자가 이를 직접 상태로 평가하는 checker는 아직 없다.
+
+다음 단계에서는 다음 값을 읽어 상태를 계산할 수 있도록 한다.
+
+```text
+failure_count
+first_failed_at
+last_failed_at
+failure_kind
+failure_reason
+failure_duration
+```
+
+그리고 Outbox checker의:
+
+```text
+oldest_pending_age
+```
+
+와 함께 비교해 다음 두 상태를 분리해서 관측한다.
+
+```text
+notification backlog age
+vs
+actual webhook transport failure duration
+```
