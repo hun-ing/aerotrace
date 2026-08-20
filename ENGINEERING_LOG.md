@@ -13370,3 +13370,347 @@ persistent failure-state production 경로 연결
 ```
 
 이후 failure-state checker systemd 연결과 production threshold는 별도 단계에서 진행한다.
+
+---
+
+## Production systemd Webhook 장애·재시도·자동 복구 E2E 실험
+
+### 변경 파일
+
+```text
+deploy/systemd/aerotrace-notification-outbox.service
+```
+
+### Webhook systemd 구성
+
+추가:
+
+```text
+EnvironmentFile=/etc/aerotrace/notification.env
+```
+
+Adapter:
+
+```text
+--transport webhook
+--webhook-timeout-sec 5
+--failure-state-file /var/lib/aerotrace-monitoring/notification-failure.json
+```
+
+Network sandbox:
+
+```text
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+```
+
+### Runtime Environment File 검증
+
+테스트 환경파일:
+
+```text
+/etc/aerotrace/notification.env
+```
+
+권한:
+
+```text
+600 root:root
+```
+
+실제 systemd oneshot 실행:
+
+```text
+notification_service_result=success
+notification_service_exec_status=0
+```
+
+을 확인했다.
+
+따라서 systemd가 root-owned environment file을 읽고 `User=huning` service 실행 환경에 전달하는 경로가 실제로 동작했다.
+
+### 빈 Outbox 회귀
+
+빈 Outbox에서:
+
+```text
+receiver_requests_after_idle=0
+failure_state_after_idle=0
+```
+
+을 확인했다.
+
+즉 idle 상태에서 불필요한 HTTP request나 failure state를 생성하지 않는다.
+
+### Webhook ALERT 성공
+
+실제 Collector stop:
+
+```text
+16:52:54
+event=ALERT
+OK → UNKNOWN
+```
+
+Webhook delivery:
+
+```text
+16:53:00
+delivery_result=DELIVERED
+event=ALERT
+remaining_events=0
+```
+
+검증:
+
+```text
+systemd_webhook_alert=PASS
+```
+
+Event ID:
+
+```text
+1787212374958106638-1326724
+```
+
+HTTP header/body와 receipt identity가 일치했다.
+
+### Webhook RECOVERY 성공
+
+Collector start 후:
+
+```text
+systemd_webhook_recovery=PASS
+```
+
+Event:
+
+```text
+1787212410955694121-1327916
+```
+
+성공 경로 최종:
+
+```text
+pending_events=0
+active_failure=false
+final_webhook_receipts=2
+final_receiver_requests=2
+```
+
+### Transport Failure Injection
+
+Webhook receiver를 종료했다.
+
+```text
+receiver_stopped=PASS
+```
+
+Collector를 중지해 실제 ALERT를 생성했다.
+
+Persistent failure state:
+
+```text
+failed_event_id=1787212535955638444-1330962
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=1
+failure_duration_sec=2.599
+```
+
+Outbox:
+
+```text
+pending_events=1
+pending_bytes=385
+oldest_pending_age_sec=8.632
+oldest_event_id=1787212535955638444-1330962
+```
+
+Receipt count:
+
+```text
+2
+```
+
+로 증가하지 않았다.
+
+### Retry 확인
+
+측정 시작:
+
+```text
+failure_count_before_wait=2
+```
+
+12초 후:
+
+```text
+failure_count_after_wait=4
+```
+
+검증:
+
+```text
+systemd_retry_count=2->4
+systemd_webhook_retry=PASS
+```
+
+Journal에서는 이후:
+
+```text
+16:56:05 failure_count=5
+16:56:11 failure_count=6
+```
+
+까지 실제 retry가 이어졌다.
+
+### 실제 Retry 간격
+
+Journal timestamps:
+
+```text
+16:55:47
+16:55:53
+16:55:59
+16:56:05
+16:56:11
+```
+
+약 6초 간격이었다.
+
+Timer configuration:
+
+```text
+OnUnitInactiveSec=5s
+```
+
+와 실제 실행 cadence가 정확히 같지 않음을 확인했다.
+
+### Pending Identity
+
+Failure state:
+
+```text
+failed_event_id=1787212535955638444-1330962
+```
+
+Outbox:
+
+```text
+pending_event_id=1787212535955638444-1330962
+```
+
+검증:
+
+```text
+failure_pending_identity=PASS
+```
+
+동일 notification event가 실패 상태와 Outbox에서 보존됐다.
+
+### Receiver 복구
+
+Collector는 DOWN 상태를 유지하고 receiver만 재시작했다.
+
+```text
+receiver_recovered=1
+```
+
+수동 adapter 실행 없이 systemd timer만 기다렸다.
+
+결과:
+
+```text
+automatic_webhook_recovery=1
+```
+
+복구된 receiver request:
+
+```text
+event=ALERT
+event_id=1787212535955638444-1330962
+```
+
+검증:
+
+```text
+systemd_failure_recovery_identity=PASS
+```
+
+성공 후:
+
+```text
+active_failure=false
+failure_count=0
+pending_events=0
+```
+
+Webhook receipts:
+
+```text
+3
+```
+
+으로 증가했다.
+
+### 최종 RECOVERY
+
+Transport 복구 후 Collector를 시작했다.
+
+```text
+final_recovery_delivered=1
+```
+
+최종 receiver 기록 마지막 두 건:
+
+```text
+2026-08-20 16:56:17 KST
+ALERT
+1787212535955638444-1330962
+
+2026-08-20 16:56:47 KST
+RECOVERY
+1787212601963824599-1332855
+```
+
+최종:
+
+```text
+pending_events=0
+active_failure=false
+두 timer active/waiting
+```
+
+### Runtime 정리
+
+테스트 Webhook receiver와 localhost environment 설정은 실제 production endpoint가 아니므로 테스트 종료 후 제거한다.
+
+현재 서버 runtime은 검증된 local-file transport로 복원하고 repository에는 Webhook-capable systemd unit 변경을 유지한다.
+
+실제 외부 endpoint를 선택할 때 다시 environment file을 생성하여 Webhook runtime을 활성화한다.
+
+### 남은 위험
+
+현재 permanent HTTP failure도 timer에 의해 반복 실행될 수 있다.
+
+예:
+
+```text
+HTTP 400
+→ adapter rc=5
+→ pending 유지
+→ 다음 timer에서 다시 실행
+```
+
+따라서 향후:
+
+```text
+permanent failure retry 정책
+dead-letter
+retry budget
+backoff
+```
+
+을 별도로 설계해야 한다.
+
+Timeout 같은 ambiguous delivery에서는 외부 receiver가 이미 처리했어도 sender가 재전송할 수 있으므로 exactly-once는 보장하지 않는다.

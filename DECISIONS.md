@@ -6952,3 +6952,343 @@ production WARNING / CRITICAL threshold
 ```
 
 다음 단계에서 local-file 기준선을 유지한 채 transport 부분만 webhook으로 교체한다.
+
+---
+
+## Production systemd Webhook Transport 장애 복구 정책 검증
+
+### 해결하려는 문제
+
+Notification Outbox와 Webhook adapter의 장애 복구 semantics는 개별 script 테스트에서는 검증됐지만 실제 production systemd timer 환경에서도 동일하게 동작하는지 확인할 필요가 있었다.
+
+검증 대상은 다음 전체 경로다.
+
+```text
+Collector 상태 변화
+→ evaluator
+→ durable Notification Outbox
+→ systemd notification timer
+→ Webhook
+→ receipt
+
+Webhook 장애
+→ persistent failure state
+→ pending 유지
+→ systemd retry
+→ transport 복구
+→ 동일 event 재전송
+→ receipt
+→ failure state clear
+→ pending ACK
+```
+
+### Webhook Configuration 분리
+
+Webhook URL을 repository나 systemd unit에 직접 저장하지 않는다.
+
+다음 runtime 환경파일을 사용하도록 unit을 구성했다.
+
+```text
+/etc/aerotrace/notification.env
+```
+
+Systemd:
+
+```text
+EnvironmentFile=/etc/aerotrace/notification.env
+```
+
+테스트 당시 파일 권한:
+
+```text
+mode=600
+owner=root
+group=root
+```
+
+Webhook URL 또는 credential이 Git repository에 포함되지 않도록 서버별 runtime configuration으로 분리한다.
+
+### Network Sandbox
+
+기존 local-file processor는:
+
+```text
+RestrictAddressFamilies=AF_UNIX
+```
+
+만 허용했다.
+
+Webhook HTTP 통신을 위해:
+
+```text
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+```
+
+으로 확장했다.
+
+`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only` 등의 기존 sandbox는 유지했다.
+
+### Production Failure State 경로
+
+Webhook failure state는:
+
+```text
+/var/lib/aerotrace-monitoring/notification-failure.json
+```
+
+에 저장한다.
+
+Notification Outbox와 receipt도 동일한 monitoring StateDirectory 책임 경계에 둔다.
+
+```text
+/var/lib/aerotrace-monitoring/
+    collector-queue-alert.json
+    notification-outbox/
+    notification-receipts/
+    notification-failure.json
+```
+
+### Webhook 성공 경로 검증
+
+localhost HTTP 204 receiver를 실제 systemd Webhook endpoint로 연결했다.
+
+실제 Collector를 중지하여 ALERT를 발생시킨 결과:
+
+```text
+2026-08-20 16:52:54 KST
+event=ALERT
+current_status=UNKNOWN
+```
+
+Webhook processor:
+
+```text
+2026-08-20 16:53:00 KST
+delivery_result=DELIVERED
+event=ALERT
+remaining_events=0
+```
+
+검증:
+
+```text
+systemd_webhook_alert=PASS
+```
+
+Receiver request의:
+
+```text
+X-AeroTrace-Event-Id
+HTTP body event_id
+receipt event_id
+```
+
+가 모두 동일함을 확인했다.
+
+Collector 복구 후 RECOVERY도 같은 경로로 검증했다.
+
+```text
+systemd_webhook_recovery=PASS
+```
+
+성공 테스트 최종:
+
+```text
+webhook receipts=2
+receiver requests=2
+pending_events=0
+active_failure=false
+```
+
+### 실제 Webhook Transport 장애 주입
+
+Webhook receiver를 완전히 종료한 상태에서 실제 Collector를 중지했다.
+
+결과:
+
+```text
+production_failure_state_created=1
+
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=1
+
+pending_events=1
+receipt 증가 없음
+```
+
+Failure state와 pending Outbox의 event identity:
+
+```text
+1787212535955638444-1330962
+```
+
+가 동일했다.
+
+검증:
+
+```text
+failure_pending_identity=PASS
+```
+
+### systemd 자동 Retry
+
+Notification timer는 장애 중 동일 pending event를 반복 처리했다.
+
+실제 journal:
+
+```text
+16:55:47 failure_count=2
+16:55:53 failure_count=3
+16:55:59 failure_count=4
+16:56:05 failure_count=5
+16:56:11 failure_count=6
+```
+
+12초 측정 구간에서도:
+
+```text
+failure_count 2 → 4
+```
+
+증가를 확인했다.
+
+검증:
+
+```text
+systemd_webhook_retry=PASS
+```
+
+### 실제 Retry Cadence
+
+Timer 설정은:
+
+```text
+OnUnitInactiveSec=5s
+```
+
+이지만 실제 실패 시도 간격은 약 6초였다.
+
+이는 `OnUnitInactiveSec`가 이전 oneshot 실행이 끝난 이후부터 다음 실행 간격을 계산하기 때문이다.
+
+따라서 향후 failure count 또는 liveness threshold를 계산할 때:
+
+```text
+설정값 5초
+```
+
+를 정확한 실제 retry cadence로 가정하지 않는다.
+
+실제 systemd 실행시간을 포함한 측정값을 사용한다.
+
+### Transport 자동 복구
+
+Collector는 계속 DOWN 상태로 두고 Webhook receiver만 복구했다.
+
+Adapter를 수동 실행하지 않았다.
+
+Systemd timer가 다음 retry에서 기존 pending ALERT를 자동으로 전송했다.
+
+결과:
+
+```text
+automatic_webhook_recovery=1
+systemd_failure_recovery_identity=PASS
+```
+
+복구된 ALERT event:
+
+```text
+1787212535955638444-1330962
+```
+
+는 장애 중 persistent failure state와 Outbox에 있던 동일 event였다.
+
+성공 후:
+
+```text
+pending_events=0
+active_failure=false
+failure_count=0
+```
+
+으로 복구됐다.
+
+Webhook receipt도:
+
+```text
+2 → 3
+```
+
+으로 증가했다.
+
+### Transport 장애 지속시간 실측
+
+최초 persistent failure:
+
+```text
+first_failed_at=2026-08-20 16:55:41 KST
+```
+
+복구된 ALERT receiver 수신:
+
+```text
+2026-08-20 16:56:17.940 KST
+```
+
+이번 장애 실험에서는 transport failure가 약 37초 지속됐다.
+
+### Collector 최종 복구
+
+Transport가 먼저 정상화되고 기존 ALERT가 전달된 것을 확인한 뒤 Collector를 시작했다.
+
+RECOVERY Webhook도 자동 전달됐다.
+
+Receiver 최종 기록:
+
+```text
+ALERT
+RECOVERY
+ALERT (transport 장애 후 자동 복구)
+RECOVERY
+```
+
+최종:
+
+```text
+pending_events=0
+active_failure=false
+collector timer=active/waiting
+notification timer=active/waiting
+```
+
+### Delivery 보장 한계
+
+이번 장애는 connection refused였기 때문에 receiver가 실패한 POST를 실제로 처리하지 않았고, 복구된 event가 receiver에 한 번만 도착했다.
+
+그러나 이를 exactly-once 보장으로 해석하지 않는다.
+
+다음과 같은 ambiguous delivery에서는 중복 가능성이 있다.
+
+```text
+receiver가 request 처리 완료
+→ response 전달 전에 timeout
+→ sender는 실패로 판단
+→ 동일 event_id 재시도
+```
+
+따라서 현재 보장 수준은 계속:
+
+```text
+at-least-once 성격
++
+event_id 기반 receiver-side deduplication 가능
+```
+
+이다.
+
+### 실제 외부 Endpoint 도입 전 Runtime 정책
+
+현재 테스트 endpoint는 일시적인 localhost receiver이므로 테스트 종료 후 서버 runtime은 검증된 local-file transport로 되돌린다.
+
+Repository에는 Webhook-capable unit을 유지하되 실제 외부 Webhook URL이 결정되기 전까지 테스트용 localhost endpoint를 production configuration으로 남기지 않는다.

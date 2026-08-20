@@ -12,13 +12,14 @@ Group=huning
 WorkingDirectory=/home/huning/aerotrace
 
 Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/aerotrace/notification.env
 
 StateDirectory=aerotrace-monitoring
 StateDirectoryMode=0750
 
 ExecStartPre=/usr/bin/mkdir -p /var/lib/aerotrace-monitoring/notification-outbox /var/lib/aerotrace-monitoring/notification-receipts
 
-ExecStart=/usr/bin/python3 /home/huning/aerotrace/scripts/process-notification-outbox.py --outbox-dir /var/lib/aerotrace-monitoring/notification-outbox --receipt-dir /var/lib/aerotrace-monitoring/notification-receipts --transport local-file --max-events 100 --quiet-idle
+ExecStart=/usr/bin/python3 /home/huning/aerotrace/scripts/process-notification-outbox.py --outbox-dir /var/lib/aerotrace-monitoring/notification-outbox --receipt-dir /var/lib/aerotrace-monitoring/notification-receipts --transport webhook --webhook-timeout-sec 5 --failure-state-file /var/lib/aerotrace-monitoring/notification-failure.json --max-events 100 --quiet-idle
 
 TimeoutStartSec=15s
 
@@ -28,4 +29,4 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

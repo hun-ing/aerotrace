@@ -4739,3 +4739,272 @@ recovery
 ```
 
 를 production systemd 실행 경로에서 검증한다.
+
+---
+
+### Portfolio Checkpoint — Production Webhook 장애 자동 복구 검증
+
+Notification Outbox와 Webhook adapter를 실제 systemd timer 실행 경로에 연결하고 Webhook receiver 장애를 직접 주입하여 persistent failure state, 반복 retry, 동일 event 보존, transport 자동 복구를 end-to-end로 검증했다.
+
+### 실제 운영 장애 실험
+
+정상 상태:
+
+```text
+pending_events=0
+active_failure=false
+```
+
+에서 Webhook receiver를 완전히 종료한 뒤 실제 OpenTelemetry Collector를 중지했다.
+
+결과:
+
+```text
+failure_kind=retryable
+failure_reason=connection_error
+pending_events=1
+persistent failure state 생성
+```
+
+Event:
+
+```text
+1787212535955638444-1330962
+```
+
+가 failure state와 Outbox에 동일하게 보존됨을 확인했다.
+
+```text
+failure_pending_identity=PASS
+```
+
+### systemd Retry 측정
+
+실제 systemd timer가 수동 개입 없이 계속 retry했다.
+
+```text
+failure_count 2 → 4
+```
+
+를 12초 측정 구간에서 확인했고 journal에서는:
+
+```text
+2 → 3 → 4 → 5 → 6
+```
+
+까지 증가했다.
+
+검증:
+
+```text
+systemd_webhook_retry=PASS
+```
+
+### 설정값과 실제 Retry Cadence 차이
+
+Timer는:
+
+```text
+OnUnitInactiveSec=5s
+```
+
+로 설정돼 있지만 실제 실패 시도 timestamp는:
+
+```text
+16:55:47
+16:55:53
+16:55:59
+16:56:05
+16:56:11
+```
+
+로 약 6초 간격이었다.
+
+이를 통해 monitoring threshold나 failure count를 계산할 때 설정값만 보는 것이 아니라 실제 scheduler/service 실행시간까지 측정해야 한다는 운영 경험을 얻었다.
+
+### 자동 복구
+
+Collector는 계속 중지된 상태로 유지하고 Webhook receiver만 복구했다.
+
+Adapter를 수동 실행하지 않았다.
+
+Systemd timer가 자동으로 기존 pending ALERT를 재전송했다.
+
+```text
+automatic_webhook_recovery=1
+systemd_failure_recovery_identity=PASS
+```
+
+복구된 event:
+
+```text
+1787212535955638444-1330962
+```
+
+는 장애 발생 당시 failure state와 Outbox에 저장된 동일 event였다.
+
+성공 후:
+
+```text
+pending_events=0
+active_failure=false
+failure_count=0
+```
+
+으로 자동 복구됐다.
+
+### 실제 장애 지속시간
+
+최초 transport failure:
+
+```text
+16:55:41 KST
+```
+
+복구 ALERT 수신:
+
+```text
+16:56:17.940 KST
+```
+
+으로 이번 실험에서는 약 37초의 실제 Webhook transport 장애를 유지한 뒤 자동 복구를 확인했다.
+
+### Collector 복구
+
+Transport가 정상화된 뒤 Collector를 시작했다.
+
+최종 RECOVERY도 자동 Webhook 전달됐다.
+
+```text
+final_recovery_delivered=1
+```
+
+최종:
+
+```text
+pending_events=0
+active_failure=false
+두 systemd timer active/waiting
+```
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 다음 운영 문제를 실제 failure injection으로 경험했다.
+
+```text
+systemd EnvironmentFile
+root-owned runtime secret/config
+network sandbox
+Webhook success path
+connection refused
+persistent transport failure state
+timer 기반 retry
+실제 retry cadence 측정
+event identity 보존
+transport-only recovery
+automatic retry recovery
+Outbox ACK
+failure-state cleanup
+ALERT / RECOVERY ordering
+```
+
+단순히 retry 코드를 작성한 것이 아니라 실제 Linux service scheduler에서 외부 transport를 중단하고 복구하면서 데이터와 상태가 어떻게 남는지를 검증했다.
+
+### 보존할 증거
+
+```text
+systemd_webhook_alert=PASS
+systemd_webhook_recovery=PASS
+
+production_failure_state_created=1
+
+failed_event_id=1787212535955638444-1330962
+failure_kind=retryable
+failure_reason=connection_error
+
+failure_count_before_wait=2
+failure_count_after_wait=4
+
+systemd_webhook_retry=PASS
+failure_pending_identity=PASS
+
+journal:
+failure_count=2
+failure_count=3
+failure_count=4
+failure_count=5
+failure_count=6
+
+receiver_recovered=1
+automatic_webhook_recovery=1
+
+systemd_failure_recovery_identity=PASS
+
+webhook_receipts_after_transport_recovery=3
+
+final_recovery_delivered=1
+
+final pending_events=0
+final active_failure=false
+```
+
+### 이력서 성과 문장 초안
+
+- systemd timer 기반 Notification Outbox Webhook consumer에 persistent failure state를 연결하고 실제 receiver connection failure를 약 37초간 주입하여 pending event 보존, `failure_count` 증가, 동일 event ID retry, receiver 복구 후 자동 전달과 state cleanup까지 end-to-end 검증
+- `OnUnitInactiveSec=5s` 설정 환경에서 실제 Webhook 실패 retry가 약 6초 간격으로 실행됨을 journal timestamp로 측정하여 설정값과 실제 scheduler cadence 차이를 확인하고 향후 alert threshold를 실측값 기반으로 결정할 근거 확보
+- 외부 delivery 실패 중 receipt를 생성하지 않고 Outbox event를 유지하며 transport 복구 후 동일 event ID를 자동 재전송하도록 구성해 notification 순서와 복구 가능성을 검증
+
+Exactly-once delivery를 구현한 것으로 표현하지 않는다. Timeout 같은 ambiguous delivery에서는 동일 event가 중복 전송될 수 있으므로 현재 구조는 event ID 기반 deduplication이 가능한 at-least-once 성격이다.
+
+### 예상 면접 질문
+
+```text
+Webhook이 죽었을 때 event는 어디에 남는가?
+
+systemd timer가 실패한 oneshot service를 다시 실행하는 것을 어떻게 검증했는가?
+
+OnUnitInactiveSec=5s인데 실제 retry가 약 6초였던 이유는 무엇인가?
+
+왜 failure count만으로 장애 duration을 판단하면 안 되는가?
+
+왜 Collector보다 Webhook transport를 먼저 복구했는가?
+
+Transport 복구 후 동일 event인지 어떻게 검증했는가?
+
+Connection refused 테스트가 exactly-once를 증명하지 못하는 이유는 무엇인가?
+
+HTTP timeout에서는 어떤 중복 문제가 생길 수 있는가?
+
+Permanent HTTP 400은 현재 timer 환경에서 어떻게 동작하며 무엇이 개선되어야 하는가?
+```
+
+### 블로그 소재
+
+제목 후보:
+
+```text
+5초 systemd Timer인데 왜 Webhook Retry는 6초마다 실행됐을까?
+```
+
+또는:
+
+```text
+Webhook을 37초 동안 끊어보고 Outbox가 실제로 복구되는지 검증했다
+```
+
+핵심 구성:
+
+```text
+1. Notification Outbox 구조
+2. systemd Webhook consumer
+3. Receiver 장애 주입
+4. Persistent failure state
+5. failure_count 증가
+6. 실제 retry cadence 측정
+7. 동일 event ID 보존
+8. Receiver만 먼저 복구
+9. systemd 자동 재전송
+10. Collector RECOVERY 전달
+11. exactly-once가 아닌 이유
+12. 남은 permanent failure / backoff 문제
+```
