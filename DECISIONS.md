@@ -6725,3 +6725,230 @@ Oracle Cloud 또는 홈서버 환경에서 장시간 장애 실험
 사내 PoC 운영 요구 확보
 실사용자 notification 지연 허용 수준 확인
 ```
+
+---
+
+## Notification Outbox production systemd 실행 경로
+
+### 해결하려는 문제
+
+Notification Outbox, delivery receipt, webhook adapter는 개별 테스트에서는 검증됐지만 실제 production systemd evaluator와 연결되어 있지 않았다.
+
+기존 production 구성은 다음과 같았다.
+
+```text
+Collector queue checker
+→ 5초 evaluator
+→ journal ALERT / RECOVERY
+```
+
+Evaluator에는:
+
+```text
+--event-outbox-dir
+```
+
+가 없었고 notification adapter를 실행하는 production systemd unit도 존재하지 않았다.
+
+따라서 queue 상태 변화는 감지할 수 있었지만 실제 durable notification pipeline으로 이어지지는 않았다.
+
+### 선택한 구조
+
+기존:
+
+```text
+StateDirectory=aerotrace-monitoring
+```
+
+경계를 유지하고 다음 경로를 사용한다.
+
+```text
+/var/lib/aerotrace-monitoring/
+    collector-queue-alert.json
+    notification-outbox/
+    notification-receipts/
+```
+
+별도 StateDirectory를 추가하지 않고 현재 monitoring 운영 상태를 하나의 책임 경계 안에서 관리한다.
+
+### Evaluator Outbox 연결
+
+Production evaluator에 다음 경로를 연결했다.
+
+```text
+--event-outbox-dir
+/var/lib/aerotrace-monitoring/notification-outbox
+```
+
+따라서 alert-required event는 journal 출력뿐 아니라 durable Outbox event로 생성된다.
+
+### Notification Processor
+
+다음 systemd unit을 추가했다.
+
+```text
+aerotrace-notification-outbox.service
+aerotrace-notification-outbox.timer
+```
+
+Timer 주기:
+
+```text
+OnUnitInactiveSec=5s
+```
+
+Service는 oneshot으로 실행되며 현재 검증 단계에서는:
+
+```text
+--transport local-file
+```
+
+을 사용한다.
+
+Receipt:
+
+```text
+/var/lib/aerotrace-monitoring/notification-receipts
+```
+
+에 저장한다.
+
+### Local-file을 먼저 사용한 이유
+
+Webhook을 바로 production unit에 연결하면 다음 문제들이 동시에 테스트된다.
+
+```text
+systemd configuration
+Outbox 생성
+adapter 실행
+network
+Webhook endpoint
+credential
+failure-state
+```
+
+장애 원인을 분리하기 어렵기 때문에 먼저 외부 network를 제거한 local-file transport로:
+
+```text
+Evaluator
+→ Outbox
+→ Timer
+→ Adapter
+→ Receipt
+→ ACK
+```
+
+경로 자체를 검증했다.
+
+Local-file은 최종 외부 notification transport가 아니라 production systemd wiring을 검증하기 위한 기준선이다.
+
+### 실제 ALERT End-to-End 검증
+
+실제 OpenTelemetry Collector를 중지했다.
+
+Evaluator:
+
+```text
+2026-08-20 16:41:43 KST
+event=ALERT
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+```
+
+Notification processor:
+
+```text
+2026-08-20 16:41:49 KST
+delivery_result=DELIVERED
+event=ALERT
+adapter_status=OK
+remaining_events=0
+```
+
+Receipt:
+
+```text
+event_id=1787211703960728995-1310439
+transport=local-file
+```
+
+검증:
+
+```text
+systemd_alert_receipt=PASS
+```
+
+이번 실행에서 evaluator event 생성부터 receipt delivery까지 약 6초가 걸렸다.
+
+### 실제 RECOVERY End-to-End 검증
+
+Collector를 다시 시작했다.
+
+Evaluator:
+
+```text
+2026-08-20 16:42:13 KST
+event=RECOVERY
+previous_status=UNKNOWN
+current_status=OK
+checker_exit_code=0
+```
+
+Notification processor:
+
+```text
+2026-08-20 16:42:19 KST
+delivery_result=DELIVERED
+event=RECOVERY
+adapter_status=OK
+remaining_events=0
+```
+
+Receipt:
+
+```text
+event_id=1787211733960954909-1311457
+transport=local-file
+```
+
+검증:
+
+```text
+systemd_recovery_receipt=PASS
+```
+
+이번 실행에서도 evaluator event 생성부터 receipt delivery까지 약 6초가 걸렸다.
+
+### 최종 상태
+
+테스트 종료 후:
+
+```text
+pending_events=0
+production_receipts=2
+```
+
+두 timer 모두:
+
+```text
+aerotrace-collector-queue-alert.timer
+aerotrace-notification-outbox.timer
+```
+
+이 `active (waiting)` 상태임을 확인했다.
+
+### 현재 보장하지 않는 것
+
+이 단계에서는 아직 다음을 production에 연결하지 않았다.
+
+```text
+실제 Webhook endpoint
+Webhook credential
+persistent webhook failure state
+failure-state checker systemd 실행
+production WARNING / CRITICAL threshold
+별도 secondary alert channel
+```
+
+다음 단계에서 local-file 기준선을 유지한 채 transport 부분만 webhook으로 교체한다.

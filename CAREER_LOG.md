@@ -4552,3 +4552,190 @@ notification outbox checker
 ```
 
 그 후 의도적인 장시간 webhook 장애를 만들어 실제 production 실행 주기에서 수치를 측정하고 WARNING/CRITICAL 기준을 결정할 수 있다.
+
+---
+
+### Portfolio Checkpoint — Production systemd Notification Outbox 연결
+
+개별적으로 구현했던 Collector queue evaluator, durable notification Outbox, notification adapter, delivery receipt를 실제 production systemd 실행 경로로 연결하고 실제 Collector 장애/복구를 통해 end-to-end로 검증했다.
+
+### 구현한 운영 구조
+
+```text
+Collector queue checker
+→ 5초 systemd evaluator
+→ durable notification Outbox
+→ 5초 notification processor timer
+→ adapter
+→ receipt
+→ pending ACK
+```
+
+운영 상태는:
+
+```text
+/var/lib/aerotrace-monitoring
+```
+
+StateDirectory 아래에서 관리하도록 구성했다.
+
+### 실제 장애 검증
+
+OpenTelemetry Collector를 실제로 중지했다.
+
+Evaluator:
+
+```text
+16:41:43
+OK → UNKNOWN
+event=ALERT
+```
+
+Notification processor:
+
+```text
+16:41:49
+delivery_result=DELIVERED
+event=ALERT
+remaining_events=0
+```
+
+검증:
+
+```text
+systemd_alert_receipt=PASS
+```
+
+이번 측정에서는 evaluator ALERT 생성부터 receipt delivery까지 약 6초가 걸렸다.
+
+### 실제 복구 검증
+
+Collector를 다시 시작했다.
+
+Evaluator:
+
+```text
+16:42:13
+UNKNOWN → OK
+event=RECOVERY
+```
+
+Notification processor:
+
+```text
+16:42:19
+delivery_result=DELIVERED
+event=RECOVERY
+remaining_events=0
+```
+
+검증:
+
+```text
+systemd_recovery_receipt=PASS
+```
+
+이번 측정에서도 약 6초가 걸렸다.
+
+### 테스트 종료 상태
+
+```text
+production_receipts=2
+pending_events=0
+```
+
+두 systemd timer 모두:
+
+```text
+active (waiting)
+```
+
+상태로 유지됐다.
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 단순 script 실행이 아닌 실제 Linux 서비스 운영 경로를 구성하고 검증했다.
+
+```text
+systemd oneshot service
+systemd timer
+StateDirectory
+service sandbox
+durable Outbox
+independent consumer timer
+ALERT / RECOVERY transition
+실제 프로세스 장애 주입
+receipt 기반 전달 확인
+운영 경로와 외부 transport 문제의 분리
+```
+
+특히 Webhook부터 바로 붙이지 않고 local-file transport로 systemd 실행 경로 자체를 먼저 검증하여 infrastructure wiring 문제와 external network 문제를 분리했다.
+
+### 보존할 증거
+
+```text
+systemd_alert_receipt=PASS
+
+event_id=1787211703960728995-1310439
+event=ALERT
+current_status=UNKNOWN
+
+ALERT evaluator timestamp=16:41:43
+ALERT delivery timestamp=16:41:49
+
+systemd_recovery_receipt=PASS
+
+event_id=1787211733960954909-1311457
+event=RECOVERY
+previous_status=UNKNOWN
+current_status=OK
+
+RECOVERY evaluator timestamp=16:42:13
+RECOVERY delivery timestamp=16:42:19
+
+pending_events=0
+production_receipts=2
+```
+
+### 이력서 성과 문장 초안
+
+- Collector 장애 감지 evaluator와 durable Notification Outbox를 독립적인 5초 systemd timer 기반 producer/consumer 구조로 연결하고 실제 Collector stop/start 장애 주입을 통해 ALERT·RECOVERY 생성, receipt 저장, pending ACK까지 end-to-end 검증
+- 외부 Webhook 장애와 systemd 실행 문제를 분리하기 위해 local-file transport를 운영 기준선으로 먼저 구성하고, 실제 테스트에서 ALERT와 RECOVERY가 각각 event 생성 후 약 6초 내 consumer에 처리되며 최종 Outbox pending 0을 확인
+
+현재 local-file transport가 실제 사용자 notification까지 제공하는 것처럼 표현하지 않는다.
+
+### 예상 면접 질문
+
+```text
+왜 evaluator가 직접 Webhook을 호출하지 않고 Outbox를 거치는가?
+
+왜 notification processor를 별도 timer로 분리했는가?
+
+systemd oneshot service가 inactive(dead)인데 정상인 이유는 무엇인가?
+
+왜 Webhook보다 local-file transport를 먼저 production systemd에 연결했는가?
+
+StateDirectory는 어떤 문제를 해결하는가?
+
+Evaluator와 notification consumer가 각각 5초 timer일 때 notification latency는 어떻게 결정되는가?
+
+Consumer가 중지되면 event는 어디에 남는가?
+
+Collector 장애와 복구를 어떻게 실제로 검증했는가?
+```
+
+### 다음 한 단계 높은 과제
+
+현재 systemd pipeline 자체는 검증됐다.
+
+다음에는 transport만 실제 Webhook으로 변경하고:
+
+```text
+Webhook configuration 분리
+persistent failure state
+retryable failure
+permanent failure
+recovery
+```
+
+를 production systemd 실행 경로에서 검증한다.

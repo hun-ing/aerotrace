@@ -16,7 +16,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 StateDirectory=aerotrace-monitoring
 StateDirectoryMode=0750
 
-ExecStart=/usr/bin/python3 /home/huning/aerotrace/scripts/evaluate-collector-queue-alert.py --state-file /var/lib/aerotrace-monitoring/collector-queue-alert.json --repeat-after-sec 300 --checker-timeout-sec 10 --quiet-no-event
+ExecStart=/usr/bin/python3 /home/huning/aerotrace/scripts/evaluate-collector-queue-alert.py --state-file /var/lib/aerotrace-monitoring/collector-queue-alert.json --event-outbox-dir /var/lib/aerotrace-monitoring/notification-outbox --repeat-after-sec 300 --checker-timeout-sec 10 --quiet-no-event
 
 TimeoutStartSec=15s
 

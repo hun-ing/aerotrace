@@ -13084,3 +13084,289 @@ failure_kind=permanent
 실험에 사용한 count와 duration 숫자는 코드 동작 검증용이다.
 
 Production 값은 실제 retry cadence와 운영 요구가 확정된 뒤 측정 근거와 함께 결정한다.
+
+---
+
+## Production systemd Notification Outbox E2E 검증
+
+### 변경 파일
+
+```text
+deploy/systemd/aerotrace-collector-queue-alert.service
+deploy/systemd/aerotrace-notification-outbox.service
+deploy/systemd/aerotrace-notification-outbox.timer
+```
+
+### 기존 상태
+
+Production에는 다음 두 unit만 존재했다.
+
+```text
+aerotrace-collector-queue-alert.service
+aerotrace-collector-queue-alert.timer
+```
+
+Evaluator:
+
+```text
+StateDirectory=aerotrace-monitoring
+```
+
+Timer:
+
+```text
+OnUnitInactiveSec=5s
+```
+
+상태는 정상:
+
+```text
+service=inactive/dead
+last exit=0/SUCCESS
+
+timer=active/waiting
+```
+
+oneshot service이므로 service의 inactive/dead 상태는 정상이다.
+
+기존 evaluator에는 notification Outbox 설정이 없었다.
+
+### 변경 내용
+
+Evaluator에 추가:
+
+```text
+--event-outbox-dir
+/var/lib/aerotrace-monitoring/notification-outbox
+```
+
+Notification processor 추가:
+
+```text
+aerotrace-notification-outbox.service
+```
+
+실행:
+
+```text
+process-notification-outbox.py
+--outbox-dir /var/lib/aerotrace-monitoring/notification-outbox
+--receipt-dir /var/lib/aerotrace-monitoring/notification-receipts
+--transport local-file
+--max-events 100
+--quiet-idle
+```
+
+Notification timer:
+
+```text
+OnUnitInactiveSec=5s
+AccuracySec=1s
+```
+
+### systemd 검증
+
+`systemd-analyze verify` 실행 시 AeroTrace unit 자체에는 오류가 없었다.
+
+출력된 netplan/snapd 관련 경고는 AeroTrace unit과 무관했다.
+
+실제 설치 후:
+
+```text
+aerotrace-notification-outbox.service
+→ status=0/SUCCESS
+
+aerotrace-notification-outbox.timer
+→ active/waiting
+```
+
+을 확인했다.
+
+### State Directory
+
+실제 생성:
+
+```text
+/var/lib/aerotrace-monitoring/notification-outbox
+/var/lib/aerotrace-monitoring/notification-receipts
+```
+
+권한/소유:
+
+```text
+drwxr-x---
+huning:huning
+```
+
+기존 evaluator state:
+
+```text
+/var/lib/aerotrace-monitoring/collector-queue-alert.json
+```
+
+과 동일 StateDirectory 경계에서 관리한다.
+
+### 실제 ALERT 테스트
+
+테스트 전:
+
+```text
+Collector=Up
+pending_events=0
+receipts_baseline=0
+```
+
+실제 Collector:
+
+```text
+otel-collector
+```
+
+를 중지했다.
+
+Evaluator 결과:
+
+```text
+2026-08-20T16:41:43+0900
+event=ALERT
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+```
+
+Notification processor:
+
+```text
+2026-08-20T16:41:49+0900
+delivery_result=DELIVERED
+event_id=1787211703960728995-1310439
+event=ALERT
+adapter_status=OK
+remaining_events=0
+```
+
+Receipt contract 검증:
+
+```text
+transport=local-file
+event=ALERT
+current_status=UNKNOWN
+checker_exit_code=3
+```
+
+결과:
+
+```text
+systemd_alert_receipt=PASS
+```
+
+Outbox:
+
+```text
+pending_events=0
+```
+
+Evaluator event 생성부터 delivery까지 이번 실행에서는 약 6초가 걸렸다.
+
+### 실제 RECOVERY 테스트
+
+Collector를 다시 시작했다.
+
+Evaluator:
+
+```text
+2026-08-20T16:42:13+0900
+event=RECOVERY
+previous_status=UNKNOWN
+current_status=OK
+checker_exit_code=0
+```
+
+Notification processor:
+
+```text
+2026-08-20T16:42:19+0900
+delivery_result=DELIVERED
+event_id=1787211733960954909-1311457
+event=RECOVERY
+adapter_status=OK
+remaining_events=0
+```
+
+Receipt contract:
+
+```text
+transport=local-file
+event=RECOVERY
+previous_status=UNKNOWN
+current_status=OK
+checker_exit_code=0
+```
+
+결과:
+
+```text
+systemd_recovery_receipt=PASS
+```
+
+Evaluator event 생성부터 delivery까지 이번 실행에서도 약 6초가 걸렸다.
+
+### 테스트 종료 상태
+
+```text
+production_receipts=2
+
+pending_events=0
+pending_bytes=0
+```
+
+Timer:
+
+```text
+aerotrace-collector-queue-alert.timer
+→ active/waiting
+
+aerotrace-notification-outbox.timer
+→ active/waiting
+```
+
+Collector도 다시 정상 실행 상태로 복구했다.
+
+### 현재 의미
+
+실제 production systemd에서 다음 경로가 검증됐다.
+
+```text
+Collector 장애
+→ checker UNKNOWN
+→ evaluator ALERT
+→ durable Outbox
+→ notification timer
+→ adapter
+→ receipt
+→ pending ACK
+
+Collector 복구
+→ checker OK
+→ evaluator RECOVERY
+→ durable Outbox
+→ notification timer
+→ adapter
+→ receipt
+→ pending ACK
+```
+
+### 남은 작업
+
+현재 transport는 systemd wiring 검증용 local-file이다.
+
+다음 단계:
+
+```text
+Webhook URL을 별도 environment file로 관리
+Webhook transport 활성화
+persistent failure-state production 경로 연결
+실제 Webhook failure/recovery 테스트
+```
+
+이후 failure-state checker systemd 연결과 production threshold는 별도 단계에서 진행한다.
