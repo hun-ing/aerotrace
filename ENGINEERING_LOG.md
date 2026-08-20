@@ -11750,3 +11750,477 @@ age 10초 / 25초 / 60초 / 90초
 또한 oldest pending age는 미전송 event의 나이를 보여주지만 transport 자체의 최초 실패 시각이나 연속 실패 횟수를 직접 나타내지는 않는다.
 
 다음 단계에서는 persistent transport failure state를 추가하는 방향을 검토한다.
+
+---
+
+## Webhook Persistent Failure State 및 성공 Finalization 복구 검증
+
+### 변경 파일
+
+```text
+scripts/process-notification-outbox.py
+```
+
+### 추가 기능
+
+Notification webhook adapter에 optional persistent failure state를 추가했다.
+
+CLI:
+
+```text
+--failure-state-file <path>
+```
+
+현재는:
+
+```text
+--transport webhook
+```
+
+에서만 사용할 수 있다.
+
+### Failure State 필드
+
+```text
+failure_state_schema_version
+transport
+failed_event_id
+failure_kind
+failure_reason
+first_failed_at
+last_failed_at
+failure_count
+```
+
+Schema:
+
+```text
+failure_state_schema_version=1
+```
+
+### Structured Exception
+
+기존:
+
+```text
+WebhookRetryableError
+WebhookPermanentError
+```
+
+에 공통 base를 추가했다.
+
+```text
+WebhookDeliveryError
+```
+
+각 delivery error는 구조화된:
+
+```text
+failure_kind
+failure_reason
+```
+
+을 가진다.
+
+따라서 persistent state가 exception message parsing에 의존하지 않는다.
+
+### Failure Reason 예
+
+```text
+connection_error
+timeout
+http_400
+http_408
+http_429
+http_500
+```
+
+### Local-file Configuration Validation
+
+다음 실행을 차단했다.
+
+```text
+--transport local-file
+--failure-state-file ...
+```
+
+결과:
+
+```text
+adapter_error=--failure-state-file requires --transport webhook
+local_failure_state_rc=4
+```
+
+### Retryable Failure 첫 시도
+
+Connection refused를 실제 발생시켰다.
+
+```text
+http://127.0.0.1:1/aerotrace
+```
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+failure_state_file=/tmp/aerotrace-v7b43-failure-state.json
+failure_count=1
+failure_kind=retryable
+failure_reason=connection_error
+failed_event_id=1787185530153348081-718365
+remaining_events=1
+failure1_rc=2
+```
+
+실제 state:
+
+```json
+{
+  "failure_state_schema_version": 1,
+  "transport": "webhook",
+  "failed_event_id": "1787185530153348081-718365",
+  "failure_kind": "retryable",
+  "failure_reason": "connection_error",
+  "first_failed_at": "2026-08-20T00:25:34+00:00",
+  "last_failed_at": "2026-08-20T00:25:34+00:00",
+  "failure_count": 1
+}
+```
+
+검증:
+
+```text
+failure_state_first_attempt=PASS
+```
+
+### Retryable Failure 두 번째 시도
+
+동일 pending event를 다시 전송했다.
+
+결과:
+
+```text
+failure_count=2
+failure_kind=retryable
+failure_reason=connection_error
+failure2_rc=2
+```
+
+State:
+
+```text
+first_failed_at=2026-08-20T00:25:34+00:00
+last_failed_at=2026-08-20T00:25:49+00:00
+failure_count=2
+```
+
+검증:
+
+```text
+failure_state_second_attempt=PASS
+```
+
+따라서:
+
+```text
+first_failed_at 유지
+last_failed_at 갱신
+failure_count 1 → 2
+```
+
+를 실제 확인했다.
+
+### 최초 Recovery 검증
+
+Local HTTP server가 204를 반환하도록 구성했다.
+
+동일 pending event를 실제 성공시켰다.
+
+결과:
+
+```text
+failure_state_cleared=true
+delivery_result=DELIVERED
+event_id=1787185530153348081-718365
+event=ALERT
+adapter_status=OK
+processed_events=1
+remaining_events=0
+recovery_rc=0
+```
+
+최종:
+
+```text
+failure_state_removed=PASS
+pending_after_recovery=0
+receipts_after_recovery=1
+```
+
+### 성공 Finalization 순서에서 발견한 문제
+
+초기 구현에서는 successful delivery 함수가:
+
+```text
+receipt 생성
+→ pending 삭제
+→ return
+```
+
+을 수행한 뒤 `main()`에서 failure state를 삭제했다.
+
+이 구조에서는:
+
+```text
+receipt 저장 성공
+pending 삭제 성공
+failure state 삭제 실패
+```
+
+시 stale failure state만 남고 pending event가 없어 다음 run에서 자동 복구가 불가능할 수 있었다.
+
+이 문제는 recovery test 이후 코드 검토에서 발견했다.
+
+### Finalization 순서 수정
+
+Webhook 성공 경로를 다음 순서로 변경했다.
+
+```text
+HTTP 성공
+→ receipt durable 저장
+→ failure state clear
+→ pending unlink
+→ outbox directory fsync
+```
+
+`ACK_EXISTING` 경로도 동일하게:
+
+```text
+기존 receipt 검증
+→ failure state clear
+→ pending unlink
+```
+
+순서로 변경했다.
+
+### Failure State Clear Failure 실험
+
+Fresh retryable failure state를 만든 뒤 state directory permission을:
+
+```text
+dr-x------
+```
+
+로 변경했다.
+
+실제:
+
+```text
+chmod 500 /tmp/aerotrace-v7b43c-state
+```
+
+HTTP server는 204를 반환했다.
+
+Failure state 삭제 단계에서 실제 permission error가 발생했다.
+
+결과:
+
+```text
+adapter_error=failure state clear failed before pending ACK:
+[Errno 13] Permission denied:
+'/tmp/aerotrace-v7b43c-state/failure.json'
+
+failed_event_id=1787185690763474192-722007
+remaining_events=1
+clear_failure_rc=4
+```
+
+중요한 filesystem 상태:
+
+```text
+pending_after_clear_failure=1
+receipts_after_clear_failure=1
+failure_state_after_clear_failure=1
+```
+
+즉 external delivery는 성공했으므로 receipt가 존재하지만 internal finalization이 끝나지 않아 pending을 유지했다.
+
+### ACK_EXISTING Recovery
+
+204 server를 완전히 종료한 뒤 state directory permission을 정상화했다.
+
+이 상태에서 adapter를 다시 실행했다.
+
+서버가 종료됐기 때문에 HTTP POST를 다시 실행했다면 connection refused가 발생해야 했다.
+
+실제 결과:
+
+```text
+failure_state_cleared=true
+delivery_result=ACK_EXISTING
+event_id=1787185690763474192-722007
+event=ALERT
+adapter_status=OK
+processed_events=1
+remaining_events=0
+ack_existing_rc=0
+```
+
+Connection refused는 발생하지 않았다.
+
+최종:
+
+```text
+final_pending=0
+final_receipts=1
+final_failure_state=0
+```
+
+따라서 receipt를 이용해 duplicate network delivery 없이 incomplete finalization을 복구할 수 있음을 확인했다.
+
+### HTTP 400 Persistent State
+
+Local HTTP server가 400을 반환하도록 구성했다.
+
+결과:
+
+```text
+adapter_error=permanent delivery failure:
+webhook returned permanent HTTP 400
+
+failure_state_file=/tmp/aerotrace-v7b43d-failure.json
+failure_count=1
+failure_kind=permanent
+failure_reason=http_400
+failed_event_id=1787207361956265193-1211675
+remaining_events=1
+http_400_failure_rc=5
+```
+
+실제 state:
+
+```json
+{
+  "failure_state_schema_version": 1,
+  "transport": "webhook",
+  "failed_event_id": "1787207361956265193-1211675",
+  "failure_kind": "permanent",
+  "failure_reason": "http_400",
+  "first_failed_at": "2026-08-20T06:29:32+00:00",
+  "last_failed_at": "2026-08-20T06:29:32+00:00",
+  "failure_count": 1
+}
+```
+
+자동 검증:
+
+```text
+permanent_failure_state=PASS
+```
+
+### 손상 Failure State 검증
+
+다음 파일을 생성했다.
+
+```text
+{broken json
+```
+
+실행 전 hash:
+
+```text
+c3e7d1b00a65589b59f816c0b0b668d795a3c28123697d5ab9555bdb8aa04604
+```
+
+Adapter 실행:
+
+```text
+adapter_error=invalid failure state:
+Expecting property name enclosed in double quotes:
+line 1 column 2 (char 1)
+
+corrupt_failure_state_rc=4
+```
+
+Connection refused URL을 지정했지만 failure state validation이 먼저 실패했으므로 network delivery는 수행되지 않았다.
+
+실행 후 hash:
+
+```text
+c3e7d1b00a65589b59f816c0b0b668d795a3c28123697d5ab9555bdb8aa04604
+```
+
+검증:
+
+```text
+corrupt_state_preserved=PASS
+```
+
+최종:
+
+```text
+corrupt_pending_after=1
+corrupt_receipts_after=0
+```
+
+손상된 state를 자동 초기화하거나 덮어쓰지 않고 운영 오류로 노출한다.
+
+### 검증된 Failure State Semantics
+
+```text
+Retryable failure
+→ state 기록
+→ pending 유지
+
+Repeated failure
+→ failure_count 증가
+→ first_failed_at 유지
+→ last_failed_at 갱신
+
+Permanent failure
+→ permanent/http_xxx state 기록
+→ pending 유지
+
+Success
+→ receipt 저장
+→ failure state clear
+→ pending ACK
+
+State clear failure
+→ receipt 유지
+→ pending 유지
+→ state 유지
+
+다음 실행
+→ receipt 확인
+→ HTTP 재전송 없음
+→ ACK_EXISTING
+→ state clear
+→ pending ACK
+
+Corrupted state
+→ network 전에 중단
+→ state 보존
+→ pending 보존
+```
+
+### 현재 기술 부채
+
+현재 failure state는 최신 연속 장애 한 건만 나타낸다.
+
+아직 다음은 없다.
+
+```text
+failure history
+duration 계산 checker
+failure count threshold
+systemd 운영 경로
+failure state metrics
+retry backoff
+Retry-After
+dead-letter
+```
+
+이들은 실제 운영 요구와 장애 데이터를 기준으로 후속 적용한다.

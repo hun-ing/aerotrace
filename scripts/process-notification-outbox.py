@@ -44,11 +44,31 @@ class NoRedirectHandler(HTTPRedirectHandler):
         return None
 
 
-class WebhookRetryableError(OSError):
-    pass
+class WebhookDeliveryError(OSError):
+    failure_kind = "unknown"
+
+    def __init__(
+        self,
+        message: str,
+        failure_reason: str,
+    ) -> None:
+        super().__init__(
+            message
+        )
+        self.failure_reason = (
+            failure_reason
+        )
 
 
-class WebhookPermanentError(OSError):
+class WebhookRetryableError(WebhookDeliveryError):
+    failure_kind = "retryable"
+
+
+class WebhookPermanentError(WebhookDeliveryError):
+    failure_kind = "permanent"
+
+
+class FailureStateError(OSError):
     pass
 
 
@@ -106,6 +126,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Webhook request timeout in seconds. "
             "Defaults to 5."
+        ),
+    )
+
+    parser.add_argument(
+        "--failure-state-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional persistent webhook transport "
+            "failure state file."
         ),
     )
 
@@ -273,6 +303,311 @@ def utc_now_iso() -> str:
     )
 
 
+def load_failure_state(
+    path: Path,
+) -> dict[str, Any]:
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        state = json.load(
+            file
+        )
+
+    if not isinstance(
+        state,
+        dict,
+    ):
+        raise ValueError(
+            f"{path}: failure state must be a JSON object"
+        )
+
+    return state
+
+
+def validate_failure_state(
+    path: Path,
+    state: dict[str, Any],
+) -> None:
+    if state.get(
+        "failure_state_schema_version"
+    ) != 1:
+        raise ValueError(
+            f"{path}: unsupported "
+            "failure_state_schema_version"
+        )
+
+    transport = state.get(
+        "transport"
+    )
+
+    if (
+        not isinstance(transport, str)
+        or not transport
+    ):
+        raise ValueError(
+            f"{path}: transport must be a non-empty string"
+        )
+
+    failed_event_id = state.get(
+        "failed_event_id"
+    )
+
+    if (
+        not isinstance(failed_event_id, str)
+        or not failed_event_id
+    ):
+        raise ValueError(
+            f"{path}: failed_event_id must be "
+            "a non-empty string"
+        )
+
+    failure_kind = state.get(
+        "failure_kind"
+    )
+
+    if failure_kind not in {
+        "retryable",
+        "permanent",
+    }:
+        raise ValueError(
+            f"{path}: invalid failure_kind"
+        )
+
+    failure_reason = state.get(
+        "failure_reason"
+    )
+
+    if (
+        not isinstance(failure_reason, str)
+        or not failure_reason
+    ):
+        raise ValueError(
+            f"{path}: failure_reason must be "
+            "a non-empty string"
+        )
+
+    timestamps = {}
+
+    for key in (
+        "first_failed_at",
+        "last_failed_at",
+    ):
+        value = state.get(
+            key
+        )
+
+        if (
+            not isinstance(value, str)
+            or not value
+        ):
+            raise ValueError(
+                f"{path}: {key} must be "
+                "a non-empty string"
+            )
+
+        try:
+            parsed = datetime.fromisoformat(
+                value
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{path}: {key} is not valid ISO-8601"
+            ) from exc
+
+        if parsed.tzinfo is None:
+            raise ValueError(
+                f"{path}: {key} must include a timezone"
+            )
+
+        timestamps[key] = parsed
+
+    if (
+        timestamps["last_failed_at"]
+        < timestamps["first_failed_at"]
+    ):
+        raise ValueError(
+            f"{path}: last_failed_at is earlier "
+            "than first_failed_at"
+        )
+
+    failure_count = state.get(
+        "failure_count"
+    )
+
+    if (
+        not isinstance(failure_count, int)
+        or isinstance(failure_count, bool)
+        or failure_count <= 0
+    ):
+        raise ValueError(
+            f"{path}: failure_count must be "
+            "a positive integer"
+        )
+
+
+def validate_failure_state_path(
+    path: Path,
+) -> None:
+    parent = path.parent
+
+    if (
+        parent.exists()
+        and not parent.is_dir()
+    ):
+        raise ValueError(
+            "failure state parent is not a directory: "
+            f"{parent}"
+        )
+
+    if not path.exists():
+        return
+
+    if not path.is_file():
+        raise ValueError(
+            "failure state path is not a file: "
+            f"{path}"
+        )
+
+    state = load_failure_state(
+        path
+    )
+
+    validate_failure_state(
+        path,
+        state,
+    )
+
+
+def write_failure_state(
+    path: Path,
+    transport: str,
+    event_id: str,
+    failure_kind: str,
+    failure_reason: str,
+) -> dict[str, Any]:
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    previous_state = None
+
+    if path.exists():
+        previous_state = load_failure_state(
+            path
+        )
+
+        validate_failure_state(
+            path,
+            previous_state,
+        )
+
+        if (
+            previous_state["transport"]
+            != transport
+        ):
+            raise ValueError(
+                f"{path}: failure state transport mismatch"
+            )
+
+    failed_at = utc_now_iso()
+
+    if previous_state is None:
+        first_failed_at = failed_at
+        failure_count = 1
+    else:
+        first_failed_at = (
+            previous_state[
+                "first_failed_at"
+            ]
+        )
+        failure_count = (
+            previous_state[
+                "failure_count"
+            ]
+            + 1
+        )
+
+    state = {
+        "failure_state_schema_version": 1,
+        "transport": transport,
+        "failed_event_id": event_id,
+        "failure_kind": failure_kind,
+        "failure_reason": failure_reason,
+        "first_failed_at": first_failed_at,
+        "last_failed_at": failed_at,
+        "failure_count": failure_count,
+    }
+
+    temporary_path = (
+        path.parent
+        / (
+            f".{path.name}."
+            f"{os.getpid()}.tmp"
+        )
+    )
+
+    try:
+        with temporary_path.open(
+            "x",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                state,
+                file,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+            file.write("\n")
+            file.flush()
+            os.fsync(
+                file.fileno()
+            )
+
+        os.replace(
+            temporary_path,
+            path,
+        )
+
+        fsync_directory(
+            path.parent
+        )
+    except Exception:
+        try:
+            temporary_path.unlink(
+                missing_ok=True
+            )
+        except OSError:
+            pass
+
+        raise
+
+    return state
+
+
+def clear_failure_state(
+    path: Path,
+) -> bool:
+    if not path.exists():
+        return False
+
+    if not path.is_file():
+        raise ValueError(
+            "failure state path is not a file: "
+            f"{path}"
+        )
+
+    path.unlink()
+
+    fsync_directory(
+        path.parent
+    )
+
+    return True
+
+
 def build_delivery_receipt(
     payload: dict[str, Any],
     transport: str,
@@ -424,17 +759,33 @@ def deliver_to_local_sink(
 
 def webhook_error_for_status(
     status: int,
-) -> OSError:
+) -> WebhookDeliveryError:
+    failure_reason = (
+        f"http_{status}"
+    )
+
     if (
         status in {408, 429}
         or 500 <= status <= 599
     ):
         return WebhookRetryableError(
-            f"webhook returned retryable HTTP {status}"
+            (
+                "webhook returned retryable "
+                f"HTTP {status}"
+            ),
+            failure_reason=(
+                failure_reason
+            ),
         )
 
     return WebhookPermanentError(
-        f"webhook returned permanent HTTP {status}"
+        (
+            "webhook returned permanent "
+            f"HTTP {status}"
+        ),
+        failure_reason=(
+            failure_reason
+        ),
     )
 
 
@@ -445,7 +796,8 @@ def deliver_to_webhook(
     payload: dict[str, Any],
     webhook_url: str,
     timeout_sec: float,
-) -> str:
+    failure_state_file: Path | None,
+) -> tuple[str, bool]:
     receipt_dir.mkdir(
         parents=True,
         exist_ok=True,
@@ -468,12 +820,34 @@ def deliver_to_webhook(
             expected_transport="webhook",
         )
 
+        failure_state_cleared = False
+
+        if failure_state_file is not None:
+            try:
+                failure_state_cleared = (
+                    clear_failure_state(
+                        failure_state_file
+                    )
+                )
+            except (
+                OSError,
+                ValueError,
+            ) as exc:
+                raise FailureStateError(
+                    "failure state clear failed "
+                    "before pending ACK: "
+                    f"{exc}"
+                ) from exc
+
         pending_path.unlink()
         fsync_directory(
             outbox_dir
         )
 
-        return "ACK_EXISTING"
+        return (
+            "ACK_EXISTING",
+            failure_state_cleared,
+        )
 
     request_body = json.dumps(
         payload,
@@ -518,12 +892,28 @@ def deliver_to_webhook(
             exc.code
         ) from exc
     except URLError as exc:
+        if isinstance(
+            exc.reason,
+            TimeoutError,
+        ):
+            raise WebhookRetryableError(
+                "webhook request timed out",
+                failure_reason="timeout",
+            ) from exc
+
         raise WebhookRetryableError(
-            f"webhook request failed: {exc.reason}"
+            f"webhook request failed: {exc.reason}",
+            failure_reason="connection_error",
         ) from exc
     except TimeoutError as exc:
         raise WebhookRetryableError(
-            "webhook request timed out"
+            "webhook request timed out",
+            failure_reason="timeout",
+        ) from exc
+    except OSError as exc:
+        raise WebhookRetryableError(
+            f"webhook request failed: {exc}",
+            failure_reason="connection_error",
         ) from exc
 
     if (
@@ -572,6 +962,25 @@ def deliver_to_webhook(
             receipt_dir
         )
 
+        failure_state_cleared = False
+
+        if failure_state_file is not None:
+            try:
+                failure_state_cleared = (
+                    clear_failure_state(
+                        failure_state_file
+                    )
+                )
+            except (
+                OSError,
+                ValueError,
+            ) as exc:
+                raise FailureStateError(
+                    "failure state clear failed "
+                    "before pending ACK: "
+                    f"{exc}"
+                ) from exc
+
         pending_path.unlink()
 
         fsync_directory(
@@ -587,7 +996,10 @@ def deliver_to_webhook(
 
         raise
 
-    return "DELIVERED"
+    return (
+        "DELIVERED",
+        failure_state_cleared,
+    )
 
 
 def resolve_webhook_url(
@@ -693,6 +1105,15 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 4
+
+        if args.failure_state_file is not None:
+            print(
+                "adapter_error="
+                "--failure-state-file requires "
+                "--transport webhook",
+                file=sys.stderr,
+            )
+            return 4
     else:
         webhook_url = resolve_webhook_url(
             args.webhook_url
@@ -719,6 +1140,22 @@ def main() -> int:
             )
             return 4
 
+        if args.failure_state_file is not None:
+            try:
+                validate_failure_state_path(
+                    args.failure_state_file
+                )
+            except (
+                OSError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
+                print(
+                    "adapter_error="
+                    f"invalid failure state: {exc}",
+                    file=sys.stderr,
+                )
+                return 4
 
     if (
         args.outbox_dir.exists()
@@ -791,6 +1228,8 @@ def main() -> int:
             return 3
 
         try:
+            failure_state_cleared = False
+
             if args.transport == "local-file":
                 delivery_result = (
                     deliver_to_local_sink(
@@ -806,18 +1245,37 @@ def main() -> int:
                         "webhook URL was not resolved"
                     )
 
-                delivery_result = (
-                    deliver_to_webhook(
-                        pending_path=pending_path,
-                        outbox_dir=args.outbox_dir,
-                        receipt_dir=args.receipt_dir,
-                        payload=payload,
-                        webhook_url=webhook_url,
-                        timeout_sec=(
-                            args.webhook_timeout_sec
-                        ),
-                    )
+                (
+                    delivery_result,
+                    failure_state_cleared,
+                ) = deliver_to_webhook(
+                    pending_path=pending_path,
+                    outbox_dir=args.outbox_dir,
+                    receipt_dir=args.receipt_dir,
+                    payload=payload,
+                    webhook_url=webhook_url,
+                    timeout_sec=(
+                        args.webhook_timeout_sec
+                    ),
+                    failure_state_file=(
+                        args.failure_state_file
+                    ),
                 )
+        except FailureStateError as exc:
+            print(
+                "adapter_error="
+                f"{exc}",
+                file=sys.stderr,
+            )
+            print(
+                f"failed_event_id={event_id}"
+            )
+            print(
+                "remaining_events="
+                f"{count_pending(args.outbox_dir)}"
+            )
+
+            return 4
         except ValueError as exc:
             print(
                 "adapter_error="
@@ -839,6 +1297,59 @@ def main() -> int:
                 f"permanent delivery failure: {exc}",
                 file=sys.stderr,
             )
+
+            if args.failure_state_file is not None:
+                try:
+                    failure_state = (
+                        write_failure_state(
+                            path=args.failure_state_file,
+                            transport="webhook",
+                            event_id=event_id,
+                            failure_kind=(
+                                exc.failure_kind
+                            ),
+                            failure_reason=(
+                                exc.failure_reason
+                            ),
+                        )
+                    )
+                except (
+                    OSError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as state_exc:
+                    print(
+                        "failure_state_error="
+                        f"{state_exc}",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"failed_event_id={event_id}"
+                    )
+                    print(
+                        "remaining_events="
+                        f"{count_pending(args.outbox_dir)}"
+                    )
+
+                    return 4
+
+                print(
+                    "failure_state_file="
+                    f"{args.failure_state_file}"
+                )
+                print(
+                    "failure_count="
+                    f"{failure_state['failure_count']}"
+                )
+                print(
+                    "failure_kind="
+                    f"{failure_state['failure_kind']}"
+                )
+                print(
+                    "failure_reason="
+                    f"{failure_state['failure_reason']}"
+                )
+
             print(
                 f"failed_event_id={event_id}"
             )
@@ -854,6 +1365,59 @@ def main() -> int:
                 f"retryable delivery failure: {exc}",
                 file=sys.stderr,
             )
+
+            if args.failure_state_file is not None:
+                try:
+                    failure_state = (
+                        write_failure_state(
+                            path=args.failure_state_file,
+                            transport="webhook",
+                            event_id=event_id,
+                            failure_kind=(
+                                exc.failure_kind
+                            ),
+                            failure_reason=(
+                                exc.failure_reason
+                            ),
+                        )
+                    )
+                except (
+                    OSError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as state_exc:
+                    print(
+                        "failure_state_error="
+                        f"{state_exc}",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"failed_event_id={event_id}"
+                    )
+                    print(
+                        "remaining_events="
+                        f"{count_pending(args.outbox_dir)}"
+                    )
+
+                    return 4
+
+                print(
+                    "failure_state_file="
+                    f"{args.failure_state_file}"
+                )
+                print(
+                    "failure_count="
+                    f"{failure_state['failure_count']}"
+                )
+                print(
+                    "failure_kind="
+                    f"{failure_state['failure_kind']}"
+                )
+                print(
+                    "failure_reason="
+                    f"{failure_state['failure_reason']}"
+                )
+
             print(
                 f"failed_event_id={event_id}"
             )
@@ -878,6 +1442,11 @@ def main() -> int:
             )
 
             return 2
+
+        if failure_state_cleared:
+            print(
+                "failure_state_cleared=true"
+            )
 
         processed += 1
 

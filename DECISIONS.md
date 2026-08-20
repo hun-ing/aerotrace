@@ -5753,3 +5753,542 @@ failed_event_id
 ```
 
 이를 통해 단순 oldest pending age와 별도로 실제 transport failure duration을 측정할 수 있게 한다.
+
+---
+
+## Notification Webhook Persistent Failure State 정책
+
+### 해결하려는 문제
+
+Notification Outbox의 `oldest_pending_age`는 가장 오래된 미전송 event가 얼마나 오래됐는지는 보여주지만, 실제 transport 장애가 언제 시작됐고 몇 번 연속 실패했는지는 직접 알려주지 않는다.
+
+예를 들어:
+
+```text
+10:00 notification event 생성
+10:02 첫 webhook 전송 실패
+10:03 두 번째 webhook 전송 실패
+```
+
+이라면:
+
+```text
+oldest pending age
+≈ 3분
+
+실제 transport failure duration
+≈ 1분
+```
+
+으로 서로 다르다.
+
+따라서 webhook transport 자체의 현재 연속 실패 상태를 별도의 persistent state로 관리하기로 했다.
+
+### Failure State Schema
+
+현재 schema version:
+
+```text
+failure_state_schema_version=1
+```
+
+저장하는 값:
+
+```text
+transport
+failed_event_id
+failure_kind
+failure_reason
+first_failed_at
+last_failed_at
+failure_count
+```
+
+예:
+
+```json
+{
+  "failure_state_schema_version": 1,
+  "transport": "webhook",
+  "failed_event_id": "1787185530153348081-718365",
+  "failure_kind": "retryable",
+  "failure_reason": "connection_error",
+  "first_failed_at": "2026-08-20T00:25:34+00:00",
+  "last_failed_at": "2026-08-20T00:25:49+00:00",
+  "failure_count": 2
+}
+```
+
+### 적용 범위
+
+Persistent failure state는 현재:
+
+```text
+webhook transport
+```
+
+에만 적용한다.
+
+`local-file` transport에는 적용하지 않는다.
+
+따라서:
+
+```text
+--failure-state-file
+```
+
+옵션은:
+
+```text
+--transport webhook
+```
+
+과 함께 사용할 때만 허용한다.
+
+`local-file`과 함께 사용하면 configuration error로 처리한다.
+
+실제 검증:
+
+```text
+adapter_error=--failure-state-file requires --transport webhook
+local_failure_state_rc=4
+```
+
+### Optional 정책
+
+`--failure-state-file`은 optional이다.
+
+지정하지 않으면 기존 webhook adapter 동작을 그대로 유지한다.
+
+이는 기존 systemd/local 테스트와의 backward compatibility를 유지하기 위한 결정이다.
+
+### Failure Kind
+
+Failure는 현재 두 종류로 구분한다.
+
+```text
+retryable
+permanent
+```
+
+예:
+
+```text
+connection refused
+timeout
+HTTP 408
+HTTP 429
+HTTP 5xx
+→ retryable
+```
+
+```text
+HTTP 3xx
+HTTP 400 등 기타 4xx
+→ permanent
+```
+
+### Structured Failure Reason
+
+Persistent state 작성자가 exception message 문자열을 파싱하지 않도록 failure reason을 구조화했다.
+
+예:
+
+```text
+connection_error
+timeout
+http_400
+http_408
+http_429
+http_500
+```
+
+다음과 같은 방식에는 의존하지 않는다.
+
+```text
+"HTTP 429" in str(exception)
+```
+
+이유는 exception message 변경이 persistent state의 의미까지 깨뜨리는 구조를 피하기 위해서다.
+
+### Sensitive Information 저장 금지
+
+Failure state에는 다음을 저장하지 않는다.
+
+```text
+webhook URL
+URL query
+URL path token
+credential
+raw request body
+raw response body
+```
+
+Webhook URL에 secret token이 포함될 가능성이 있기 때문이다.
+
+### 연속 실패 Counting 정책
+
+첫 실패:
+
+```text
+failure_count=1
+first_failed_at=T1
+last_failed_at=T1
+```
+
+두 번째 연속 실패:
+
+```text
+failure_count=2
+first_failed_at=T1 유지
+last_failed_at=T2
+```
+
+세 번째 실패:
+
+```text
+failure_count=3
+first_failed_at=T1 유지
+last_failed_at=T3
+```
+
+즉 `first_failed_at`은 현재 연속 장애의 시작 시각이고 `last_failed_at`은 최근 실패 시각이다.
+
+### 실제 Retryable Failure 검증
+
+Webhook endpoint를 사용하지 않는 localhost port로 설정했다.
+
+```text
+http://127.0.0.1:1/aerotrace
+```
+
+첫 실패:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+failure_count=1
+failure_kind=retryable
+failure_reason=connection_error
+failure1_rc=2
+```
+
+State:
+
+```text
+first_failed_at=2026-08-20T00:25:34+00:00
+last_failed_at=2026-08-20T00:25:34+00:00
+```
+
+검증:
+
+```text
+failure_state_first_attempt=PASS
+```
+
+동일 event 두 번째 실패:
+
+```text
+failure_count=2
+failure_kind=retryable
+failure_reason=connection_error
+failure2_rc=2
+```
+
+State:
+
+```text
+first_failed_at=2026-08-20T00:25:34+00:00
+last_failed_at=2026-08-20T00:25:49+00:00
+failure_count=2
+```
+
+검증:
+
+```text
+failure_state_second_attempt=PASS
+```
+
+따라서 최초 실패 시각 유지와 최근 실패 시각 갱신을 실제로 확인했다.
+
+### Recovery 시 Failure State 정책
+
+Webhook delivery가 성공하면 현재 연속 장애는 종료된 것으로 판단한다.
+
+따라서 성공 시 failure state를 삭제한다.
+
+실제 HTTP 204 recovery 결과:
+
+```text
+failure_state_cleared=true
+delivery_result=DELIVERED
+adapter_status=OK
+remaining_events=0
+recovery_rc=0
+```
+
+최종:
+
+```text
+failure_state_removed=PASS
+pending_after_recovery=0
+receipts_after_recovery=1
+```
+
+### 성공 Finalization 순서
+
+초기 구현에서는 다음 순서였다.
+
+```text
+HTTP 2xx
+→ receipt 저장
+→ pending 삭제
+→ main() 복귀
+→ failure state 삭제
+```
+
+이 구조에서는 failure state 삭제만 실패하면:
+
+```text
+receipt 있음
+pending 없음
+stale failure state 있음
+```
+
+이 되어 다음 adapter 실행에서 stale state를 자동 복구할 기회가 사라진다.
+
+따라서 finalization 순서를 다음과 같이 변경했다.
+
+```text
+HTTP 2xx
+→ receipt durable 저장
+→ failure state clear
+→ pending ACK
+```
+
+Failure state clear가 실패하면:
+
+```text
+receipt 있음
+failure state 있음
+pending 있음
+```
+
+상태를 유지한다.
+
+이를 통해 다음 실행에서 receipt를 근거로 외부 HTTP 요청을 다시 보내지 않고 복구할 수 있다.
+
+### Failure State Clear Failure 실험
+
+기존 retryable failure state와 pending event를 만든 뒤 state directory write 권한을 제거했다.
+
+```text
+chmod 500 <state-directory>
+```
+
+Webhook server는 HTTP 204를 정상 반환했다.
+
+그 뒤 failure state unlink가 실패했다.
+
+결과:
+
+```text
+adapter_error=failure state clear failed before pending ACK:
+[Errno 13] Permission denied
+
+clear_failure_rc=4
+```
+
+중요한 파일 상태:
+
+```text
+pending_after_clear_failure=1
+receipts_after_clear_failure=1
+failure_state_after_clear_failure=1
+```
+
+즉 외부 delivery 성공에 대한 receipt는 남았지만 pending ACK는 수행하지 않았다.
+
+### ACK_EXISTING Recovery 정책
+
+위 상태에서 HTTP server를 완전히 종료한 뒤 adapter를 다시 실행했다.
+
+서버가 내려가 있으므로 network POST를 다시 실행했다면 connection refused가 발생해야 했다.
+
+하지만 기존 receipt를 발견해 HTTP 요청 없이 다음 경로로 복구했다.
+
+```text
+failure_state_cleared=true
+delivery_result=ACK_EXISTING
+adapter_status=OK
+remaining_events=0
+ack_existing_rc=0
+```
+
+최종 상태:
+
+```text
+final_pending=0
+final_receipts=1
+final_failure_state=0
+```
+
+따라서 외부 delivery 성공 후 내부 bookkeeping 실패가 발생해도 동일 HTTP notification을 불필요하게 재전송하지 않고 복구할 수 있음을 확인했다.
+
+### Permanent Failure State
+
+HTTP 400을 실제 발생시켜 permanent failure state를 검증했다.
+
+결과:
+
+```text
+adapter_error=permanent delivery failure:
+webhook returned permanent HTTP 400
+
+failure_count=1
+failure_kind=permanent
+failure_reason=http_400
+remaining_events=1
+http_400_failure_rc=5
+```
+
+Persistent state:
+
+```text
+failure_state_schema_version=1
+transport=webhook
+failure_kind=permanent
+failure_reason=http_400
+failure_count=1
+```
+
+검증:
+
+```text
+permanent_failure_state=PASS
+```
+
+Permanent failure에서도:
+
+```text
+pending=1
+receipt=0
+```
+
+을 유지한다.
+
+이는 최초 ALERT가 전달되지 않았는데 뒤의 RECOVERY만 전달되는 순서 역전을 방지하기 위한 기존 outbox ordering 정책과 동일하다.
+
+### 손상된 Failure State 정책
+
+Failure state JSON이 손상된 경우 기존 파일을 덮어쓰거나 네트워크 delivery를 먼저 실행하지 않는다.
+
+테스트 state:
+
+```text
+{broken json
+```
+
+실행 결과:
+
+```text
+adapter_error=invalid failure state:
+Expecting property name enclosed in double quotes...
+
+corrupt_failure_state_rc=4
+```
+
+중요한 점은 state validation이 network delivery보다 먼저 수행된다는 것이다.
+
+따라서 이 테스트에서는 connection-refused URL을 사용했음에도 network failure가 발생하지 않았다.
+
+### 손상 State 보존 검증
+
+실행 전 SHA-256:
+
+```text
+c3e7d1b00a65589b59f816c0b0b668d795a3c28123697d5ab9555bdb8aa04604
+```
+
+실행 후 SHA-256:
+
+```text
+c3e7d1b00a65589b59f816c0b0b668d795a3c28123697d5ab9555bdb8aa04604
+```
+
+검증:
+
+```text
+corrupt_state_preserved=PASS
+```
+
+최종 상태:
+
+```text
+corrupt_pending_after=1
+corrupt_receipts_after=0
+```
+
+따라서 운영 상태 파일이 손상됐을 때 이를 조용히 초기화해 장애 정보를 잃는 대신 명시적인 configuration/state error로 노출한다.
+
+### Persistence 방식
+
+Failure state 작성은 다음 순서로 수행한다.
+
+```text
+temporary file 생성
+→ JSON write
+→ file flush
+→ file fsync
+→ os.replace
+→ parent directory fsync
+```
+
+성공적인 state 삭제 후에도 parent directory를 fsync한다.
+
+### 현재 Delivery 보장 수준
+
+현재 notification 구조는 다음 특성을 가진다.
+
+```text
+Outbox event 보존
++
+delivery receipt
++
+persistent transport failure state
++
+ACK_EXISTING recovery
+```
+
+하지만 외부 HTTP receiver와 로컬 filesystem 사이에 분산 transaction이 존재하지 않으므로 exactly-once delivery를 보장하지는 않는다.
+
+특히 receiver가 request를 처리했지만 HTTP response가 timeout된 경우에는 동일 event가 재전송될 수 있다.
+
+따라서 현재 의미는 여전히:
+
+```text
+at-least-once 성격
++
+event_id 기반 receiver-side deduplication 가능
+```
+
+이다.
+
+### 현재 남은 과제
+
+아직 다음은 구현하지 않았다.
+
+```text
+failure state 자체를 조회하는 별도 checker
+failure duration threshold
+failure count threshold
+Retry-After
+exponential backoff
+retry budget
+dead-letter 정책
+failure history archive
+systemd production failure-state 경로 적용
+```
+
+다음 단계에서는 persistent failure state를 실제 운영자가 읽을 수 있도록 checker 또는 기존 Outbox checker와 연결하는 것을 검토한다.
