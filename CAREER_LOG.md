@@ -5095,3 +5095,288 @@ HTTP 400을 6초마다 다시 보내던 알림 시스템에 Persistent Latch를 
 - 운영자용 pending 조회와 안전한 재처리 도구
 - Python adapter black-box 테스트의 CI 자동화
 - Production systemd timer에서 permanent HTTP 요청 수 고정 검증
+
+---
+
+## PostgreSQL WAL checkpoint와 Telemetry 유실 분석 Portfolio Checkpoint
+
+### 직접 얻은 실무 경험
+
+이번 작업에서는 단순히 PostgreSQL 설정 하나를 변경한 것이 아니라 telemetry가 Sender에서 DB까지 이동하는 전체 경로를 실제 장애 데이터로 분석했다.
+
+직접 경험한 내용:
+
+- 짧은 throughput benchmark와 장시간 sustained workload의 차이
+- PostgreSQL WAL-triggered checkpoint 분석
+- `checkpoint starting: time`과 `checkpoint starting: wal` 구분
+- PostgreSQL checkpoint duration과 WAL distance 확인
+- Collector exporter HTTP timeout 분석
+- exporter consumer 정체와 persistent sending queue 증가 관찰
+- queue capacity와 `block_on_overflow=false`의 실제 의미 확인
+- Receiver acceptance와 end-to-end DB persistence의 차이 확인
+- Collector cumulative counter와 실제 DB row를 함께 사용한 데이터 유실 판정
+- 부하 발생기의 cadence, producer lag, send-start lag, backpressure 검증
+- Benchmark false negative를 만든 DB settle race 발견 및 수정
+- PostgreSQL 설정 하나만 변경하는 통제된 A/B 실험
+- Docker Compose를 PostgreSQL 설정 source of truth로 정리
+- TimescaleDB 컨테이너 재생성 후 Named Volume 데이터 보존 검증
+
+### 실제 장애 증거
+
+`max_wal_size=1GB`에서:
+
+    Target       = 4,500 spans/s
+    Duration     = 180 sec
+    Expected     = 810,000 spans
+    Stored       = 478,200 spans
+    Missing      = 331,800 spans
+    Missing rate = 40.96%
+
+    Collector queue max = 49,350 / 50,000
+
+Collector:
+
+    Client.Timeout exceeded while awaiting headers
+    sending queue is full
+
+PostgreSQL:
+
+    checkpoint starting: wal
+
+이 반복됐다.
+
+누적 Collector metric에서도:
+
+    receiver accepted - exporter sent ≈ 656,249
+    exporter enqueue failed           = 656,250
+
+으로 exporter queue 단계에서 실제 문제가 발생했음을 확인했다.
+
+### 개선 검증
+
+`max_wal_size=4GB`에서 동일한:
+
+    4,500 spans/s × 180 sec
+
+부하를 적용했다.
+
+결과:
+
+    DB stored                  = 810,000 / 810,000
+    Exporter enqueue failed Δ  = 0
+    Receiver refused Δ         = 0
+    Producer backpressure      = 0
+    Sustained-rate validity    = PASS
+    End-to-end integrity       = PASS
+
+그 후 필요 이상으로 큰 설정을 사용하지 않기 위해 2GB를 검증했다.
+
+`max_wal_size=2GB` 동일 조건을 두 번 반복했고 두 실행 모두:
+
+    DB stored                  = 810,000 / 810,000
+    Exporter enqueue failed Δ  = 0
+    Receiver refused Δ         = 0
+    Producer backpressure      = 0
+    Sustained-rate validity    = PASS
+    End-to-end integrity       = PASS
+
+를 확인했다.
+
+두 번째 2GB 실행에서는 WAL-triggered checkpoint가 실제로 한 번 발생했지만 Collector timeout과 데이터 유실 없이 처리됐다.
+
+따라서 성과를:
+
+    checkpoint를 제거했다
+
+라고 표현하지 않는다.
+
+정확한 표현:
+
+> WAL-triggered checkpoint의 빈도와 압력을 완화하여 현재 workload에서 Collector timeout과 queue overflow로 이어지던 장애 연쇄를 제거했다.
+
+### 성능 및 안정성 측정값
+
+4GB:
+
+    DB CPU avg       = 45.66%
+    DB CPU median    = 45.87%
+    Request p99      = 1.900 ms
+    Queue max        = 1,050
+    DB               = 810,000 / 810,000
+
+2GB Run 1:
+
+    DB CPU avg       = 48.90%
+    DB CPU median    = 46.78%
+    Request p99      = 1.854 ms
+    Queue max        = 1,050
+    DB               = 810,000 / 810,000
+
+2GB Run 2:
+
+    Request p99      = 2.126 ms
+    Rate error       = 0.000%
+    Backpressure     = 0
+    DB               = 810,000 / 810,000
+
+이번 테스트는 최대 throughput을 다시 결정한 실험이 아니므로:
+
+    최대 처리량이 N% 증가했다
+
+라고 표현하지 않는다.
+
+### Benchmark 신뢰성 개선 경험
+
+기존 Sender의 성공은 Collector Receiver에 전달한 것까지만 의미했다.
+
+실제 telemetry SaaS에서 중요한 것은 최종 DB persistence이므로 benchmark 성공 조건을 다음처럼 강화했다.
+
+    Sender cadence
+    + DB prefix count
+    + Receiver refusal delta
+    + Exporter enqueue failure delta
+    + Final queue
+    + Final in-flight
+
+또한 Collector drain 직후 DB count가 아직 최종 commit을 반영하지 못하는 race를 발견했다.
+
+실제 smoke:
+
+    Drain 시점 DB = 4,850 / 5,000
+    Settle 확인   = 5,000 / 5,000
+
+이를 통해 benchmark 자체도 correctness test가 필요하다는 경험을 확보했다.
+
+### 운영 설정 반영 경험
+
+최종 설정:
+
+    max_wal_size=2GB
+
+Docker Compose:
+
+    command:
+      - postgres
+      - -c
+      - max_wal_size=2GB
+
+실제 PostgreSQL:
+
+    setting = 2048 MB
+    source  = command line
+
+실험용 `ALTER SYSTEM` 값은 제거했고 `postgresql.auto.conf`에 해당 entry가 남아 있지 않음을 확인했다.
+
+TimescaleDB 컨테이너 재생성 전후 데이터:
+
+    before = 19,754,641 spans
+    after  = 19,754,641 spans
+
+으로 동일했다.
+
+### 채용 담당자와 면접관에게 보여줄 포인트
+
+- 단순히 설정값을 검색해 변경한 것이 아니라 실제 데이터 유실을 재현하고 원인을 단계적으로 좁혔다.
+- Sender, Collector, Backend, PostgreSQL을 하나의 end-to-end 데이터 경로로 분석했다.
+- HTTP 200과 실제 DB persistence의 의미가 다르다는 점을 실험으로 확인했다.
+- Persistent Queue가 존재해도 overflow 정책과 downstream 장애에 따라 데이터가 유실될 수 있음을 확인했다.
+- PostgreSQL checkpoint 로그와 Collector metric을 연결해 장애 연쇄를 분석했다.
+- 하나의 설정만 바꾸는 A/B 실험으로 원인에 대한 신뢰도를 높였다.
+- 4GB가 성공했다고 바로 선택하지 않고 2GB를 추가 검증해 테스트한 값 중 더 작은 안정값을 선택했다.
+- Benchmark 자체의 race를 발견해 측정 신뢰성을 개선했다.
+- Kafka나 새로운 저장소를 먼저 추가하지 않고 현재 단순한 구조의 실제 병목부터 해결했다.
+- 설정 적용 후 컨테이너 재생성, 데이터 보존, runtime source까지 운영 관점에서 검증했다.
+
+### 보존해야 할 증거
+
+포트폴리오와 블로그 작성을 위해 다음 원본을 보존한다.
+
+- 1GB 4,500 spans/s × 180초 실패 결과
+- DB `478,200 / 810,000`
+- Missing `331,800`
+- Missing ratio `40.96%`
+- Collector queue `49,350 / 50,000`
+- Collector timeout 로그
+- Collector queue-full 로그
+- PostgreSQL `checkpoint starting: wal` 로그
+- cumulative `enqueue_failed=656,250`
+- 4GB 4,500 × 180초 PASS
+- 2GB 4,500 × 180초 PASS Run 1
+- 2GB 4,500 × 180초 PASS Run 2
+- 2GB Run 2 WAL checkpoint 로그
+- end-to-end benchmark의 accepted/refused/sent/enqueue_failed delta
+- TimescaleDB recreate 전후 `19,754,641` row
+- PostgreSQL `source=command line`
+- `postgresql.auto.conf` entry 0 확인
+
+### 이력서 문장 초안
+
+긴 버전:
+
+> 4,500 spans/s 장시간 OpenTelemetry 수집 테스트에서 PostgreSQL WAL-triggered checkpoint와 Collector exporter timeout이 연쇄적으로 발생해 810,000 Span 중 331,800건이 누락되는 문제를 재현하고, PostgreSQL·Collector·DB 지표를 연계 분석한 뒤 `max_wal_size` A/B 튜닝을 통해 동일 180초 workload에서 810,000건 전량 저장을 반복 검증
+
+짧은 버전:
+
+> PostgreSQL WAL checkpoint로 인한 Collector queue saturation과 Telemetry 유실을 로그·metric·DB count로 추적하고, `max_wal_size` A/B 튜닝과 end-to-end 무결성 검증으로 4,500 spans/s × 180초 조건에서 810,000 Span 전량 저장을 반복 확인
+
+### 블로그 주제
+
+제목:
+
+> HTTP 200인데 Trace 40%가 사라졌다 — OpenTelemetry Collector와 PostgreSQL WAL checkpoint 장애 분석
+
+핵심 메시지:
+
+> Collector Receiver가 telemetry를 받았다는 사실과 최종 DB에 영속화됐다는 사실은 다르며, Persistent Queue도 downstream stall과 overflow 정책을 함께 이해해야 데이터 유실을 방지할 수 있다.
+
+구성:
+
+1. 60초 benchmark에서는 보이지 않았던 문제
+2. 180초 테스트에서 queue가 50,000에 접근한 현상
+3. Sender는 PASS인데 DB에는 왜 Span이 없었는가
+4. Collector `enqueue_failed` metric 발견
+5. PostgreSQL `checkpoint starting: wal` 분석
+6. 1GB → 4GB → 2GB A/B 실험
+7. 2GB에서도 checkpoint는 있었지만 왜 성공했는가
+8. Benchmark 자체의 DB settle race
+9. Docker Compose 영구 설정과 재배포 검증
+10. Persistent Queue를 “있기만 하면 안전하다”고 생각하면 안 되는 이유
+
+### 예상 면접 질문
+
+- Collector가 HTTP 200을 반환했는데 왜 데이터가 유실될 수 있나요?
+- Persistent Queue가 있는데 왜 Span이 사라졌나요?
+- `block_on_overflow=false`는 어떤 의미인가요?
+- PostgreSQL checkpoint가 왜 write latency에 영향을 줄 수 있나요?
+- 왜 4GB가 아니라 2GB를 선택했나요?
+- 2GB에서도 WAL checkpoint가 있었는데 왜 성공했다고 판단했나요?
+- 왜 Collector `num_consumers`를 먼저 늘리지 않았나요?
+- `max_wal_size`를 크게 하면 어떤 trade-off가 있나요?
+- Benchmark의 end-to-end 성공을 어떻게 정의했나요?
+- DB settle race는 어떻게 발견했나요?
+- Receiver accepted와 exporter sent의 차이는 무엇인가요?
+- 이 실험으로 최대 처리량도 4,500 spans/s라고 말할 수 있나요?
+
+### 다음에 경험할 한 단계 높은 과제
+
+현재 문제를 만든 downstream stall은 완화했지만 Collector queue 정책 자체는 여전히:
+
+    block_on_overflow=false
+
+이다.
+
+따라서 다음 운영 단계에서는 DB가 다시 장시간 느려지거나 완전히 장애가 발생하는 상황에서 다음을 실제 장애 실험으로 검증해야 한다.
+
+- queue saturation 시 정확한 동작
+- `block_on_overflow` 정책
+- queue 크기와 허용 장애 시간 관계
+- persistent storage 실제 사용량
+- upstream backpressure 가능 여부
+- 장시간 장애 중 데이터 유실 조건
+- queue 사용률과 enqueue failure 경보 기준
+
+이번 checkpoint의 핵심은 “성능을 높였다”가 아니라:
+
+> 실제 telemetry 유실을 재현하고, 관측 지표의 의미를 재정의하고, benchmark 자체의 오류까지 수정한 뒤 PostgreSQL과 Collector 사이의 장애 연쇄를 반복 가능한 A/B 실험으로 해결했다.
+
+는 운영 경험이다.
