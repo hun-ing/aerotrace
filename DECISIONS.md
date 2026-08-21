@@ -7446,3 +7446,202 @@ Production Webhook unit은 `--failure-state-file`을 사용하므로 latch 적�
 - 운영자용 pending event 조회·재처리 기능이 필요한 경우
 - 여러 notification channel을 독립적으로 처리하는 경우
 - 장기간 미처리 permanent event 보존 정책이 필요한 경우
+
+---
+
+## Retryable Webhook Failure의 Bounded Exponential Backoff 정책
+
+### 해결하려는 문제
+
+Permanent Webhook failure는 persistent latch로 자동 재전송을 차단했지만 connection failure, timeout, HTTP 408, HTTP 429, HTTP 5xx와 같은 retryable failure는 notification timer가 실행될 때마다 다시 HTTP 요청을 수행했다.
+
+짧은 장애에서는 빠른 자동 복구가 가능하지만 장애가 길어지면 동일 event에 대한 요청이 고정 주기로 계속 발생한다.
+
+```text
+retryable failure
+→ pending 유지
+→ 다음 timer 실행에서 즉시 재전송
+→ failure_count 증가
+→ 장애가 끝날 때까지 반복
+```
+
+이 동작은 외부 endpoint 부하, rate limit, journal 반복을 증가시키며 timeout처럼 성공 여부가 모호한 실패에서는 중복 전달 가능성도 높인다.
+
+### 검토한 대안
+
+#### 고정 지연
+
+구현과 예측은 쉽지만 짧은 장애에 적합한 간격을 선택하면 장기 장애 중 요청 수가 많고, 긴 간격을 선택하면 일시 장애 복구가 불필요하게 늦어진다.
+
+#### systemd timer 간격 증가
+
+Adapter 밖에서 전체 실행 빈도를 줄일 수 있지만 healthy event와 retryable failure event를 구분하지 못한다. 기존 pending event가 없는 정상 처리와 새 notification 전달까지 함께 늦추므로 선택하지 않았다.
+
+#### 최대 retry 횟수 후 permanent 전환
+
+요청 수에는 상한을 둘 수 있지만 일시적인 외부 장애를 payload 자체의 permanent failure처럼 취급하게 된다. 운영자 개입 없이는 자동 복구할 수 없으므로 현재 failure 분류 의미와 맞지 않는다.
+
+#### Persistent failure-state 기반 bounded exponential backoff
+
+이미 저장 중인 실제 delivery failure 횟수와 마지막 실패 시각을 사용하면 별도 schema 변경 없이 event별 retry 시점을 결정할 수 있다. 짧은 장애에는 빠르게 재시도하고 장기 장애에는 요청 빈도를 제한하면서 자동 복구 가능성은 유지한다.
+
+현재 단계에서는 이 방식을 선택했다.
+
+### 선택한 계산 정책
+
+Retryable failure의 다음 실제 HTTP 요청까지 기다릴 시간은 다음과 같이 계산한다.
+
+```text
+delay = min(initial × 2^(failure_count - 1), maximum)
+```
+
+기본값:
+
+```text
+initial = 5초
+maximum = 300초
+```
+
+따라서 기본 지연 수열은 다음과 같다.
+
+```text
+failure_count 1  → 5초
+failure_count 2  → 10초
+failure_count 3  → 20초
+failure_count 4  → 40초
+failure_count 5  → 80초
+failure_count 6  → 160초
+failure_count 7+ → 300초
+```
+
+`failure_count`는 timer invocation 횟수가 아니라 실제 Webhook delivery failure 횟수다. Backoff 중 실행은 이 값을 증가시키지 않는다.
+
+### Deferred 실행 정책
+
+현재 pending event와 일치하는 retryable failure-state가 있고 `last_failed_at + delay`가 지나지 않았다면 실제 HTTP 요청을 수행하지 않는다.
+
+```text
+delivery_result=DEFERRED_RETRYABLE_FAILURE
+adapter_status=DEFERRED
+failure_deferred=true
+retry_after_sec=<remaining seconds>
+exit code=0
+```
+
+Deferred 경로에서는 다음 상태를 모두 유지한다.
+
+```text
+HTTP 요청 수 변화 없음
+failure-state 재작성 없음
+failure_count 변화 없음
+pending event 유지
+receipt 생성 없음
+```
+
+Exit code 0은 delivery 성공을 의미하지 않고 이번 timer invocation에서 의도한 backoff가 정상 적용됐음을 의미한다. Pending event와 persistent failure-state는 미전달 상태를 계속 나타낸다.
+
+Backoff가 끝난 뒤 실제 요청이 다시 실패하면 failure-state가 갱신되고 증가한 `failure_count`를 기준으로 다음 지연을 계산한다. 성공하면 기존 durable finalization 순서를 따른다.
+
+```text
+receipt 저장 및 fsync
+→ failure-state 삭제 및 parent directory fsync
+→ pending ACK 및 outbox directory fsync
+```
+
+### 처리 우선순위
+
+Webhook event 처리는 다음 순서를 유지한다.
+
+```text
+1. 기존 receipt 확인 및 ACK_EXISTING
+2. 동일 event의 permanent failure latch 확인
+3. 동일 event의 retryable failure backoff 확인
+4. 실제 HTTP 요청
+```
+
+`ACK_EXISTING`을 가장 먼저 처리하므로 외부 delivery 성공 뒤 내부 pending ACK만 중단된 crash window를 permanent latch나 retryable backoff가 막지 않는다.
+
+Permanent failure latch는 retryable backoff보다 먼저 평가한다. `--retry-permanent-failure`를 사용한 수동 실행은 permanent latch만 명시적으로 우회하며 permanent state는 retryable backoff 대상이 아니므로 실제 1회 요청을 수행한다.
+
+### Configuration 정책
+
+새 옵션:
+
+```text
+--retryable-backoff-initial-sec <seconds>
+--retryable-backoff-max-sec <seconds>
+```
+
+두 값은 finite number여야 한다. Initial은 0보다 커야 하고 maximum은 initial 이상이어야 한다.
+
+다음 설정은 configuration error와 exit code 4를 반환한다.
+
+```text
+initial=0 또는 음수
+initial=NaN 또는 infinity
+maximum=NaN 또는 infinity
+maximum < initial
+```
+
+Repository의 Webhook systemd unit은 기본 정책을 암묵적으로 의존하지 않고 다음 값을 명시한다.
+
+```text
+--retryable-backoff-initial-sec 5
+--retryable-backoff-max-sec 300
+```
+
+Backoff는 다음 조건을 모두 만족할 때만 적용한다.
+
+```text
+transport=webhook
+failure-state-file 설정
+failure_kind=retryable
+failed_event_id가 현재 pending event와 일치
+```
+
+Failure-state schema version은 변경하지 않았다. 별도 `next_attempt_at`을 저장하지 않고 기존 `failure_count`와 `last_failed_at`에서 매 실행 남은 시간을 계산한다.
+
+Failure-state 기능을 사용하지 않는 수동 Webhook 실행은 durable retry history가 없으므로 기존처럼 invocation마다 실제 요청을 수행한다.
+
+### Permanent failure 수동 재시도 unit
+
+운영자가 permanent failure 원인을 수정한 뒤 명시적으로 한 event만 재시도할 수 있도록 다음 oneshot unit을 repository에 둔다.
+
+```text
+deploy/systemd/aerotrace-notification-outbox-retry-permanent.service
+```
+
+이 unit은:
+
+```text
+ConditionPathExists=/var/lib/aerotrace-monitoring/notification-failure.json
+--retry-permanent-failure
+--max-events 1
+```
+
+을 사용한다. Timer에 연결하지 않으며 자동 permanent retry 용도로 사용하지 않는다.
+
+현재 installed production runtime은 local-file 기준선이고 `/etc/aerotrace/notification.env`가 없으므로 repository Webhook unit과 이 수동 retry unit은 아직 `/etc/systemd/system`에 설치하지 않는다.
+
+### 검증 결과
+
+Local fake HTTP receiver와 독립 fixture로 다음을 확인했다.
+
+- HTTP 503 첫 실패 직후 실행은 `DEFERRED_RETRYABLE_FAILURE`이며 실제 요청 수 1을 유지했다.
+- Backoff 후 두 번째 HTTP 503에서 요청 수와 `failure_count`가 각각 2가 됐다.
+- 두 번째 실패 직후 실행도 deferred되어 요청 수 2를 유지했다.
+- HTTP 204 복구 후 요청 수 3, pending 0, receipt 1이 됐고 failure-state가 삭제됐다.
+- 기본 계산 수열 `5 → 10 → 20 → 40 → 80 → 160 → 300`과 maximum 상한을 확인했다.
+- invalid 0, NaN, `maximum < initial` 설정은 exit code 4를 반환했다.
+- Local-file smoke, `ACK_EXISTING` 우선순위, permanent latch, explicit permanent retry 회귀 검증을 통과했다.
+- `systemd-analyze verify`에서 AeroTrace unit 오류가 없음을 확인했다.
+
+### 현재 한계와 재검토 조건
+
+- Backoff 시각 계산은 persistent UTC timestamp와 서버 wall clock에 의존한다.
+- Timer invocation 자체는 계속 발생하므로 deferred journal 출력은 남는다.
+- Outbox head event가 backoff 또는 permanent latch 상태이면 뒤 event도 처리되지 않는다.
+- HTTP timeout의 ambiguous delivery와 receiver-side 중복 가능성은 해결하지 않는다.
+- Tracked 자동 테스트 suite는 아직 없고 현재 검증은 수동 black-box fixture 중심이다.
+- 실제 외부 Webhook endpoint의 rate limit과 notification SLA를 확인하면 initial과 maximum 값을 재조정해야 한다.
+- 다중 channel 또는 높은 event volume이 필요해지면 event별 next-attempt timestamp, retry budget, dead-letter queue를 재검토한다.

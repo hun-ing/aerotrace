@@ -13934,3 +13934,364 @@ active_failure=false
 - Python adapter에 tracked 자동 테스트 suite가 없다.
 - HTTP timeout의 ambiguous success로 인한 중복 POST 가능성은 해결 범위 밖이다.
 - Production systemd Webhook unit에서 실제 HTTP 400 요청 수가 1회로 고정되는 검증은 아직 수행하지 않았다.
+
+---
+
+## V-7B-4-7 Retryable Webhook Failure Bounded Backoff 구현 및 검증
+
+### 기준점
+
+```text
+commit=720b838
+commit message=Webhook 영구 실패 무한 재전송 방지
+runtime transport=local-file
+production pending_events=0
+production active_failure=false
+```
+
+기존 분석용 untracked 스크립트 세 개는 변경하지 않았다.
+
+```text
+scripts/sample-collector-exporter.py
+scripts/sample-postgres-waits.py
+scripts/summarize-postgres-waits.py
+```
+
+### 해결하려는 문제
+
+Permanent failure의 자동 무한 재전송은 latch로 차단했지만 retryable failure는 notification timer 실행마다 실제 HTTP 요청을 다시 수행했다.
+
+Endpoint 장애가 길어지면 connection failure, timeout, HTTP 408, HTTP 429, HTTP 5xx가 실제 복구 가능성보다 높은 빈도로 반복될 수 있었다.
+
+목표는 retryable 자동 복구를 유지하면서 실제 실패 횟수에 따라 재시도 간격을 늘리고 최대 지연을 제한하는 것이었다.
+
+### 변경 파일
+
+```text
+scripts/process-notification-outbox.py
+deploy/systemd/aerotrace-notification-outbox.service
+deploy/systemd/aerotrace-notification-outbox-retry-permanent.service
+```
+
+### Adapter 변경 내용
+
+추가 옵션:
+
+```text
+--retryable-backoff-initial-sec
+--retryable-backoff-max-sec
+```
+
+기본값:
+
+```text
+initial=5초
+max=300초
+```
+
+`calculate_retryable_backoff_sec()`는 `failure_count` 1부터 initial 값을 적용하고 failure마다 두 배로 증가시키며 maximum에서 제한한다.
+
+```text
+5 → 10 → 20 → 40 → 80 → 160 → 300 → 300
+```
+
+`load_retryable_failure_defer()`는 다음 조건에서만 backoff를 적용한다.
+
+```text
+failure-state 파일 존재
+transport=webhook
+failed_event_id=현재 pending event_id
+failure_kind=retryable
+last_failed_at + 계산된 delay가 아직 지나지 않음
+```
+
+Failure-state schema version은 변경하지 않았다. 기존 `failure_count`와 `last_failed_at`을 사용하며 별도 next-attempt field는 저장하지 않는다.
+
+Backoff가 남아 있으면 `RetryableFailureDeferredError`를 통해 HTTP 요청 전에 main flow로 반환한다.
+
+출력:
+
+```text
+delivery_result=DEFERRED_RETRYABLE_FAILURE
+adapter_status=DEFERRED
+failure_deferred=true
+failure_count=<existing count>
+failure_kind=retryable
+failure_reason=<existing reason>
+failed_event_id=<event id>
+retry_after_sec=<remaining seconds>
+remaining_events=<pending count>
+```
+
+Exit code는 0이다.
+
+이 경로에서는 HTTP 요청, failure-state 변경, `failure_count` 증가, receipt 생성, pending ACK가 발생하지 않는다.
+
+### Webhook 처리 순서
+
+`deliver_to_webhook()`의 처리 순서를 다음과 같이 유지했다.
+
+```text
+ACK_EXISTING
+→ permanent latch
+→ retryable backoff
+→ 실제 HTTP request
+```
+
+Receipt가 이미 있으면 failure-state 종류와 backoff 잔여 시간에 관계없이 기존 crash-window 복구가 먼저 수행된다.
+
+Permanent latch는 계속 일반 자동 실행을 막는다. `--retry-permanent-failure`는 permanent latch를 명시적으로 우회하고 permanent state는 retryable defer 조건과 일치하지 않으므로 실제 요청을 한 번 수행한다.
+
+### Retryable HTTP 503 Backoff 검증
+
+Local fake HTTP receiver가 HTTP 503을 반환하도록 구성하고 하나의 pending event를 처리했다.
+
+첫 실제 실패:
+
+```text
+exit code=2
+actual requests=1
+failure_kind=retryable
+failure_reason=http_503
+failure_count=1
+pending_events=1
+receipts=0
+```
+
+첫 실패 직후 같은 event를 다시 실행했다.
+
+```text
+delivery_result=DEFERRED_RETRYABLE_FAILURE
+adapter_status=DEFERRED
+exit code=0
+actual requests=1
+failure_count=1
+pending_events=1
+receipts=0
+```
+
+따라서 deferred invocation이 HTTP 요청이나 failure-state 증가를 만들지 않음을 확인했다.
+
+첫 5초 backoff가 지난 뒤 다시 실행했다.
+
+```text
+exit code=2
+actual requests=2
+failure_count=2
+failure_kind=retryable
+failure_reason=http_503
+```
+
+두 번째 실패 직후 실행은 다시 deferred됐다.
+
+```text
+delivery_result=DEFERRED_RETRYABLE_FAILURE
+exit code=0
+actual requests=2
+failure_count=2
+```
+
+두 번째 실패에 적용되는 10초 backoff가 실제 요청을 차단했다.
+
+결과:
+
+```text
+retryable_immediate_defer=PASS
+retryable_second_failure_backoff=PASS
+deferred_request_count_unchanged=PASS
+deferred_failure_state_unchanged=PASS
+```
+
+### HTTP 204 자동 복구
+
+두 번째 backoff가 지난 뒤 receiver를 HTTP 204로 변경하고 명시적 permanent retry 옵션 없이 adapter를 실행했다.
+
+```text
+exit code=0
+delivery_result=DELIVERED
+actual requests=3
+pending_events=0
+receipts=1
+failure_state_exists=False
+```
+
+성공 finalization 순서에 따라 receipt가 생성되고 retryable failure-state와 pending event가 제거됐다.
+
+결과:
+
+```text
+retryable_automatic_recovery=PASS
+failure_state_cleared_after_success=PASS
+```
+
+### Backoff 계산 검증
+
+`failure_count`별 기본 계산 결과를 직접 검증했다.
+
+```text
+1=5
+2=10
+3=20
+4=40
+5=80
+6=160
+7=300
+8=300
+```
+
+Maximum에 도달한 뒤 큰 `failure_count`에서도 300초 상한을 유지했다.
+
+결과:
+
+```text
+bounded_backoff_sequence=PASS
+bounded_backoff_maximum=PASS
+```
+
+### Configuration Validation
+
+다음 잘못된 값을 각각 실행했다.
+
+```text
+--retryable-backoff-initial-sec 0
+--retryable-backoff-initial-sec NaN
+--retryable-backoff-initial-sec 10 --retryable-backoff-max-sec 5
+```
+
+각 실행은 HTTP 요청 전에 configuration error와 exit code 4를 반환했다.
+
+```text
+invalid_zero_initial=PASS
+invalid_nan=PASS
+invalid_max_less_than_initial=PASS
+```
+
+### ACK_EXISTING 우선순위 회귀
+
+다음 fixture를 구성했다.
+
+```text
+valid webhook receipt 있음
+동일 pending event 있음
+동일 event retryable failure-state 있음
+backoff 시간은 아직 남아 있음
+```
+
+결과:
+
+```text
+delivery_result=ACK_EXISTING
+exit code=0
+actual webhook requests=0
+pending_events=0
+failure_state_exists=False
+ack_existing_precedes_backoff=PASS
+```
+
+따라서 retryable defer가 receipt 기반 crash-window 복구를 막지 않음을 확인했다.
+
+### Permanent Failure 회귀
+
+기존 permanent latch와 explicit retry 동작을 다시 확인했다.
+
+```text
+첫 permanent failure
+→ 실제 HTTP 요청 1회
+→ failure_count=1
+→ pending 유지
+
+일반 재실행
+→ BLOCKED_PERMANENT_FAILURE
+→ 실제 요청 수 유지
+→ failure_count 유지
+
+--retry-permanent-failure
+→ 실제 요청 1회 수행
+→ 성공 시 receipt 저장, failure-state 삭제, pending ACK
+```
+
+결과:
+
+```text
+permanent_latch_regression=PASS
+explicit_permanent_retry_regression=PASS
+```
+
+### Local-file 회귀
+
+기존 local-file transport smoke를 실행했다.
+
+```text
+local_file_smoke=PASS
+```
+
+Backoff 옵션 추가가 installed production transport의 기존 처리 경로를 변경하지 않음을 확인했다.
+
+### systemd Unit 변경 및 검증
+
+Repository Webhook unit의 `ExecStart`에 정책값을 명시했다.
+
+```text
+--retryable-backoff-initial-sec 5
+--retryable-backoff-max-sec 300
+```
+
+Permanent failure는 자동 retry하면 안 되므로 timer가 없는 수동 oneshot unit을 추가했다.
+
+```text
+deploy/systemd/aerotrace-notification-outbox-retry-permanent.service
+ConditionPathExists=/var/lib/aerotrace-monitoring/notification-failure.json
+--retry-permanent-failure
+--max-events 1
+```
+
+`systemd-analyze verify` 결과 AeroTrace unit 오류는 없었다.
+
+```text
+systemd_unit_verify=PASS
+```
+
+### Production 안전 상태
+
+Repository Webhook unit과 permanent retry unit은 `/etc/systemd/system`에 설치하지 않았다.
+
+검증 종료 시 installed runtime은 계속 local-file 기준선이었다.
+
+```text
+transport=local-file
+RestrictAddressFamilies=AF_UNIX
+notification timer=active (waiting)
+pending_events=0
+active_failure=false
+/etc/aerotrace/notification.env 없음
+```
+
+따라서 fake receiver, retryable failure-state, Webhook URL이 production notification state에 남지 않았다.
+
+### 최종 결과
+
+```text
+retryable first failure                 PASS
+immediate deferred execution            PASS
+second failure after backoff            PASS
+second immediate deferred execution     PASS
+HTTP 204 automatic recovery             PASS
+5→10→20→40→80→160→300 calculation       PASS
+invalid configuration exit code 4       PASS
+local-file regression                   PASS
+ACK_EXISTING precedence                 PASS
+permanent latch regression              PASS
+explicit permanent retry regression     PASS
+systemd unit verification               PASS
+production local-file safety            PASS
+```
+
+### 남은 위험과 기술 부채
+
+- HTTP timeout ambiguous delivery의 중복 가능성은 남아 있다.
+- Deferred invocation도 journal output을 남긴다.
+- Head event backoff 중 뒤 event를 처리하지 않는다.
+- Wall clock의 큰 변경은 계산된 retry 시각에 영향을 줄 수 있다.
+- 실제 외부 endpoint의 rate limit과 notification SLA는 아직 정해지지 않았다.
+- Python adapter black-box 검증을 tracked automated test suite로 전환하지 않았다.
+- Repository Webhook unit과 permanent retry unit은 실제 endpoint 준비 전까지 production에 설치하지 않는다.

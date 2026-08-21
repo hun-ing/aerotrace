@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -86,6 +87,24 @@ class PermanentFailureLatchedError(OSError):
         )
 
 
+class RetryableFailureDeferredError(OSError):
+    def __init__(
+        self,
+        failure_state: dict[str, Any],
+        retry_after_sec: float,
+    ) -> None:
+        super().__init__(
+            "retryable webhook failure is deferred"
+        )
+
+        self.failure_state = (
+            failure_state
+        )
+        self.retry_after_sec = (
+            retry_after_sec
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -159,6 +178,26 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Explicitly retry one event blocked by a "
             "persistent permanent webhook failure latch."
+        ),
+    )
+
+    parser.add_argument(
+        "--retryable-backoff-initial-sec",
+        type=float,
+        default=5.0,
+        help=(
+            "Initial retryable webhook failure backoff "
+            "in seconds. Defaults to 5."
+        ),
+    )
+
+    parser.add_argument(
+        "--retryable-backoff-max-sec",
+        type=float,
+        default=300.0,
+        help=(
+            "Maximum retryable webhook failure backoff "
+            "in seconds. Defaults to 300."
         ),
     )
 
@@ -538,6 +577,130 @@ def load_permanent_failure_latch(
     return state
 
 
+def calculate_retryable_backoff_sec(
+    failure_count: int,
+    initial_sec: float,
+    max_sec: float,
+) -> float:
+    if failure_count <= 0:
+        raise ValueError(
+            "failure_count must be positive"
+        )
+
+    if initial_sec <= 0:
+        raise ValueError(
+            "retryable backoff initial seconds "
+            "must be positive"
+        )
+
+    if max_sec < initial_sec:
+        raise ValueError(
+            "retryable backoff maximum seconds "
+            "must be greater than or equal to "
+            "initial seconds"
+        )
+
+    delay_sec = initial_sec
+    remaining_doublings = (
+        failure_count - 1
+    )
+
+    while (
+        remaining_doublings > 0
+        and delay_sec < max_sec
+    ):
+        delay_sec = min(
+            delay_sec * 2,
+            max_sec,
+        )
+        remaining_doublings -= 1
+
+    return delay_sec
+
+
+def load_retryable_failure_defer(
+    path: Path,
+    event_id: str,
+    initial_sec: float,
+    max_sec: float,
+) -> tuple[dict[str, Any], float] | None:
+    if not path.exists():
+        return None
+
+    state = load_failure_state(
+        path
+    )
+
+    validate_failure_state(
+        path,
+        state,
+    )
+
+    if state["transport"] != "webhook":
+        raise ValueError(
+            f"{path}: failure state transport mismatch"
+        )
+
+    if (
+        state["failed_event_id"]
+        != event_id
+    ):
+        return None
+
+    if (
+        state["failure_kind"]
+        != "retryable"
+    ):
+        return None
+
+    backoff_sec = (
+        calculate_retryable_backoff_sec(
+            failure_count=state["failure_count"],
+            initial_sec=initial_sec,
+            max_sec=max_sec,
+        )
+    )
+
+    timestamp_text = (
+        state["last_failed_at"]
+    )
+
+    if timestamp_text.endswith("Z"):
+        timestamp_text = (
+            timestamp_text[:-1]
+            + "+00:00"
+        )
+
+    last_failed_at = (
+        datetime.fromisoformat(
+            timestamp_text
+        )
+    )
+
+    if last_failed_at.tzinfo is None:
+        raise ValueError(
+            f"{path}: last_failed_at must include timezone"
+        )
+
+    elapsed_sec = (
+        datetime.now(timezone.utc)
+        - last_failed_at.astimezone(timezone.utc)
+    ).total_seconds()
+
+    retry_after_sec = (
+        backoff_sec
+        - elapsed_sec
+    )
+
+    if retry_after_sec <= 0:
+        return None
+
+    return (
+        state,
+        retry_after_sec,
+    )
+
+
 def write_failure_state(
     path: Path,
     transport: str,
@@ -857,6 +1020,8 @@ def deliver_to_webhook(
     timeout_sec: float,
     failure_state_file: Path | None,
     retry_permanent_failure: bool,
+    retryable_backoff_initial_sec: float,
+    retryable_backoff_max_sec: float,
 ) -> tuple[str, bool]:
     receipt_dir.mkdir(
         parents=True,
@@ -934,6 +1099,42 @@ def deliver_to_webhook(
         if permanent_latch is not None:
             raise PermanentFailureLatchedError(
                 permanent_latch
+            )
+
+    if failure_state_file is not None:
+        try:
+            retryable_defer = (
+                load_retryable_failure_defer(
+                    path=failure_state_file,
+                    event_id=payload["event_id"],
+                    initial_sec=(
+                        retryable_backoff_initial_sec
+                    ),
+                    max_sec=(
+                        retryable_backoff_max_sec
+                    ),
+                )
+            )
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise FailureStateError(
+                "retryable failure state read failed "
+                "before webhook request: "
+                f"{exc}"
+            ) from exc
+
+        if retryable_defer is not None:
+            (
+                deferred_state,
+                retry_after_sec,
+            ) = retryable_defer
+
+            raise RetryableFailureDeferredError(
+                failure_state=deferred_state,
+                retry_after_sec=retry_after_sec,
             )
 
     request_body = json.dumps(
@@ -1181,6 +1382,36 @@ def main() -> int:
         )
         return 4
 
+    if (
+        not math.isfinite(
+            args.retryable_backoff_initial_sec
+        )
+        or args.retryable_backoff_initial_sec <= 0
+    ):
+        print(
+            "adapter_error="
+            "--retryable-backoff-initial-sec "
+            "must be a positive finite number",
+            file=sys.stderr,
+        )
+        return 4
+
+    if (
+        not math.isfinite(
+            args.retryable_backoff_max_sec
+        )
+        or args.retryable_backoff_max_sec
+        < args.retryable_backoff_initial_sec
+    ):
+        print(
+            "adapter_error="
+            "--retryable-backoff-max-sec must be "
+            "a finite number greater than or equal to "
+            "--retryable-backoff-initial-sec",
+            file=sys.stderr,
+        )
+        return 4
+
     webhook_url = None
 
     if args.transport == "local-file":
@@ -1371,7 +1602,58 @@ def main() -> int:
                     retry_permanent_failure=(
                         args.retry_permanent_failure
                     ),
+                    retryable_backoff_initial_sec=(
+                        args.retryable_backoff_initial_sec
+                    ),
+                    retryable_backoff_max_sec=(
+                        args.retryable_backoff_max_sec
+                    ),
                 )
+        except RetryableFailureDeferredError as exc:
+            failure_state = (
+                exc.failure_state
+            )
+
+            print(
+                "delivery_result="
+                "DEFERRED_RETRYABLE_FAILURE"
+            )
+            print(
+                "adapter_status=DEFERRED"
+            )
+            print(
+                "failure_deferred=true"
+            )
+            print(
+                "failure_state_file="
+                f"{args.failure_state_file}"
+            )
+            print(
+                "failure_count="
+                f"{failure_state['failure_count']}"
+            )
+            print(
+                "failure_kind="
+                f"{failure_state['failure_kind']}"
+            )
+            print(
+                "failure_reason="
+                f"{failure_state['failure_reason']}"
+            )
+            print(
+                "failed_event_id="
+                f"{failure_state['failed_event_id']}"
+            )
+            print(
+                "retry_after_sec="
+                f"{exc.retry_after_sec:.3f}"
+            )
+            print(
+                "remaining_events="
+                f"{count_pending(args.outbox_dir)}"
+            )
+
+            return 0
         except PermanentFailureLatchedError as exc:
             failure_state = (
                 exc.failure_state

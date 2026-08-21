@@ -1,7 +1,9 @@
 [Unit]
-Description=AeroTrace notification outbox processor
+Description=Retry one AeroTrace permanently failed notification
 After=network-online.target
 Wants=network-online.target
+
+ConditionPathExists=/var/lib/aerotrace-monitoring/notification-failure.json
 
 [Service]
 Type=oneshot
@@ -19,7 +21,7 @@ StateDirectoryMode=0750
 
 ExecStartPre=/usr/bin/mkdir -p /var/lib/aerotrace-monitoring/notification-outbox /var/lib/aerotrace-monitoring/notification-receipts
 
-ExecStart=/usr/bin/python3 /home/huning/aerotrace/scripts/process-notification-outbox.py --outbox-dir /var/lib/aerotrace-monitoring/notification-outbox --receipt-dir /var/lib/aerotrace-monitoring/notification-receipts --transport webhook --webhook-timeout-sec 5 --failure-state-file /var/lib/aerotrace-monitoring/notification-failure.json --retryable-backoff-initial-sec 5 --retryable-backoff-max-sec 300 --max-events 100 --quiet-idle
+ExecStart=/usr/bin/python3 /home/huning/aerotrace/scripts/process-notification-outbox.py --outbox-dir /var/lib/aerotrace-monitoring/notification-outbox --receipt-dir /var/lib/aerotrace-monitoring/notification-receipts --transport webhook --webhook-timeout-sec 5 --failure-state-file /var/lib/aerotrace-monitoring/notification-failure.json --retry-permanent-failure --retryable-backoff-initial-sec 5 --retryable-backoff-max-sec 300 --max-events 1
 
 TimeoutStartSec=15s
 

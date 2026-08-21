@@ -1,9 +1,86 @@
 # AeroTrace 프로젝트 컨텍스트
 
-> 마지막 업데이트: 2026-08-04  
-> 현재 상태: Phase 8 웹 대시보드 MVP 완료  
-> 현재 Phase: Phase 9 — 로컬 통합 실행 및 배포 준비  
-> 다음 작업: 현재 Docker Compose와 환경변수 구성을 점검하고 Backend, Frontend, TimescaleDB, OpenTelemetry Collector의 통합 실행 절차를 확정한다.
+> 마지막 업데이트: 2026-08-21
+> 현재 상태: Phase 9 production notification pipeline의 local-file 기준선 운영 및 Webhook 실패 정책 hardening 완료
+> 현재 Phase: Phase 9 — 로컬 통합 실행 및 배포 준비
+> 다음 작업: 실제 Webhook endpoint, receiver-side deduplication, notification SLA와 경보 threshold를 확정한 뒤 승인된 change window의 전환 계획을 수립한다.
+
+---
+
+## 현재 작업 컨텍스트 — 2026-08-21
+
+현재 작업 기준 커밋:
+
+```text
+720b838 Webhook 영구 실패 무한 재전송 방지
+```
+
+커밋 전 변경 범위:
+
+```text
+scripts/process-notification-outbox.py
+deploy/systemd/aerotrace-notification-outbox.service
+deploy/systemd/aerotrace-notification-outbox-retry-permanent.service
+```
+
+다음 untracked 파일은 별도 성능 분석 작업이므로 이번 변경에서 수정하거나 커밋하지 않는다.
+
+```text
+scripts/sample-collector-exporter.py
+scripts/sample-postgres-waits.py
+scripts/summarize-postgres-waits.py
+```
+
+Webhook retryable failure에는 persistent failure-state의 `failure_count`와 `last_failed_at`을 기준으로 bounded exponential backoff를 적용한다.
+
+기본 지연은 다음과 같다.
+
+```text
+failure_count 1  → 5초
+failure_count 2  → 10초
+failure_count 3  → 20초
+failure_count 4  → 40초
+failure_count 5  → 80초
+failure_count 6  → 160초
+failure_count 7+ → 300초
+```
+
+Backoff 중인 동일 event는 `DEFERRED_RETRYABLE_FAILURE`와 exit code 0을 반환한다. 이 경로에서는 HTTP 요청, failure-state 재작성, `failure_count` 증가가 발생하지 않는다.
+
+Webhook 처리 우선순위는 다음과 같다.
+
+```text
+기존 receipt 확인 및 ACK_EXISTING
+→ permanent failure latch
+→ retryable failure backoff
+→ 실제 HTTP 요청
+```
+
+따라서 receipt 기반 crash-window 복구는 permanent latch와 retryable backoff보다 항상 우선한다. Permanent failure는 기존 latch를 유지하며 운영자가 원인을 수정한 뒤 `--retry-permanent-failure`로만 명시적으로 재시도한다.
+
+Backoff 설정 기본값:
+
+```text
+--retryable-backoff-initial-sec 5
+--retryable-backoff-max-sec 300
+```
+
+두 값은 finite number여야 하고 initial은 0보다 커야 하며 max는 initial 이상이어야 한다. 잘못된 설정은 HTTP 요청 전에 exit code 4로 종료한다.
+
+Repository에는 Webhook 자동 처리 unit과 permanent failure 수동 재시도용 oneshot unit이 있다. 수동 unit은 한 번에 최대 한 event만 처리한다.
+
+현재 서버에 설치된 production runtime은 계속 local-file 안전 기준선이다.
+
+```text
+transport=local-file
+RestrictAddressFamilies=AF_UNIX
+notification timer=active (waiting)
+pending_events=0
+active_failure=false
+/etc/aerotrace/notification.env 없음
+```
+
+Repository의 Webhook unit과 permanent retry unit은 실제 endpoint와 환경 설정을 준비하기 전까지 `/etc/systemd/system`에 설치하지 않는다.
 
 ---
 
@@ -2048,4 +2125,3 @@ Collector queue는 Run1에서 최대 3150 및 연속 `3150 → 2100`이 관찰�
 사전에 정의한 queue 경계 조건이 한 번 발생했고 DB headroom도 상당히 감소했으므로 더 높은 rate 탐색은 중단한다.
 
 다음 단계는 설정 변경 없이 3,250 spans/s에서 Collector, Backend, JDBC, TimescaleDB를 분리 측정해 실제 병목 위치를 확인하는 것이다.
-
