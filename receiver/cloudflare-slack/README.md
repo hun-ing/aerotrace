@@ -2,7 +2,7 @@
 
 이 Worker는 AeroTrace Webhook event를 HMAC으로 검증하고 D1에 원자적으로 저장한 뒤 Cloudflare Queue를 통해 Slack Incoming Webhook으로 전달한다.
 
-Production 서버는 아직 이 receiver를 사용하지 않는다. Cloudflare/Slack 설정과 격리 synthetic 검증이 끝날 때까지 installed transport는 `local-file`로 유지한다.
+2026-08-21 현재 production sender가 이 receiver를 사용한다. Remote D1 migration, Queue/DLQ, private Slack Incoming Webhook, isolated synthetic, controlled production smoke, UptimeRobot health monitor와 sender rollback rehearsal을 완료했다.
 
 ## Architecture
 
@@ -76,24 +76,37 @@ chmod 0600 .dev.vars
 
 ## Remote deployment — operator action only
 
-아래 명령은 Cloudflare 계정에 Worker, D1, Queue를 생성하거나 변경한다. 계정과 Slack channel을 준비한 운영자가 명시적으로 실행한다.
+아래 명령은 Cloudflare 계정의 Worker, D1, Queue를 생성하거나 변경한다. 최초 bootstrap은 완료됐으며, 새 환경을 만들거나 재배포할 때 계정과 Slack channel을 관리하는 운영자가 명시적으로 실행한다.
 
 1. Slack app에서 Incoming Webhooks를 활성화하고 알림 전용 private channel에 app을 설치한다.
 2. `.dev.vars`에 동일 HMAC secret과 Slack Webhook URL을 넣는다.
-3. Cloudflare에 로그인하고 dry-run을 다시 확인한다.
-4. 두 secret을 code와 함께 한 번에 upload한다.
-5. 자동 생성된 D1 ID가 `wrangler.jsonc`에 기록됐는지 검토한다.
-6. Sender endpoint를 연결하기 전에 remote migration을 적용한다.
+3. Cloudflare에 로그인하고 dry-run을 다시 확인한다. Browser가 없는 SSH host에서는 device flow를 사용한다.
+4. Queue 목록에서 config가 참조하는 DLQ가 없으면 먼저 한 번 생성한다.
+5. 두 secret을 code와 함께 한 번에 upload한다.
+6. 자동 생성된 D1 ID가 `wrangler.jsonc`에 기록됐는지 검토한다.
+7. Sender endpoint를 연결하기 전에 remote migration을 적용한다.
 
 ```bash
 cd /home/huning/aerotrace/receiver/cloudflare-slack
-npx wrangler login
+npx wrangler login --device
 npm run deploy:dry-run
+npx wrangler queues list
+```
+
+`aerotrace-notification-delivery-dlq`가 목록에 없을 때만 다음을 실행한다. 이미 있으면 다시 만들지 않는다.
+
+```bash
+npx wrangler queues create aerotrace-notification-delivery-dlq
+```
+
+그다음 deploy와 migration을 수행한다.
+
+```bash
 npx wrangler deploy --secrets-file .dev.vars
 npm run db:migrate:remote
 ```
 
-최초 deploy와 migration 사이에는 data endpoint를 사용하지 않는다. 아직 AeroTrace production sender가 receiver를 가리키지 않으므로 이 순서에서 notification event가 들어오면 안 된다.
+Wrangler 4.125.0 최초 bootstrap에서는 D1과 primary delivery Queue를 자동 provision했지만 config가 consumer로 참조한 DLQ는 먼저 만들어야 했다. 최초 deploy와 migration 사이에는 data endpoint를 사용하지 않는다. 기존 production 재배포라면 migration compatibility와 sender 영향 범위를 먼저 검토한다.
 
 Cloudflare가 자동으로 resource ID를 `wrangler.jsonc`에 추가하면 secret이 아닌지 확인한 뒤 repository에 반영한다. `.dev.vars`는 절대 stage하지 않는다.
 
@@ -122,11 +135,14 @@ Synthetic event는 production server outbox나 `/etc`를 변경하지 않는다.
 ```text
 type=HTTP(s)
 URL=https://<worker-host>/health
+method=GET
 interval=5 minutes
 alert contact=operator email only
 ```
 
 Slack을 이 monitor의 alert contact로 추가하면 primary와 fallback이 다시 같은 channel에 의존하므로 사용하지 않는다.
+
+Activation에서는 `/health`를 빠뜨린 root URL의 404가 DOWN email로 감지됐고, 정확한 `/health`로 고친 뒤 recovery UP email을 받았다. Built-in Test Notification도 수신했다. D1 실패 상태를 일부러 만들어 `/health` 503을 발생시키지는 않았으며 해당 동작은 automated test가 검증한다.
 
 ## Read-only inspection
 

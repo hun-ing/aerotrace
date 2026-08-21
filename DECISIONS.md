@@ -1,10 +1,9 @@
 # AeroTrace 설계 결정 기록
 
-> 마지막 업데이트: 2026-08-04  
-> 현재 결정 수: 20  
+> 마지막 업데이트: 2026-08-21
 > 상태: 채택 / 보류 / 재검토 필요
 
-이 문서는 AeroTrace의 주요 설계 결정, 검토한 대안, 선택 이유, 위험, 재검토 조건을 기록한다.
+이 문서는 AeroTrace의 주요 설계 결정, 검토한 대안, 선택 이유, 위험, 재검토 조건을 시간순으로 기록한다. 과거 결정의 상태 문장은 당시 근거이며, 같은 주제의 최신 ADR이 현재 기준선이다.
 
 ---
 
@@ -8157,3 +8156,82 @@ Local-file runtime은 SLO 데이터가 아니다. Remote receiver, Slack synthet
 - Queue exhaustion/permanent failure
 - Count threshold false positive
 - 팀 on-call 도입
+
+---
+
+## ADR — Production notification 기준선을 Webhook으로 활성화하고 live drill을 분리한다
+
+### 상태
+
+채택 — 2026-08-21 16:18 KST production 활성
+
+### 배경
+
+Slack + Cloudflare receiver 구현과 local regression만으로는 production sender의 filesystem outbox, systemd sandbox, HMAC secret, public Worker, D1/Queue와 Slack을 한 경로로 검증할 수 없다. 반대로 정상 credential을 일부러 틀리거나 receiver final failure를 주입하는 모든 훈련을 activation 필수 조건으로 두면 단일 운영자의 정상 production에 불필요한 permanent latch와 fallback alarm을 만들 수 있다.
+
+### 결정
+
+Installed production 기준선을 다음으로 전환한다.
+
+```text
+transport=webhook
+sender secret=/etc/aerotrace/notification.env, root:root 0600
+receiver=Cloudflare Worker + D1 + Queue/DLQ
+channel=private Slack Incoming Webhook
+health fallback=UptimeRobot GET /health, 5분, operator email
+rollback=보존한 local-file systemd unit
+```
+
+Activation gate는 안전한 live acceptance와 실패 주입이 필요한 drill을 분리한다.
+
+Live acceptance:
+
+- Isolated signed synthetic의 202와 Slack 한 건
+- `/health` HTTP 200과 zero failure aggregate
+- Sender/receiver HMAC secret exact-match 확인
+- Controlled production outbox event의 receipt, D1 `delivered`, Slack 한 건
+- Local-file 복원 후 Webhook 재설치 round trip
+- UptimeRobot non-2xx DOWN과 recovery UP email path
+
+Tracked test 또는 승인된 후속 drill:
+
+- Exact duplicate/conflict, timeout, 429, permanent response와 DLQ는 automated test가 상시 검증한다.
+- 실제 HMAC rotation, receiver final-failure requeue와 ALERT→RECOVERY pair는 maintenance window 또는 incident에서 운영자가 수행한다.
+- 실제로 실행하지 않은 live drill을 PASS로 기록하지 않는다.
+
+### 검증과 현재 기준선
+
+```text
+notification timer=active
+latest service Result=success, ExecMainStatus=0
+pending_events=0
+active_failure=false
+receiver /health=200, status=ok
+D1 delivery_state=delivered 2
+delivered payload_json not redacted=0
+installed Webhook unit=repository unit
+local-file rollback backup=preserved
+```
+
+UptimeRobot DOWN/UP 경로는 최초 monitor URL에서 `/health`를 누락해 root 404가 발생한 실제 DOWN과 수정 후 recovery, built-in Test Notification으로 확인했다. 이를 D1 final failure로 인한 `/health` 503 live rehearsal이라고 해석하지 않는다.
+
+### Free plan 운영 가정
+
+2026-08-21 확인한 Free plan 기준은 Workers 100,000 requests/day, D1 5,000,000 rows read/day·100,000 rows written/day·account total 5 GB, Queues 10,000 standard operations/day included다. Queue 정상 전달 한 건은 보통 write/read/delete 3 operations이고 retry마다 read가 추가된다. Free Queue retention은 24시간이므로 DLQ message가 장기 evidence가 될 수 없고 D1 final-failure row를 보존한다.
+
+### 결과와 Trade-off
+
+- Local-file receipt가 외부 notification 성공처럼 보이던 기준선을 실제 Slack delivery pipeline으로 교체했다.
+- Primary Slack과 health fallback email의 failure domain을 분리했다.
+- 단일 active HMAC secret 때문에 rotation에는 짧은 sender 정지가 필요하다.
+- Queue/DLQ와 Slack의 live failure injection을 activation에서 생략한 대신 automated state-machine test와 D1 health 관측에 의존한다.
+- Synthetic과 controlled smoke는 SLO compliance 분모에서 제외하며 eligible production event가 없으면 `NO_DATA`다.
+
+### 재검토 조건
+
+- 최초 7일 daily review 또는 30일 SLI review 결과
+- Free tier quota나 Queue retention 변경
+- 첫 실제 receiver final failure 또는 duplicate Slack message
+- Secret rotation 사고
+- Secondary on-call 도입
+- D1 retention job 도입

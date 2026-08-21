@@ -2,7 +2,7 @@
 
 > 마지막 업데이트: 2026-08-21
 > Contract version: 2
-> 상태: Slack + Cloudflare Worker/D1/Queue 기준 확정, production 미활성
+> 상태: Slack + Cloudflare Worker/D1/Queue production 활성
 
 ---
 
@@ -380,20 +380,34 @@ Wrangler 4.125.0 bundle dry-run PASS
 fresh local D1 migration PASS
 ```
 
-Production 전 남은 acceptance:
+2026-08-21 live environment에서 완료:
 
 ```text
-Cloudflare remote deploy and migration
-Slack private channel Incoming Webhook
-isolated synthetic 202 and one Slack message
-duplicate signed request and one Slack side effect
-real timeout/429 or controlled failure injection
-UptimeRobot /health email monitor
-HMAC rotation rehearsal
-sender local-file rollback rehearsal
+Cloudflare remote deploy, D1 migration, Queue and DLQ provisioning PASS
+Slack private channel Incoming Webhook direct test PASS
+isolated signed synthetic 202 and one Slack message PASS
+GET /health HTTP 200 and zero failure counts PASS
+UptimeRobot non-2xx DOWN and recovery UP email path PASS
+sender/receiver HMAC secret exact-match check PASS
+controlled production outbox to receipt, D1 delivered and one Slack message PASS
+local-file rollback and Webhook restoration rehearsal PASS
+D1 delivered rows=2, delivered payloads left unredacted=0
 ```
 
-완료 전 installed production runtime은 `local-file` 기준선을 유지한다.
+다음은 tracked receiver/sender test에서 완료했으며 production에 실패를 인위적으로 주입하지 않았다.
+
+```text
+exact duplicate replay and payload conflict
+sender timeout, retryable and permanent classification
+Slack 429/5xx/permanent classification and DLQ exhaustion
+failed receiver state causing /health 503
+```
+
+실제 HMAC rotation, receiver final-failure requeue와 ALERT→RECOVERY pair는 승인된 maintenance window 또는 실제 incident에서 수행한다. UptimeRobot 실제 DOWN은 설정 중 `/health`를 빠뜨린 root 404로 확인했으며 D1 failure를 만든 `/health` 503 live rehearsal로 기록하지 않는다.
+
+현재 installed production transport는 `webhook`이고 local-file unit은 rollback 사본으로 보존한다.
+
+Free plan 운영 가정은 Workers 100,000 requests/day, D1 5,000,000 rows read/day·100,000 rows written/day·account total 5 GB, Queues 10,000 standard operations/day included다. Queue 정상 전달 한 건은 보통 write/read/delete 3 operations이고 retry마다 read가 추가된다. Free Queue message retention은 24시간이므로 DLQ 장기 증거는 D1 `failed_exhausted` row에 의존한다. Provider limit 변경 시 이 가정을 재검토한다.
 
 ## 15. Official references
 
@@ -402,5 +416,8 @@ sender local-file rollback rehearsal
 - Cloudflare D1 Worker binding API: <https://developers.cloudflare.com/d1/worker-api/>
 - Cloudflare Queues JavaScript API: <https://developers.cloudflare.com/queues/configuration/javascript-apis/>
 - Cloudflare Queue retries and DLQ: <https://developers.cloudflare.com/queues/configuration/batching-retries/>
+- Cloudflare Workers pricing and limits: <https://developers.cloudflare.com/workers/platform/pricing/>
+- Cloudflare D1 pricing and limits: <https://developers.cloudflare.com/d1/platform/pricing/>
+- Cloudflare Queues pricing and limits: <https://developers.cloudflare.com/queues/platform/pricing/>
 - Slack Incoming Webhooks: <https://api.slack.com/messaging/webhooks>
 - UptimeRobot Free plan: <https://help.uptimerobot.com/en/articles/11604710-who-should-use-uptimerobot-s-free-plan>

@@ -1,8 +1,10 @@
 # AeroTrace Career Log
 
-> 마지막 업데이트: 2026-08-04  
-> 현재 Portfolio 단계: 수집, 저장, 장애 복구, 데이터 수명주기, 멀티테넌트 조회, Trace Explorer까지 End-to-End MVP 검증  
-> 다음 Checkpoint: 로컬 통합 실행과 실제 배포
+> 마지막 업데이트: 2026-08-21
+> 현재 Portfolio 단계: 수집·저장·조회 MVP, 장애 복구와 Cloudflare/Slack notification production 활성화 검증
+> 다음 Checkpoint: notification 첫 7일 health review와 30일 SLI·Free tier 사용량 검토
+
+이 문서는 checkpoint를 시간순으로 누적한다. 과거 항목의 `현재`와 `다음 검증`은 당시 상태이며 마지막 checkpoint가 최신 범위다.
 
 ---
 
@@ -5478,3 +5480,70 @@ real provider failure injection
 - HMAC rotation rehearsal
 - Installed local-file rollback rehearsal
 - 첫 30일 SLI measurement와 threshold review
+
+---
+
+## Portfolio Checkpoint — Slack Notification Production Activation
+
+### 이전 체크포인트에서 실제로 완료한 것
+
+```text
+Cloudflare Worker/D1/Queue/DLQ remote deploy and migration
+private Slack Incoming Webhook direct acceptance
+HMAC-signed isolated synthetic 202 and one Slack message
+UptimeRobot GET /health 5-minute operator email fallback
+production filesystem outbox -> systemd -> Worker -> Queue -> Slack smoke
+local-file rollback -> Webhook restoration round trip
+```
+
+Production sender secret은 root:root mode 0600 환경 파일에 두고 Cloudflare secret과의 exact match만 출력 없이 확인했다. Installed systemd service는 outbound HTTPS에 필요한 address family만 추가하고, retryable backoff 5초부터 300초 상한과 permanent latch를 유지했다.
+
+### Production 검증 증거
+
+```text
+activation timestamp=2026-08-21 16:18 KST
+notification timer=active
+latest service Result=success, ExecMainStatus=0
+pending_events=0
+active_failure=false
+receiver /health=HTTP 200, all failure counts 0
+isolated synthetic Slack side effect=1
+controlled production smoke receipt=1
+controlled production smoke Slack side effect=1
+D1 delivered rows=2
+delivered rows retaining original payload=0
+local-file rollback backup=preserved
+```
+
+UptimeRobot에서는 최초 URL에 `/health`를 빼먹은 root 404가 DOWN email로 감지됐고, 올바른 `GET /health`로 수정한 뒤 recovery UP email을 받았다. 이 결과를 receiver failed-state 기반 `/health` 503 live rehearsal로 과장하지 않는다.
+
+### 이력서 성과 문장 초안
+
+> Filesystem Outbox와 HMAC Webhook, Cloudflare Worker·D1·Queue, private Slack을 실제 production 경로로 연결하고, durable receipt와 payload redaction을 확인한 controlled E2E smoke 및 local-file rollback·Webhook 복원 rehearsal로 운영 전환 가능성을 검증
+
+짧은 버전:
+
+> Cloudflare D1/Queue 기반 Slack 알림 경로를 production에 활성화하고 systemd outbox E2E 전달과 rollback round trip을 검증
+
+### 과장하지 않을 범위
+
+다음 항목은 아직 live production evidence가 없다.
+
+```text
+exact duplicate signed replay
+real Slack 429/permanent/DLQ exhaustion
+receiver final-failure requeue
+HMAC secret rotation
+ALERT -> RECOVERY pair through Slack
+30-day SLO compliance
+24x7 or multi-operator incident response
+```
+
+Exact duplicate/conflict, retryable/permanent response, Queue exhaustion과 `/health` degraded state는 tracked automated tests로 검증했다. 실제 rotation과 requeue는 승인된 maintenance window 또는 incident에서 수행해야 한다.
+
+### 다음 검증
+
+- 최초 7일 daily health/failure review
+- 첫 eligible production notification의 두 delivery boundary 기록
+- 첫 30일 SLI sample size와 Free tier 사용량 review
+- 승인된 maintenance window의 HMAC rotation 또는 첫 실제 incident의 receiver requeue 기록

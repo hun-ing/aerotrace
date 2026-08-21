@@ -1,8 +1,10 @@
 # AeroTrace Engineering Log
 
-> 마지막 업데이트: 2026-08-04  
-> 현재 Phase: Phase 9 — 로컬 통합 실행 및 배포 준비  
+> 마지막 업데이트: 2026-08-21
+> 현재 Phase: Phase 9 — notification production 활성화 및 초기 운영 관찰
 > 기록 원칙: 사용자가 직접 적용하고 실행한 결과만 완료로 기록하며, 원본 출력이 없는 수치는 추측하지 않는다.
+
+이 문서는 검증 결과를 시간순으로 누적한다. 중간 항목의 `현재`와 `다음 단계`는 해당 실험 시점의 표현이며 최종 항목과 `AEROTRACE_CONTEXT.md` 최상단이 최신 상태다.
 
 ---
 
@@ -15124,3 +15126,163 @@ NOTIFICATION_INCIDENT_TEMPLATE.md
 ```
 
 지금 이 문서들을 미리 만들면 owner, 실제 D1 volume, 첫 incident workflow가 없는 placeholder와 runbook 중복이 된다. Trigger 시점에 실측 근거로 작성한다.
+
+---
+
+## V-7B-4-11 Slack Notification Production 활성화와 Rollback Rehearsal
+
+### 목적
+
+Repository에서 검증한 HMAC sender와 Cloudflare durable receiver를 실제 private Slack channel에 연결하고, production filesystem outbox부터 Slack까지 한 건을 검증한다. 동시에 local-file 기준선으로 복원한 뒤 Webhook을 다시 활성화할 수 있는지 확인한다.
+
+### Remote receiver bootstrap
+
+Wrangler 4.125.0 device authorization으로 Cloudflare에 로그인했다. Secret 값은 `.dev.vars`에 mode 0600으로 보관하고 출력 없이 형식과 sender 값 일치 여부만 확인했다.
+
+첫 deploy에서 config가 참조한 `aerotrace-notification-delivery-dlq`가 없어 중단됐다. Queue와 D1 목록을 먼저 확인한 뒤 DLQ를 한 번 생성했다. 다음 deploy가 D1과 primary delivery Queue를 자동 provision하고 Worker, scheduled reconciliation, primary Queue consumer와 DLQ consumer를 배포했다. 생성된 D1 binding ID는 Wrangler가 `wrangler.jsonc`에 기록했으며 credential이 아닌 deployment metadata로 검토했다.
+
+Remote migration 후 health 결과:
+
+```text
+HTTP status=200
+status=ok
+failed_permanent=0
+failed_exhausted=0
+stale_in_flight=0
+```
+
+Repository root에서 Wrangler D1 command를 실행하면 `DB` binding을 찾지 못했다. `receiver/cloudflare-slack`의 config directory에서 실행해야 한다는 운영 조건을 확인했다.
+
+### Slack과 isolated acceptance
+
+Private notification channel에 Slack Incoming Webhook app을 설치하고 direct Webhook test의 `ok`와 메시지 수신을 확인했다. HMAC-signed isolated synthetic은 다음 결과를 냈다.
+
+```text
+receiver_status=202
+synthetic_result=DURABLY_ACCEPTED
+same synthetic event_id in Slack=1
+```
+
+Exact same signed request를 다시 replay한 live duplicate test는 하지 않았다. Duplicate와 conflict는 tracked receiver test가 검증한다.
+
+### Independent health fallback
+
+UptimeRobot Free HTTP(S) monitor를 5분 주기, operator email only로 구성했다. 최초 URL에서 `/health`를 빠뜨려 Worker root 404가 DOWN으로 감지됐고, 정확한 `GET /health`로 수정한 뒤 recovery UP email을 받았다. Built-in Test Notification의 DOWN/UP email도 수신했다.
+
+이 결과는 email contact와 non-2xx recovery 경로의 live evidence다. D1에 final failure를 넣어 `/health` 503을 발생시킨 rehearsal은 아니며 그 동작은 Node regression test로 검증한다.
+
+### Production sender 전환
+
+전환 전 notification timer를 중지하고 installed local-file unit을 덮어쓰지 않는 backup으로 보존했다. Backup에서 다음 기준선을 확인했다.
+
+```text
+--transport local-file
+RestrictAddressFamilies=AF_UNIX
+```
+
+`/etc/aerotrace/notification.env`는 root:root mode 0600으로 설치했다. Endpoint 형식과 Cloudflare/sender HMAC secret exact match는 실제 값을 표시하지 않고 확인했다. Repository Webhook service와 permanent retry oneshot unit을 설치한 뒤 idle manual start가 성공했다.
+
+Installed Webhook 기준선:
+
+```text
+EnvironmentFile=/etc/aerotrace/notification.env
+--transport webhook
+--webhook-timeout-sec 5
+--retryable-backoff-initial-sec 5
+--retryable-backoff-max-sec 300
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+```
+
+### Controlled production outbox smoke
+
+Notification timer를 멈춘 상태에서 explicit smoke label의 controlled WARNING event 한 건을 production outbox에 만들고 service를 한 번 실행했다.
+
+```text
+service Result=success
+ExecMainStatus=0
+pending_events=0
+active_failure=false
+receipt count for smoke event=1
+receipt transport=webhook
+Slack message count for smoke event=1
+D1 final state=delivered
+```
+
+Temporary checker와 state는 제거했다. Receipt와 D1 delivered row는 activation evidence로 보존했다. ALERT→RECOVERY pair는 만들지 않았다.
+
+Remote D1 acceptance 종료 상태:
+
+```text
+delivery_state=delivered, events=2
+delivered rows with payload_json other than {}=0
+```
+
+두 row는 isolated synthetic과 controlled production smoke다. Synthetic과 smoke는 production SLO compliance 분모에서 분리한다.
+
+### Rollback round trip
+
+Timer를 중지하고 보존한 local-file unit으로 복원한 뒤 daemon reload와 idle service 성공을 확인했다. 이어 repository Webhook unit을 다시 설치하고 idle service 성공 후 timer를 재시작했다.
+
+최종 기준선:
+
+```text
+activation timestamp=2026-08-21 16:18 KST
+notification timer=active
+collector alert timer=active
+latest notification service Result=success, ExecMainStatus=0
+installed service matches repository Webhook unit
+local-file backup remains preserved
+pending_events=0
+active_failure=false
+receiver /health=HTTP 200
+```
+
+### 의도적으로 수행하지 않은 live drill
+
+다음은 정상 production에 credential mismatch나 실패 row를 만들 수 있어 activation 중 강제하지 않았다.
+
+```text
+HMAC secret rotation
+receiver failed_permanent/failed_exhausted injection and requeue
+Slack 429/permanent/DLQ exhaustion
+exact duplicate signed replay
+ALERT -> RECOVERY pair
+```
+
+Contract와 runbook에 operator procedure를 유지하고 automated tests로 state transition을 검증한다. 실제 rotation/requeue는 승인된 maintenance window 또는 incident에서 실행하고 결과를 별도 log에 남긴다.
+
+### 문서 갱신 원칙
+
+Current-state 문서의 local-file/production 미활성 문구를 Webhook 기준선으로 바꿨다. 과거 ADR과 engineering log의 당시 local-file 상태는 historical evidence이므로 소급 수정하지 않고, 이 항목과 새 ADR로 상태 전이를 기록한다.
+
+전면 review에서 다음을 추가로 확인했다.
+
+```text
+current runtime, SLO activation timestamp and acceptance evidence consistency
+actual live checks versus automated-only and deferred drills
+UptimeRobot root 404 incident versus unexecuted /health 503 drill
+receiver 202 durability versus asynchronous Slack delivery
+systemd install, rollback and receiver requeue command scope
+Cloudflare Free quota and 24-hour Queue retention caveat
+Markdown code fence balance, local links and secret leakage
+historical record versus current truth separation
+```
+
+새 deployment/test 설명서는 runbook, receiver README와 tracked suite를 중복하므로 만들지 않는다. Production 활성 이후 우선순위가 높아진 추가 문서는 `NOTIFICATION_INCIDENT_TEMPLATE.md`이며 첫 실제 incident 전에 작성하는 것을 권장한다. `DATA_RETENTION_POLICY.md`는 D1 30일 volume 측정 뒤, `SECURITY.md`는 외부 contributor 또는 공개 vulnerability report 경로가 필요할 때 작성한다.
+
+### 최종 repository 검증
+
+```text
+Python sender regression=10/10 PASS
+Node receiver regression=14/14 PASS
+Node syntax check=PASS
+Wrangler version=4.125.0
+Worker dry-run upload=28.76 KiB, gzip=7.26 KiB, PASS
+fresh local D1 migration=3 commands PASS
+repository AeroTrace systemd unit errors=0
+git diff --check=PASS
+Markdown code fences/local links=PASS
+diff credential scan=PASS
+```
+
+Local fake HTTP server와 Miniflare local D1은 loopback socket이 필요하므로 제한된 sandbox 밖에서 동일 test command를 다시 실행해 최종 PASS를 확인했다. Remote deploy나 production D1 mutation은 이 최종 repository 검증에서 수행하지 않았다.

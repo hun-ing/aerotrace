@@ -13,25 +13,33 @@
 
 ## 1. 현재 Production 기준선
 
-2026-08-21 현재 서버에 설치된 notification runtime은 local-file transport다.
+2026-08-21 16:18 KST 최종 재활성화 기준, 서버에 설치된 notification runtime은 Webhook transport다.
 
 ```text
-transport=local-file
-RestrictAddressFamilies=AF_UNIX
+transport=webhook
+EnvironmentFile=/etc/aerotrace/notification.env
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 aerotrace-notification-outbox.timer=active (waiting)
 pending_events=0
 active_failure=false
-/etc/aerotrace/notification.env 없음
+receiver /health=HTTP 200, status=ok
+UptimeRobot=GET /health, 5분, operator email
 ```
 
-다음 repository 버전의 unit은 Webhook 전환 준비용이며 현재 `/etc/systemd/system`에 설치하지 않는다.
+다음 repository unit이 production에 설치돼 있다.
 
 ```text
 deploy/systemd/aerotrace-notification-outbox.service
 deploy/systemd/aerotrace-notification-outbox-retry-permanent.service
 ```
 
-외부 채널은 Slack, receiver 구현은 Cloudflare Worker + D1 + Queue, fallback은 UptimeRobot email로 확정했다. 그러나 remote deploy, Slack synthetic, `/health` monitor와 rollback rehearsal이 끝나지 않았으므로 installed local-file service를 repository Webhook service로 교체하지 않는다.
+외부 채널은 private Slack channel, receiver는 Cloudflare Worker + D1 + Queue, fallback은 UptimeRobot email이다. 기존 local-file unit은 다음 경로에 rollback 사본으로 보존한다.
+
+```text
+/etc/systemd/system/aerotrace-notification-outbox.service.local-file.bak
+```
+
+Activation에서 isolated synthetic과 controlled production outbox smoke가 Slack에 각각 한 번 전달됐고, local-file 복원 후 Webhook으로 되돌리는 rollback round trip도 완료했다. 실제 secret 값, Worker URL과 event ID는 이 문서에 기록하지 않는다.
 
 ## 2. 운영 불변 조건
 
@@ -110,19 +118,22 @@ systemctl cat aerotrace-notification-outbox.service
 systemctl show aerotrace-notification-outbox.service -p FragmentPath -p Result -p ExecMainStatus -p ExecStart
 ```
 
-현재 local-file 기준선에서는 installed service의 `ExecStart`에 다음 값이 있어야 한다.
+현재 Webhook 기준선에서는 installed service의 `ExecStart`에 다음 값이 있어야 한다.
 
 ```text
---transport local-file
+--transport webhook
+--failure-state-file /var/lib/aerotrace-monitoring/notification-failure.json
+--retryable-backoff-initial-sec 5
+--retryable-backoff-max-sec 300
 ```
 
 Network sandbox는 다음 값이어야 한다.
 
 ```text
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ```
 
-Repository Webhook unit의 내용만 보고 production이 Webhook으로 동작한다고 판단하지 않는다.
+Installed unit이 repository Webhook unit과 일치하는지도 확인한다. Repository 파일만 보고 production 상태를 판단하지 않는다.
 
 ### Pending outbox 확인
 
@@ -187,7 +198,7 @@ python3 scripts/check-notification-failure-state.py \
 
 ### Cloudflare receiver health
 
-Remote receiver가 준비된 뒤 secret이나 event ID를 출력하지 않고 확인한다.
+Secret이나 event ID를 출력하지 않고 remote receiver를 확인한다.
 
 ```bash
 curl --fail-with-body --silent --show-error \
@@ -196,18 +207,19 @@ curl --fail-with-body --silent --show-error \
 
 정상은 HTTP 200과 모든 count 0이다. `failed_permanent`, `failed_exhausted`, `stale_in_flight` 중 하나라도 양수거나 D1 query가 실패하면 HTTP 503이다.
 
-Production 전환 전에 UptimeRobot Free에서 다음 monitor를 만든다.
+Production fallback은 UptimeRobot Free의 다음 monitor다. Worker `/health`는 GET endpoint이므로 method를 명시적으로 GET으로 둔다.
 
 ```text
 type=HTTP(s)
 name=AeroTrace Slack Receiver Health
 URL=https://<worker-host>/health
+method=GET
 interval=5 minutes
 alert contact=verified operator email
 Slack contact=사용하지 않음
 ```
 
-Monitor 생성 직후 정상 UP email/contact 상태를 확인하고, controlled `/health` 503 rehearsal에서 DOWN email을 받은 뒤 복구 UP도 확인한다.
+2026-08-21 설정 중 URL에서 `/health`를 빠뜨려 root 404가 실제 DOWN으로 감지됐고, 올바른 `/health`로 수정한 뒤 recovery UP email을 받았다. Built-in Test Notification의 DOWN/UP email도 수신했다. 이는 email contact와 non-2xx 감지를 확인한 결과이며, D1에 실패 상태를 주입한 실제 `/health` 503 rehearsal은 아니다.
 
 ### 최근 실행 결과와 journal
 
@@ -457,23 +469,30 @@ Corrupt failure-state를 무조건 삭제하면 기존 permanent latch 또는 re
 
 Malformed pending event를 무조건 삭제하면 아직 전달되지 않은 notification을 유실할 수 있다. 현재 dead-letter/quarantine 자동화가 없으므로 별도 사고 기록과 운영 판단이 필요하다.
 
-## 10. Webhook 전환 전 점검표
+## 10. Webhook 활성화 결과와 후속 Drill
 
-현재 local-file 기준선에서 Slack Webhook으로 전환하려면 다음 조건이 모두 필요하다.
+2026-08-21 activation에서 완료한 live acceptance:
 
-- Slack private channel과 Incoming Webhook app owner가 정해졌다.
-- Cloudflare Worker, D1 migration, Queue와 DLQ가 remote에 준비됐다.
-- Receiver HTTPS endpoint의 isolated synthetic test가 통과했다.
-- HMAC secret이 sender와 receiver에 동일하게 안전하게 저장됐다.
-- 동일 `event_id` duplicate에서 Slack side effect가 1회임을 확인했다.
-- Timeout 후 ambiguous delivery 대응 절차가 있다.
-- Notification SLO와 outbox/failure threshold가 검토됐다.
-- UptimeRobot `/health` email monitor의 DOWN/UP 검증이 통과했다.
-- Backoff `initial=5`, `maximum=300`이 endpoint rate limit과 SLA에 적합하다.
-- `/etc/aerotrace/notification.env`의 소유권과 권한 정책이 정해졌다.
-- 전환 직전 `pending_events=0`, `active_failure=false`를 확인했다.
-- Installed local-file unit의 rollback 사본을 만들었다.
-- 성공 ALERT/RECOVERY와 retryable/permanent failure를 change window에서 검증할 계획이 있다.
+- Slack private channel과 Incoming Webhook app owner를 정했다.
+- Cloudflare Worker, D1 migration, Queue와 DLQ를 remote에 준비했다.
+- Receiver HTTPS endpoint의 isolated synthetic이 202를 반환하고 Slack에 한 번 표시됐다.
+- HMAC secret을 sender와 receiver에 동일하게 저장하고 값의 일치 여부를 secret 자체를 출력하지 않고 확인했다.
+- Notification SLO와 outbox/failure threshold를 검토했다.
+- UptimeRobot `GET /health` email monitor와 DOWN/UP contact를 확인했다.
+- Backoff `initial=5`, `maximum=300`을 repository unit과 installed unit에서 확인했다.
+- `/etc/aerotrace/notification.env`를 root:root mode 0600으로 설치했다.
+- 전환 직전과 완료 후 `pending_events=0`, `active_failure=false`를 확인했다.
+- Installed local-file unit의 rollback 사본을 만들고 local-file 복원과 Webhook 재설치 round trip을 완료했다.
+- Controlled production outbox event가 receipt 한 건, Slack 한 건, D1 `delivered`로 끝나는 것을 확인했다.
+
+다음 경계는 tracked automated tests로 검증했지만 live production failure를 주입하지 않았다.
+
+- Exact same `event_id` duplicate와 다른 payload conflict
+- Sender timeout/retryable/permanent 분류와 permanent explicit retry
+- Slack 429/5xx/permanent failure, Queue retry와 DLQ exhaustion
+- Receiver final failure에 따른 `/health` 503
+
+실제 HMAC rotation, receiver final-failure requeue, ALERT→RECOVERY pair는 승인된 maintenance window나 실제 incident에서 수행한다. 정상 production에 실패 row나 credential mismatch를 인위적으로 만들기 위해 activation gate를 다시 열지 않는다.
 
 Adapter는 `X-AeroTrace-Timestamp`와 `X-AeroTrace-Signature: v1=...` HMAC header를 보낸다. Bearer token과 임의 사용자 header는 지원하지 않는다. URL userinfo도 validation에서 거부한다.
 
@@ -531,13 +550,13 @@ npm run db:migrate:local
 
 Local fake receiver가 loopback TCP port를 사용하므로 sandboxed 실행 환경에서는 socket permission이 필요할 수 있다.
 
-## 11. Webhook 전환 명령 — 현재 실행 금지
+## 11. Webhook 설치 또는 재설치 — operator action only
 
-이 절의 명령은 `/etc` 파일과 production systemd runtime을 변경한다. 실제 endpoint와 승인된 변경 시간이 준비된 뒤 운영자가 직접 실행한다.
+이 절은 2026-08-21 완료한 activation 절차의 재사용 가능한 기록이다. 명령은 `/etc` 파일과 production systemd runtime을 변경하므로 운영자가 승인된 변경 시간에 직접 실행한다. 현재 정상 runtime에 반복 실행할 필요는 없다.
 
-### 11.1 현재 installed unit 백업
+### 11.1 초기 전환 시 installed local-file unit 백업
 
-이유: Repository Webhook service가 같은 unit 이름의 installed local-file 기준선을 교체하므로 즉시 복구 가능한 원본이 필요하다.
+이유: Repository Webhook service가 같은 unit 이름의 installed local-file 기준선을 교체하므로 즉시 복구 가능한 원본이 필요하다. 현재 backup은 이미 존재한다. 이 단계는 installed unit에서 `--transport local-file`을 먼저 확인한 초기 전환에만 수행한다.
 
 ```bash
 sudo systemctl stop aerotrace-notification-outbox.timer
@@ -621,21 +640,21 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 Environment file의 URL과 HMAC secret 값 자체는 출력하지 않는다.
 
-그다음 승인된 ALERT/RECOVERY test event로 다음을 검증한다.
+그다음 승인된 controlled event로 다음을 검증한다. Activation에서는 명시적 smoke label의 WARNING event 한 건으로 확인했으며 ALERT→RECOVERY pair는 아직 live drill하지 않았다.
 
 ```text
 receiver request event_id와 outbox event_id 일치
 HTTP 2xx 후 receipt 생성
 pending 감소
 failure-state 없음
-ALERT 이후 RECOVERY 전달
+계획된 pair drill이면 ALERT 이후 RECOVERY 전달
 ```
 
 ## 12. Webhook 전환 Rollback — 사전 백업 필요
 
 Webhook 전환에 실패하면 새 HTTP 요청을 중단하고 기존 local-file 기준선으로 복원한다.
 
-다음 명령은 production runtime을 변경하므로 운영자가 직접 실행한다.
+2026-08-21 이 절의 local-file 복원, idle service 성공, repository Webhook unit 재설치, idle service 성공과 timer 재시작까지 rehearsal했다. 아래 명령은 앞으로도 production runtime을 변경하므로 운영자가 직접 실행한다.
 
 ```bash
 sudo systemctl stop aerotrace-notification-outbox.timer
@@ -800,10 +819,12 @@ Webhook ALERT가 있었다면 필요한 RECOVERY 전달 확인
 - Receiver Queue에는 DLQ가 있지만 final failure의 public admin retry endpoint는 없다.
 - Retryable deferred 실행도 journal output을 남긴다.
 - Backoff 계산은 server wall clock에 의존한다.
-- Threshold와 초기 SLO는 정했지만 production SLI는 아직 `NO_DATA`다.
-- Slack과 Cloudflare는 선택했지만 remote resource와 credential은 아직 생성하지 않았다.
+- Threshold와 초기 SLO는 활성화했지만 eligible non-synthetic production event가 없어 compliance는 아직 `NO_DATA`다.
+- Cloudflare Free quota는 Workers 100,000 requests/day, D1 5,000,000 rows read/day·100,000 rows written/day·account total 5 GB, Queues 10,000 standard operations/day included를 현재 운영 가정으로 둔다. Queue 한 건의 정상 전달도 보통 write/read/delete 3 operations이며 retry마다 read operation이 추가된다. Provider 변경 시 재확인한다.
+- Free Queue message retention은 24시간으로 고정된다. DLQ message 자체는 이후 사라질 수 있으므로 D1 `failed_exhausted` row가 장기 장애 증거다.
 - HMAC active secret 하나만 지원하며 dual-secret 무중단 rotation은 없다.
 - Slack 성공 후 D1 update 전 crash는 user-visible duplicate를 만들 수 있다.
 - Receiver 성공 row의 원문은 redaction하지만 D1 row 자동 retention/deletion은 없다.
 - Tracked tests는 local fake와 state machine을 검증하지만 실제 Cloudflare/Slack acceptance를 대신하지 않는다.
+- Live activation은 exact duplicate replay, Slack 429/permanent/DLQ, receiver `/health` 503, HMAC rotation과 receiver requeue를 인위적으로 주입하지 않았다.
 - 단일 운영자 구조로 24x7 response와 secondary on-call을 보장하지 않는다.

@@ -21,7 +21,8 @@
     {
       "binding": "DB",
       "database_name": "aerotrace-notification-receiver",
-      "migrations_dir": "migrations"
+      "migrations_dir": "migrations",
+      "database_id": "fafe1203-81a7-4b07-8b3a-6b0e61944c4b"
     }
   ],
   "queues": {

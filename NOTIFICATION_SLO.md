@@ -1,14 +1,14 @@
 # AeroTrace Notification SLO
 
 > 마지막 업데이트: 2026-08-21
-> 상태: 초기 운영 목표 확정, production 활성 전 provisional
+> 상태: 2026-08-21 production 활성, 첫 30일 calibration 진행
 > 범위: notification event 생성부터 receiver durable acceptance와 Slack delivery까지
 
 ---
 
 ## 1. 상태와 적용 시점
 
-Notification channel은 Slack, receiver는 Cloudflare Worker + D1 + Queue로 선택했다. 이 문서의 수치는 초기 운영 기준이며 다음 조건을 모두 만족한 production activation 시각부터 SLO 계산을 시작한다.
+Notification channel은 Slack, receiver는 Cloudflare Worker + D1 + Queue다. 이 문서의 수치는 초기 운영 기준이며 2026-08-21 16:18 KST의 최종 Webhook 재활성화 시각부터 적용한다.
 
 ```text
 Cloudflare remote receiver acceptance PASS
@@ -18,7 +18,7 @@ production sender가 Webhook으로 전환됨
 activation timestamp 기록
 ```
 
-현재 installed production transport는 여전히 `local-file`이므로 SLO compliance와 error budget은 아직 `NO_DATA`다. Local-file receipt를 외부 notification 성공으로 계산하지 않는다.
+현재 installed production transport는 `webhook`이다. 다만 activation synthetic과 controlled smoke는 production SLI에서 분리하며, eligible non-synthetic production event가 아직 없으면 compliance와 error budget을 `NO_DATA`로 기록한다. 과거 local-file receipt도 외부 notification 성공으로 계산하지 않는다.
 
 ## 2. 사용자 결과와 두 delivery 경계
 
@@ -42,9 +42,9 @@ Sender receipt의 `delivered_at`은 receiver HTTP 2xx 확인 시각이다. Slack
 
 | Objective | Target | Window | 상태 |
 |---|---:|---|---|
-| Receiver durable acceptance latency | unique event의 99%가 60초 이내 | rolling 30 days | provisional |
-| Slack delivery latency | durable accepted event의 99%가 추가 300초 이내 `delivered` | rolling 30 days | provisional |
-| ALERT/STATUS_CHANGE/RECOVERY/REMINDER | 같은 목표 적용 | rolling 30 days | provisional |
+| Receiver durable acceptance latency | unique event의 99%가 60초 이내 | rolling 30 days | active, calibrating |
+| Slack delivery latency | durable accepted event의 99%가 추가 300초 이내 `delivered` | rolling 30 days | active, calibrating |
+| ALERT/STATUS_CHANGE/RECOVERY/REMINDER | 같은 목표 적용 | rolling 30 days | active, calibrating |
 | Receiver duplicate/conflict correctness | 같은 ID의 다른 payload를 0건 덮어씀 | continuous | invariant |
 | 승인 없는 event loss | 0건 | continuous | invariant |
 | Duplicate Slack side effect | 목표 0건 | continuous | best-effort invariant |
@@ -336,28 +336,44 @@ Production activation 후:
 - Error budget 소진
 - 다중 notification channel 또는 팀 on-call 도입
 
-## 11. Activation gate
+## 11. Activation gate 결과
+
+2026-08-21 완료한 activation gate:
 
 ```text
-Repository sender/receiver tests PASS
-Wrangler dry-run and local D1 migration PASS
-Cloudflare remote deploy/migration PASS
-Slack private channel synthetic PASS
-same event_id duplicate side effect 1회 확인
-UptimeRobot `/health` email monitor PASS
-HMAC secret storage/rotation rehearsal PASS
-sender threshold command PASS
-receiver failed state query/requeue rehearsal PASS
-local-file rollback rehearsal PASS
-activation timestamp and operator 기록
+Repository sender/receiver tests=PASS
+Wrangler dry-run and local D1 migration=PASS
+Cloudflare remote deploy/migration=PASS
+Slack private channel isolated synthetic 202 + one message=PASS
+UptimeRobot GET /health monitor + email DOWN/UP path=PASS
+HMAC secret root-owned storage + sender/receiver exact match=PASS
+sender threshold command=PASS
+controlled production outbox -> receipt -> D1 delivered -> Slack one message=PASS
+local-file rollback + Webhook restoration rehearsal=PASS
+final activation timestamp=2026-08-21 16:18 KST
 ```
 
-이 gate 전까지 installed production runtime은 다음 기준선을 유지한다.
+UptimeRobot DOWN/UP는 잘못된 root path의 404와 수정 후 `/health` 200, 그리고 built-in Test Notification으로 확인했다. D1 failure를 주입한 `/health` 503 live drill은 아니며 이 경계는 automated receiver test가 검증한다.
+
+다음 항목은 문서와 automated test가 절차·상태 전이를 검증했지만 live production drill은 하지 않았다.
 
 ```text
-transport=local-file
-RestrictAddressFamilies=AF_UNIX
+exact duplicate signed replay and payload conflict
+Slack 429/permanent response and DLQ exhaustion
+real HMAC secret rotation
+receiver failed-state compare-and-set requeue
+ALERT -> RECOVERY pair
+```
+
+실제 secret rotation과 receiver requeue는 healthy production에 고의 mismatch나 failure row를 만들지 않고, 승인된 maintenance window 또는 실제 incident에서 수행한다.
+
+현재 production 기준선:
+
+```text
+transport=webhook
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 pending_events=0
 active_failure=false
-/etc/aerotrace/notification.env 없음
+/etc/aerotrace/notification.env=root:root 0600
+fallback=UptimeRobot GET /health operator email
 ```
