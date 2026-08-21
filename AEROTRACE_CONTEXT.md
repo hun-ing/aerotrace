@@ -85,7 +85,7 @@ tests/test_notification_outbox.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-이 suite는 backoff 계산과 configuration, local-file smoke, request contract, retryable defer/복구, `ACK_EXISTING` 우선순위, permanent latch와 explicit retry를 local fake HTTP receiver로 검증한다. CI job 연결은 후속 작업이다.
+이 suite는 backoff 계산과 configuration, local-file smoke, request contract, retryable defer/복구, `ACK_EXISTING` 우선순위, permanent latch와 explicit retry를 local fake HTTP receiver로 검증한다. `.github/workflows/notification-outbox-tests.yml`이 pull request와 관련 `main` push에서 같은 명령을 Python 3.10으로 실행하며, 최초 PR run은 8개 테스트를 모두 통과했다.
 
 현재 서버에 설치된 production runtime은 계속 local-file 안전 기준선이다.
 

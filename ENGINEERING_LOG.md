@@ -13931,7 +13931,7 @@ active_failure=false
 
 - Permanent pending event의 dead-letter/quarantine 정책은 아직 없다.
 - Latched timer 실행의 journal 반복량은 별도로 측정하지 않았다.
-- 후속 작업에서 Python adapter tracked `unittest` suite를 추가했으며 CI job은 아직 없다.
+- 후속 작업에서 Python adapter tracked `unittest` suite를 추가했고, 이후 커밋 `00b421d`에서 CI job 연결까지 완료했다.
 - HTTP timeout의 ambiguous success로 인한 중복 POST 가능성은 해결 범위 밖이다.
 - Production systemd Webhook unit에서 실제 HTTP 400 요청 수가 1회로 고정되는 검증은 아직 수행하지 않았다.
 
@@ -14293,7 +14293,7 @@ production local-file safety            PASS
 - Head event backoff 중 뒤 event를 처리하지 않는다.
 - Wall clock의 큰 변경은 계산된 retry 시각에 영향을 줄 수 있다.
 - 실제 외부 endpoint의 rate limit과 notification SLA는 아직 정해지지 않았다.
-- Python adapter black-box 검증을 tracked `unittest` suite로 전환했으며 CI job 연결은 아직 없다.
+- Python adapter black-box 검증을 tracked `unittest` suite로 전환했고, 이후 커밋 `00b421d`에서 CI job 연결까지 완료했다.
 - Repository Webhook unit과 permanent retry unit은 실제 endpoint 준비 전까지 production에 설치하지 않는다.
 
 ---
@@ -14781,9 +14781,64 @@ Repository Webhook unit과 permanent retry unit도 production에 설치하지 �
 
 ### 남은 작업
 
-- Test suite를 CI job에 연결한다.
 - 실제 receiver/provider와 authentication 방식을 선택한다.
 - Receiver durable deduplication acceptance test를 수행한다.
 - Notification SLO의 `TBD` 값과 incident owner를 확정한다.
 - Checker threshold를 실행할 독립 monitoring 경로를 구현한다.
 - 실제 endpoint의 `Retry-After` 또는 rate limit이 현재 backoff와 맞는지 검증한다.
+
+---
+
+## V-7B-4-9 Notification Outbox 회귀 테스트 CI 연결
+
+### 기준점
+
+```text
+branch=feature/notification-contract-slo-tests
+test suite=tests/test_notification_outbox.py
+local result=8/8 PASS
+production transport=local-file
+```
+
+### 구현
+
+`.github/workflows/notification-outbox-tests.yml`을 추가했다.
+
+```text
+trigger=pull_request, related main push, workflow_dispatch
+runner=ubuntu-latest
+python=3.10
+permissions=contents:read
+timeout=5 minutes
+command=PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+자동 실행 경로는 sender 구현, 회귀 suite, workflow 자체 변경으로 제한했다. Checkout credential은 job 종료 전뿐 아니라 테스트 실행 중에도 불필요하므로 `persist-credentials: false`를 사용했다.
+
+### 검증
+
+로컬에서 YAML 파싱과 `git diff --check`를 통과했고, loopback socket을 허용한 환경에서 회귀 suite 8개 전체 통과를 다시 확인했다.
+
+Draft PR #1 생성 후 GitHub Actions run `32441836314`를 확인했다.
+
+```text
+workflow=Notification Outbox Tests
+job=notification-outbox
+run_number=1
+status=completed
+conclusion=success
+regression test step=success
+```
+
+PR은 `main` 기준 충돌 없이 merge 가능한 상태로 확인했다.
+
+### Production 안전 상태
+
+이 단계는 repository workflow와 문서만 변경했다. `/etc/systemd/system`, `/etc/aerotrace`, production outbox·receipt·failure-state에는 쓰기를 수행하지 않았다. 실제 runtime은 계속 local-file 기준선이다.
+
+### 남은 작업
+
+- 실제 receiver/provider와 authentication 방식을 선택한다.
+- Receiver의 durable `event_id` deduplication을 acceptance test로 검증한다.
+- Notification SLO 수치와 incident ownership을 확정한다.
+- 격리된 Webhook E2E와 rollback rehearsal 후 production 전환 승인을 받는다.

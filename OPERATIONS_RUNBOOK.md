@@ -639,4 +639,4 @@ Webhook ALERT가 있었다면 필요한 RECOVERY 전달 확인
 - 현재 production outbox/failure WARNING·CRITICAL threshold와 notification SLA가 확정되지 않았다.
 - 실제 외부 Webhook provider와 credential은 아직 선택되지 않았다.
 - 사용자 정의 Webhook authentication header를 지원하지 않는다.
-- Tracked `unittest` suite는 local 실행되지만 CI job에 아직 연결되지 않았다.
+- Tracked `unittest` suite는 local과 GitHub Actions에서 실행되지만 실제 external receiver의 durable acceptance와 deduplication까지 검증하지는 않는다.

@@ -7436,7 +7436,7 @@ Production Webhook unit은 `--failure-state-file`을 사용하므로 latch 적�
 - Latched 상태에서도 timer journal은 주기적으로 기록될 수 있다.
 - HTTP timeout처럼 상대 서버 처리 여부를 알 수 없는 retryable failure의 중복 POST 가능성은 그대로다.
 - Exactly-once delivery를 보장하지 않는다.
-- Python adapter의 tracked `unittest` 회귀 suite를 추가했으며 CI job 연결은 후속 기술 부채다.
+- Python adapter의 tracked `unittest` 회귀 suite를 추가했다. 후속 커밋 `00b421d`에서 같은 명령을 실행하는 GitHub Actions job 연결을 완료했다.
 
 ### 재검토 조건
 
@@ -7642,7 +7642,7 @@ Local fake HTTP receiver와 독립 fixture로 다음을 확인했다.
 - Timer invocation 자체는 계속 발생하므로 deferred journal 출력은 남는다.
 - Outbox head event가 backoff 또는 permanent latch 상태이면 뒤 event도 처리되지 않는다.
 - HTTP timeout의 ambiguous delivery와 receiver-side 중복 가능성은 해결하지 않는다.
-- Tracked `unittest` suite가 핵심 backoff·latch·복구 semantics를 검증하며 CI job 연결은 아직 없다.
+- Tracked `unittest` suite가 핵심 backoff·latch·복구 semantics를 검증하며, 후속 커밋 `00b421d`에서 pull request와 관련 `main` push에 대한 CI 실행을 추가했다.
 - 실제 외부 Webhook endpoint의 rate limit과 notification SLA를 확인하면 initial과 maximum 값을 재조정해야 한다.
 - 다중 channel 또는 높은 event volume이 필요해지면 event별 next-attempt timestamp, retry budget, dead-letter queue를 재검토한다.
 
@@ -7932,3 +7932,61 @@ TimescaleDB 컨테이너만 Named Volume을 유지한 채 재생성했다.
 - checkpoint와 Collector timeout이 다시 함께 발생할 때
 - queue overflow가 다시 발생할 때
 - backup / replication / recovery 요구가 변경될 때
+
+---
+
+## ADR — Notification Outbox 회귀 suite를 변경 경로 제한 CI로 실행
+
+### 상태
+
+채택
+
+### 배경
+
+Webhook sender의 backoff, failure latch, receipt 우선순위와 복구 semantics는 파일 상태와 실제 HTTP 요청 수를 함께 확인해야 한다. 수동 black-box 검증만으로는 이후 변경에서 같은 경계를 반복 확인하기 어렵기 때문에 tracked `unittest` suite를 추가했지만, local 실행만으로는 pull request 회귀를 자동 발견할 수 없었다.
+
+### 결정
+
+`.github/workflows/notification-outbox-tests.yml`에서 다음 변경에 대해 표준 suite를 Python 3.10으로 실행한다.
+
+```text
+pull_request:
+  workflow 자체
+  scripts/process-notification-outbox.py
+  tests/test_notification_outbox.py
+
+push:
+  main의 동일 경로 변경
+
+manual:
+  workflow_dispatch
+```
+
+Workflow 권한은 `contents: read`만 허용하고 checkout credential은 유지하지 않는다. 외부 package 설치 없이 Python standard library 기반 테스트만 실행한다.
+
+### 선택 이유
+
+- Production interpreter와 같은 Python 3.10 계열에서 실행한다.
+- Sender semantics에 영향을 주는 변경은 pull request에서 자동 검증한다.
+- 관련 없는 문서나 인프라 변경마다 loopback HTTP suite를 실행하지 않는다.
+- Dependency download와 cache가 없어 공급망 및 재현성 범위가 작다.
+- 5분 timeout과 concurrency cancellation으로 멈춘 run과 오래된 branch run을 제한한다.
+
+### 검증
+
+Draft PR #1의 최초 GitHub Actions run `32441836314`에서 `notification-outbox` job과 회귀 테스트 단계가 모두 성공했다.
+
+### Trade-off
+
+- Path filter 밖의 변경이 Python sender에 간접 영향을 주면 자동 실행되지 않을 수 있다.
+- Fake local receiver는 실제 provider의 TLS, rate limit, authentication, durable deduplication을 검증하지 않는다.
+- Workflow 성공은 production Webhook 활성화 승인을 의미하지 않는다.
+- Branch protection required check 지정 여부는 repository 정책으로 별도 관리해야 한다.
+
+### 재검토 조건
+
+- Sender가 다른 module이나 dependency를 import하도록 구조가 바뀔 때
+- 지원 Python version을 변경할 때
+- 실제 receiver용 integration environment를 도입할 때
+- Test runtime이 5분에 접근하거나 flaky socket failure가 발생할 때
+- Branch protection 또는 merge queue 정책을 도입할 때
