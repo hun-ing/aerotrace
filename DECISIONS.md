@@ -7436,7 +7436,7 @@ Production Webhook unit은 `--failure-state-file`을 사용하므로 latch 적�
 - Latched 상태에서도 timer journal은 주기적으로 기록될 수 있다.
 - HTTP timeout처럼 상대 서버 처리 여부를 알 수 없는 retryable failure의 중복 POST 가능성은 그대로다.
 - Exactly-once delivery를 보장하지 않는다.
-- Python adapter의 회귀 테스트는 현재 수동 black-box fixture 방식이며 CI 자동화는 후속 기술 부채다.
+- Python adapter의 tracked `unittest` 회귀 suite를 추가했으며 CI job 연결은 후속 기술 부채다.
 
 ### 재검토 조건
 
@@ -7642,7 +7642,7 @@ Local fake HTTP receiver와 독립 fixture로 다음을 확인했다.
 - Timer invocation 자체는 계속 발생하므로 deferred journal 출력은 남는다.
 - Outbox head event가 backoff 또는 permanent latch 상태이면 뒤 event도 처리되지 않는다.
 - HTTP timeout의 ambiguous delivery와 receiver-side 중복 가능성은 해결하지 않는다.
-- Tracked 자동 테스트 suite는 아직 없고 현재 검증은 수동 black-box fixture 중심이다.
+- Tracked `unittest` suite가 핵심 backoff·latch·복구 semantics를 검증하며 CI job 연결은 아직 없다.
 - 실제 외부 Webhook endpoint의 rate limit과 notification SLA를 확인하면 initial과 maximum 값을 재조정해야 한다.
 - 다중 channel 또는 높은 event volume이 필요해지면 event별 next-attempt timestamp, retry budget, dead-letter queue를 재검토한다.
 

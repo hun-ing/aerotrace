@@ -1,7 +1,7 @@
 # AeroTrace 프로젝트 컨텍스트
 
 > 마지막 업데이트: 2026-08-21
-> 현재 상태: Phase 9 production notification pipeline의 local-file 기준선 운영 및 Webhook 실패 정책 hardening 완료
+> 현재 상태: Phase 9 production notification pipeline의 Webhook 실패 정책, receiver contract, SLO 초안과 tracked 회귀 테스트 구축
 > 현재 Phase: Phase 9 — 로컬 통합 실행 및 배포 준비
 > 다음 작업: 실제 Webhook endpoint, receiver-side deduplication, notification SLA와 경보 threshold를 확정한 뒤 승인된 change window의 전환 계획을 수립한다.
 
@@ -9,18 +9,18 @@
 
 ## 현재 작업 컨텍스트 — 2026-08-21
 
-현재 작업 기준 커밋:
+Webhook retryable backoff와 운영 runbook 기준 커밋:
 
 ```text
-720b838 Webhook 영구 실패 무한 재전송 방지
+c558902 Webhook 재시도 백오프와 운영 절차 추가
 ```
 
-커밋 전 변경 범위:
+후속 문서와 자동 검증 범위:
 
 ```text
-scripts/process-notification-outbox.py
-deploy/systemd/aerotrace-notification-outbox.service
-deploy/systemd/aerotrace-notification-outbox-retry-permanent.service
+WEBHOOK_RECEIVER_CONTRACT.md
+NOTIFICATION_SLO.md
+tests/test_notification_outbox.py
 ```
 
 다음 untracked 파일은 별도 성능 분석 작업이므로 이번 변경에서 수정하거나 커밋하지 않는다.
@@ -68,6 +68,24 @@ Backoff 설정 기본값:
 두 값은 finite number여야 하고 initial은 0보다 커야 하며 max는 initial 이상이어야 한다. 잘못된 설정은 HTTP 요청 전에 exit code 4로 종료한다.
 
 Repository에는 Webhook 자동 처리 unit과 permanent failure 수동 재시도용 oneshot unit이 있다. 수동 unit은 한 번에 최대 한 event만 처리한다.
+
+외부 receiver와의 HTTP payload, header, status, `event_id` deduplication, timeout과 authentication 경계는 `WEBHOOK_RECEIVER_CONTRACT.md`에 정의한다.
+
+Notification SLI 계산 기준, current retry timeline, 미확정 threshold와 incident ownership은 `NOTIFICATION_SLO.md`에 분리했다. 실제 endpoint와 운영 요구가 없으므로 수치 SLO는 아직 채택하지 않았다.
+
+Tracked 회귀 테스트:
+
+```text
+tests/test_notification_outbox.py
+```
+
+표준 실행:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+이 suite는 backoff 계산과 configuration, local-file smoke, request contract, retryable defer/복구, `ACK_EXISTING` 우선순위, permanent latch와 explicit retry를 local fake HTTP receiver로 검증한다. CI job 연결은 후속 작업이다.
 
 현재 서버에 설치된 production runtime은 계속 local-file 안전 기준선이다.
 

@@ -5093,7 +5093,7 @@ HTTP 400을 6초마다 다시 보내던 알림 시스템에 Persistent Latch를 
 
 - Permanent event quarantine/dead-letter lifecycle 설계
 - 운영자용 pending 조회와 안전한 재처리 도구
-- Python adapter black-box 테스트의 CI 자동화
+- Python adapter tracked `unittest` suite의 CI job 연결
 - Production systemd timer에서 permanent HTTP 요청 수 고정 검증
 
 ---

@@ -5,6 +5,11 @@
 
 ---
 
+관련 문서:
+
+- [Webhook Receiver Contract](WEBHOOK_RECEIVER_CONTRACT.md)
+- [Notification SLO Draft](NOTIFICATION_SLO.md)
+
 ## 1. 현재 Production 기준선
 
 2026-08-21 현재 서버에 설치된 notification runtime은 local-file transport다.
@@ -427,6 +432,27 @@ systemd-analyze verify \
   /home/huning/aerotrace/deploy/systemd/aerotrace-notification-outbox.timer
 ```
 
+### Repository 회귀 테스트
+
+이 명령은 temporary directory와 local fake HTTP receiver만 사용하며 production outbox와 systemd runtime을 변경하지 않는다.
+
+```bash
+cd /home/huning/aerotrace
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+검증 범위:
+
+- Bounded backoff 계산과 invalid configuration
+- Local-file delivery smoke
+- Webhook request payload/header contract
+- HTTP status retryable/permanent 분류
+- Retryable immediate defer, 두 번째 실패, HTTP 204 복구
+- `ACK_EXISTING`이 retryable backoff보다 먼저 실행됨
+- Permanent latch와 explicit retry
+
+Local fake receiver가 loopback TCP port를 사용하므로 sandboxed 실행 환경에서는 socket permission이 필요할 수 있다.
+
 ## 11. Webhook 전환 명령 — 현재 실행 금지
 
 이 절의 명령은 `/etc` 파일과 production systemd runtime을 변경한다. 실제 endpoint와 승인된 변경 시간이 준비된 뒤 운영자가 직접 실행한다.
@@ -613,4 +639,4 @@ Webhook ALERT가 있었다면 필요한 RECOVERY 전달 확인
 - 현재 production outbox/failure WARNING·CRITICAL threshold와 notification SLA가 확정되지 않았다.
 - 실제 외부 Webhook provider와 credential은 아직 선택되지 않았다.
 - 사용자 정의 Webhook authentication header를 지원하지 않는다.
-- Python adapter의 black-box 회귀 테스트는 tracked automated suite가 아니다.
+- Tracked `unittest` suite는 local 실행되지만 CI job에 아직 연결되지 않았다.

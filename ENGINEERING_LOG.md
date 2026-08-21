@@ -13931,7 +13931,7 @@ active_failure=false
 
 - Permanent pending event의 dead-letter/quarantine 정책은 아직 없다.
 - Latched timer 실행의 journal 반복량은 별도로 측정하지 않았다.
-- Python adapter에 tracked 자동 테스트 suite가 없다.
+- 후속 작업에서 Python adapter tracked `unittest` suite를 추가했으며 CI job은 아직 없다.
 - HTTP timeout의 ambiguous success로 인한 중복 POST 가능성은 해결 범위 밖이다.
 - Production systemd Webhook unit에서 실제 HTTP 400 요청 수가 1회로 고정되는 검증은 아직 수행하지 않았다.
 
@@ -14293,7 +14293,7 @@ production local-file safety            PASS
 - Head event backoff 중 뒤 event를 처리하지 않는다.
 - Wall clock의 큰 변경은 계산된 retry 시각에 영향을 줄 수 있다.
 - 실제 외부 endpoint의 rate limit과 notification SLA는 아직 정해지지 않았다.
-- Python adapter black-box 검증을 tracked automated test suite로 전환하지 않았다.
+- Python adapter black-box 검증을 tracked `unittest` suite로 전환했으며 CI job 연결은 아직 없다.
 - Repository Webhook unit과 permanent retry unit은 실제 endpoint 준비 전까지 production에 설치하지 않는다.
 
 ---
@@ -14631,3 +14631,159 @@ Docker Named Volume을 유지한 컨테이너 재생성에서 DB 데이터가 �
 - Benchmark 도구 자체의 판정 오류도 실제 데이터 유실처럼 보일 수 있으므로 측정 도구도 검증해야 한다.
 - PostgreSQL checkpoint, Backend latency, Collector retry/queue, 최종 DB row를 하나의 end-to-end 장애 경로로 함께 관찰해야 한다.
 - 설정을 여러 개 동시에 변경하지 않고 단일 변수 A/B를 수행해야 원인에 대한 신뢰도를 높일 수 있다.
+
+---
+
+## V-7B-4-8 Webhook Receiver Contract, Notification SLO 초안 및 Tracked 회귀 테스트
+
+### 기준점
+
+```text
+Webhook backoff/runbook commit=c558902
+installed transport=local-file
+production pending_events=0
+production active_failure=false
+```
+
+### 목표
+
+Webhook sender 구현과 수동 검증은 완료됐지만 실제 receiver가 지켜야 할 idempotency contract, notification SLI/SLO 결정 틀과 반복 실행 가능한 tracked 자동 테스트가 없었다.
+
+이번 단계의 목표:
+
+- Sender와 receiver 사이의 HTTP contract 고정
+- Timeout duplicate를 receiver가 처리해야 하는 이유 명시
+- Endpoint가 없는 상태에서 SLO 값을 추측하지 않고 측정 기준만 정의
+- 기존 수동 black-box 핵심 시나리오를 tracked `unittest`로 전환
+
+### 추가 및 변경 문서
+
+```text
+WEBHOOK_RECEIVER_CONTRACT.md
+NOTIFICATION_SLO.md
+OPERATIONS_RUNBOOK.md
+AEROTRACE_CONTEXT.md
+DECISIONS.md
+CAREER_LOG.md
+ENGINEERING_LOG.md
+```
+
+### Receiver Contract
+
+`WEBHOOK_RECEIVER_CONTRACT.md`에 다음을 정의했다.
+
+```text
+POST + UTF-8 JSON
+Content-Type=application/json
+Accept=application/json
+User-Agent=AeroTrace-Notification/1
+X-AeroTrace-Event-Id=body.event_id
+schema_version=1
+```
+
+Receiver의 성공 2xx는 sender가 더 이상 retry하지 않아도 되는 durable acceptance를 의미해야 한다.
+
+동일 `event_id` duplicate는 사용자-visible side effect를 다시 만들지 않고 2xx를 반환한다. 같은 ID에 다른 payload가 오면 conflict로 기록하고 permanent 4xx로 거부한다.
+
+Timeout은 receiver가 처리했지만 sender가 response를 받지 못한 ambiguous delivery일 수 있으므로 receiver-side durable deduplication이 production activation의 필수 조건이다.
+
+현재 adapter에는 사용자 정의 `Authorization` 또는 signature header가 없고 `Retry-After`를 해석하지 않는다는 제약도 명시했다.
+
+### Notification SLO Draft
+
+`NOTIFICATION_SLO.md`에 다음 SLI를 정의했다.
+
+```text
+end-to-end durable delivery latency
+delivery-within-objective ratio
+oldest pending age
+active transport failure duration
+retry progress
+receiver duplicate side effects
+pipeline liveness
+```
+
+현재 실제 external endpoint, provider rate limit, user notification latency requirement와 incident owner가 없다.
+
+따라서 다음 수치는 모두 `TBD/미채택`으로 유지했다.
+
+```text
+ALERT/RECOVERY delivery objective
+monthly success ratio
+outbox/failure WARNING·CRITICAL threshold
+permanent failure response/restore time
+retry budget
+incident ownership
+```
+
+Current timer, Webhook timeout, `5 → 10 → 20 → 40 → 80 → 160 → 300` backoff에서 가능한 earliest retry timeline을 SLO가 아닌 현재 algorithm 특성으로 분리했다.
+
+### Tracked Test Suite
+
+추가 파일:
+
+```text
+tests/test_notification_outbox.py
+```
+
+External dependency 없이 Python standard library `unittest`, temporary directory, local `ThreadingHTTPServer`를 사용한다.
+
+표준 실행:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+검증 항목:
+
+```text
+bounded backoff sequence와 maximum
+invalid 0, NaN, maximum < initial
+HTTP status retryable/permanent 분류
+local-file delivery smoke
+Webhook payload/header contract
+HTTP 503 immediate defer와 state 무변경
+backoff 만료 후 두 번째 failure_count 증가
+HTTP 204 자동 복구와 finalization
+ACK_EXISTING precedes retryable backoff
+permanent latch no-resend
+explicit permanent retry와 복구
+retry-permanent configuration validation
+```
+
+최종 결과:
+
+```text
+tests=8
+passed=8
+failed=0
+errors=0
+result=PASS
+```
+
+Sandbox 내부 최초 실행에서는 loopback socket 생성이 `PermissionError`로 차단됐고 network를 사용하지 않는 테스트는 통과했다. 동일 suite를 loopback이 허용된 host 실행 환경에서 다시 실행해 8개 전체 통과를 확인했다.
+
+### Production 안전 상태
+
+Test suite는 `TemporaryDirectory`와 local fake receiver만 사용했다.
+
+다음 production 경로를 사용하거나 변경하지 않았다.
+
+```text
+/var/lib/aerotrace-monitoring/notification-outbox
+/var/lib/aerotrace-monitoring/notification-receipts
+/var/lib/aerotrace-monitoring/notification-failure.json
+/etc/aerotrace/notification.env
+/etc/systemd/system
+```
+
+Repository Webhook unit과 permanent retry unit도 production에 설치하지 않았다.
+
+### 남은 작업
+
+- Test suite를 CI job에 연결한다.
+- 실제 receiver/provider와 authentication 방식을 선택한다.
+- Receiver durable deduplication acceptance test를 수행한다.
+- Notification SLO의 `TBD` 값과 incident owner를 확정한다.
+- Checker threshold를 실행할 독립 monitoring 경로를 구현한다.
+- 실제 endpoint의 `Retry-After` 또는 rate limit이 현재 backoff와 맞는지 검증한다.
