@@ -13714,3 +13714,223 @@ backoff
 을 별도로 설계해야 한다.
 
 Timeout 같은 ambiguous delivery에서는 외부 receiver가 이미 처리했어도 sender가 재전송할 수 있으므로 exactly-once는 보장하지 않는다.
+
+---
+
+## V-7B-4-6 Permanent Webhook Failure 무한 재전송 방지 검증
+
+### 기준점
+
+```text
+commit=9df7cbd
+runtime transport=local-file
+production pending_events=0
+production active_failure=false
+```
+
+기존 분석용 untracked 스크립트 세 개는 변경하지 않았다.
+
+### 구현
+
+변경 파일:
+
+```text
+scripts/process-notification-outbox.py
+```
+
+추가한 동작:
+
+- `PermanentFailureLatchedError`
+- 현재 event와 일치하는 permanent state 조회
+- receipt 확인 뒤, 실제 HTTP 요청 전 latch 차단
+- `delivery_result=BLOCKED_PERMANENT_FAILURE`
+- `failure_latched=true`
+- `--retry-permanent-failure`
+- local-file 및 failure-state 미설정 조합의 configuration validation
+
+Failure-state schema version은 변경하지 않았다. 기존 `failure_kind=permanent`와 `failed_event_id`를 latch의 durable 근거로 사용한다.
+
+### 최초 permanent failure와 자동 실행 차단
+
+HTTP 400 fixture에서 같은 pending event로 adapter를 두 번 실행했다.
+
+첫 실행:
+
+```text
+first_rc=5
+requests_after_first=1
+failure_kind=permanent
+failure_reason=http_400
+failure_count=1
+pending_events=1
+receipts=0
+```
+
+두 번째 일반 실행:
+
+```text
+delivery_result=BLOCKED_PERMANENT_FAILURE
+failure_latched=true
+second_rc=5
+requests_after_second=1
+failure_count=1
+```
+
+두 번째 실행 전후 failure-state SHA-256도 동일했다.
+
+결과:
+
+```text
+permanent_latch_no_resend=PASS
+actual_webhook_requests=1
+assertion_rc=0
+```
+
+Adapter는 다시 실행됐지만 HTTP 요청과 state 재작성은 발생하지 않았다.
+
+### 명시적 재시도와 복구
+
+기존 latch에 `--retry-permanent-failure`를 사용하여 HTTP 400을 한 번 더 호출했다.
+
+```text
+explicit_retry_400_rc=5
+requests_after_explicit_retry=2
+failure_count=2
+```
+
+그다음 일반 실행에서는 다시 latch가 적용됐다.
+
+```text
+blocked_after_retry_rc=5
+requests_after_blocked_run=2
+```
+
+Webhook을 HTTP 204로 수정한 뒤 명시적으로 재시도했다.
+
+```text
+explicit_retry_204_rc=0
+requests_after_recovery=3
+delivery_result=DELIVERED
+failure_state_cleared=true
+pending_events=0
+receipts=1
+failure_state_exists=False
+```
+
+결과:
+
+```text
+explicit_retry_and_recovery=PASS
+assertion_rc=0
+```
+
+### ACK_EXISTING crash-window 회귀 검증
+
+다음 상태를 별도 fixture로 재현했다.
+
+```text
+valid webhook receipt 있음
+동일 pending event 있음
+동일 event permanent failure-state 있음
+Webhook endpoint는 connection refused 상태
+```
+
+결과:
+
+```text
+failure_state_cleared=true
+delivery_result=ACK_EXISTING
+adapter_rc=0
+actual_webhook_requests=0
+pending_events=0
+receipts=1
+failure_state_exists=False
+ack_existing_precedes_latch=PASS
+```
+
+따라서 latch가 기존 receipt 기반 crash-window 복구보다 먼저 실행되지 않음을 확인했다.
+
+### Retryable 회귀 검증
+
+Connection refused를 같은 event에 두 번 발생시켰다.
+
+```text
+attempt 1
+exit code=2
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=1
+
+attempt 2
+exit code=2
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=2
+```
+
+`first_failed_at`은 유지됐고 `last_failed_at`은 두 번째 실제 실패 시각으로 증가했다.
+
+HTTP 204 endpoint를 시작한 뒤 명시적 permanent 재시도 옵션 없이 실행했다.
+
+```text
+delivery_result=DELIVERED
+failure_state_cleared=true
+pending_events=0
+receipts=1
+```
+
+결과:
+
+```text
+retryable_automatic_retry=PASS
+retryable_automatic_recovery=PASS
+retryable_failure_count=1->2
+recovery_webhook_requests=1
+assertion_rc=0
+```
+
+Permanent 전용 latch가 retryable 자동 재시도와 복구를 막지 않음을 확인했다.
+
+### Configuration 및 local-file 회귀 검증
+
+```text
+local-file + --retry-permanent-failure
+→ exit code 4
+
+webhook + --retry-permanent-failure
++ failure-state-file 없음
+→ exit code 4
+
+기존 local-file idle 실행
+→ adapter_status=IDLE
+→ exit code 0
+```
+
+결과:
+
+```text
+permanent_retry_configuration=PASS
+local_file_regression=PASS
+```
+
+### Production 안전 상태
+
+검증 종료 시 installed runtime은 계속 local-file 기준선이었다.
+
+```text
+transport=local-file
+RestrictAddressFamilies=AF_UNIX
+notification timer=active (waiting)
+pending_events=0
+active_failure=false
+```
+
+따라서 임시 Webhook fixture와 permanent latch 테스트가 production notification state에 남지 않았다.
+
+### 남은 위험과 기술 부채
+
+- Permanent pending event의 dead-letter/quarantine 정책은 아직 없다.
+- Latched timer 실행의 journal 반복량은 별도로 측정하지 않았다.
+- Python adapter에 tracked 자동 테스트 suite가 없다.
+- HTTP timeout의 ambiguous success로 인한 중복 POST 가능성은 해결 범위 밖이다.
+- Production systemd Webhook unit에서 실제 HTTP 400 요청 수가 1회로 고정되는 검증은 아직 수행하지 않았다.

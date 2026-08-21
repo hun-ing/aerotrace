@@ -72,6 +72,20 @@ class FailureStateError(OSError):
     pass
 
 
+class PermanentFailureLatchedError(OSError):
+    def __init__(
+        self,
+        failure_state: dict[str, Any],
+    ) -> None:
+        super().__init__(
+            "permanent webhook failure is latched"
+        )
+
+        self.failure_state = (
+            failure_state
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -136,6 +150,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional persistent webhook transport "
             "failure state file."
+        ),
+    )
+
+    parser.add_argument(
+        "--retry-permanent-failure",
+        action="store_true",
+        help=(
+            "Explicitly retry one event blocked by a "
+            "persistent permanent webhook failure latch."
         ),
     )
 
@@ -479,6 +502,42 @@ def validate_failure_state_path(
     )
 
 
+def load_permanent_failure_latch(
+    path: Path,
+    event_id: str,
+) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+
+    state = load_failure_state(
+        path
+    )
+
+    validate_failure_state(
+        path,
+        state,
+    )
+
+    if state["transport"] != "webhook":
+        raise ValueError(
+            f"{path}: failure state transport mismatch"
+        )
+
+    if (
+        state["failed_event_id"]
+        != event_id
+    ):
+        return None
+
+    if (
+        state["failure_kind"]
+        != "permanent"
+    ):
+        return None
+
+    return state
+
+
 def write_failure_state(
     path: Path,
     transport: str,
@@ -797,6 +856,7 @@ def deliver_to_webhook(
     webhook_url: str,
     timeout_sec: float,
     failure_state_file: Path | None,
+    retry_permanent_failure: bool,
 ) -> tuple[str, bool]:
     receipt_dir.mkdir(
         parents=True,
@@ -848,6 +908,33 @@ def deliver_to_webhook(
             "ACK_EXISTING",
             failure_state_cleared,
         )
+
+    if (
+        failure_state_file is not None
+        and not retry_permanent_failure
+    ):
+        try:
+            permanent_latch = (
+                load_permanent_failure_latch(
+                    path=failure_state_file,
+                    event_id=payload["event_id"],
+                )
+            )
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise FailureStateError(
+                "failure state latch read failed "
+                "before webhook request: "
+                f"{exc}"
+            ) from exc
+
+        if permanent_latch is not None:
+            raise PermanentFailureLatchedError(
+                permanent_latch
+            )
 
     request_body = json.dumps(
         payload,
@@ -1114,6 +1201,15 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 4
+
+        if args.retry_permanent_failure:
+            print(
+                "adapter_error="
+                "--retry-permanent-failure requires "
+                "--transport webhook",
+                file=sys.stderr,
+            )
+            return 4
     else:
         webhook_url = resolve_webhook_url(
             args.webhook_url
@@ -1136,6 +1232,18 @@ def main() -> int:
         except ValueError as exc:
             print(
                 f"adapter_error={exc}",
+                file=sys.stderr,
+            )
+            return 4
+
+        if (
+            args.retry_permanent_failure
+            and args.failure_state_file is None
+        ):
+            print(
+                "adapter_error="
+                "--retry-permanent-failure requires "
+                "--failure-state-file",
                 file=sys.stderr,
             )
             return 4
@@ -1260,7 +1368,55 @@ def main() -> int:
                     failure_state_file=(
                         args.failure_state_file
                     ),
+                    retry_permanent_failure=(
+                        args.retry_permanent_failure
+                    ),
                 )
+        except PermanentFailureLatchedError as exc:
+            failure_state = (
+                exc.failure_state
+            )
+
+            print(
+                "adapter_error="
+                "permanent webhook failure is latched; "
+                "correct the cause and use "
+                "--retry-permanent-failure",
+                file=sys.stderr,
+            )
+            print(
+                "delivery_result="
+                "BLOCKED_PERMANENT_FAILURE"
+            )
+            print(
+                "failure_latched=true"
+            )
+            print(
+                "failure_state_file="
+                f"{args.failure_state_file}"
+            )
+            print(
+                "failure_count="
+                f"{failure_state['failure_count']}"
+            )
+            print(
+                "failure_kind="
+                f"{failure_state['failure_kind']}"
+            )
+            print(
+                "failure_reason="
+                f"{failure_state['failure_reason']}"
+            )
+            print(
+                "failed_event_id="
+                f"{failure_state['failed_event_id']}"
+            )
+            print(
+                "remaining_events="
+                f"{count_pending(args.outbox_dir)}"
+            )
+
+            return 5
         except FailureStateError as exc:
             print(
                 "adapter_error="

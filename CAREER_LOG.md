@@ -5008,3 +5008,90 @@ Webhook을 37초 동안 끊어보고 Outbox가 실제로 복구되는지 검증�
 11. exactly-once가 아닌 이유
 12. 남은 permanent failure / backoff 문제
 ```
+
+---
+
+## Portfolio Checkpoint — Permanent Webhook Failure Latch
+
+### 직접 얻은 실무 경험
+
+- Retryable failure와 permanent failure에 서로 다른 재시도 정책을 적용했다.
+- Persistent failure-state를 단순 관측 자료가 아니라 process 재시작 이후에도 유지되는 delivery latch로 활용했다.
+- Receipt를 latch보다 먼저 확인하여 외부 전송 성공 후 내부 ACK가 중단되는 crash-window 복구를 보존했다.
+- 자동 재시도와 운영자 명시적 재시도를 분리했다.
+- HTTP 요청 횟수, failure count, pending, receipt, state 파일을 함께 측정하여 재전송 차단을 검증했다.
+- Local-file production 기준선을 유지한 상태에서 격리된 Webhook fixture로 변경을 검증했다.
+
+### 보존할 증거
+
+```text
+permanent_latch_no_resend=PASS
+actual_webhook_requests=1
+failure_count=1
+pending_events=1
+receipts=0
+
+explicit_retry_and_recovery=PASS
+actual_webhook_requests_total=3
+pending_events=0
+receipts=1
+failure_state_exists=False
+
+ack_existing_precedes_latch=PASS
+actual_webhook_requests=0
+
+retryable_automatic_retry=PASS
+retryable_automatic_recovery=PASS
+retryable_failure_count=1->2
+
+permanent_retry_configuration=PASS
+local_file_regression=PASS
+```
+
+추가로 보존할 자료:
+
+- 최초 HTTP 400과 후속 latch 실행 로그
+- 명시적 HTTP 400 재시도와 `failure_count=2`
+- HTTP 204 복구 시 receipt와 state 삭제 결과
+- ACK_EXISTING 실행 중 닫힌 endpoint를 호출하지 않은 결과
+- retryable connection refused의 `failure_count 1 → 2`
+- 변경 전후 Git diff
+
+### 이력서 성과 문장 초안
+
+- 재시도로 해결되지 않는 Webhook HTTP 4xx가 systemd 주기 실행마다 무한 재전송되는 문제를 persistent failure latch와 운영자 명시적 재시도로 차단하고, 동일 event의 adapter 실행 2회 중 실제 HTTP 요청이 1회만 발생함을 검증
+- Notification receipt를 permanent latch보다 우선 평가하도록 설계하여 외부 전송 성공 후 내부 ACK가 중단된 crash-window에서 추가 HTTP 요청 없이 state 정리와 pending ACK가 완료됨을 검증
+- Permanent failure 차단과 retryable 자동 복구를 분리하여 connection failure는 연속 재시도되고 HTTP 204 정상화 후 별도 override 없이 복구되는 동작을 검증
+
+### 블로그 주제
+
+```text
+HTTP 400을 6초마다 다시 보내던 알림 시스템에 Persistent Latch를 넣은 과정
+```
+
+핵심 구성:
+
+1. Retryable과 permanent를 분류하는 이유
+2. 단순 retry count 제한의 문제
+3. Pending 보존과 dead-letter 사이의 선택
+4. Failure-state를 latch로 재사용한 구조
+5. Receipt가 latch보다 먼저 실행돼야 하는 이유
+6. 운영자 명시적 재시도 설계
+7. 실제 HTTP 요청 수로 검증한 방법
+8. 남아 있는 timeout 중복과 dead-letter 과제
+
+### 예상 면접 질문
+
+- Permanent failure를 pending에서 바로 삭제하지 않은 이유는 무엇인가?
+- Latch를 receipt 확인보다 먼저 적용하면 어떤 장애가 생기는가?
+- `failure_count`를 timer 실행 횟수가 아닌 실제 요청 실패 횟수로 유지한 이유는 무엇인가?
+- Latched 실행에서 exit code 5를 유지한 이유는 무엇인가?
+- Dead-letter queue를 도입한다면 재처리와 보존 정책을 어떻게 설계할 것인가?
+- HTTP timeout에서 exactly-once가 불가능한 이유는 무엇인가?
+
+### 다음 한 단계 높은 과제
+
+- Permanent event quarantine/dead-letter lifecycle 설계
+- 운영자용 pending 조회와 안전한 재처리 도구
+- Python adapter black-box 테스트의 CI 자동화
+- Production systemd timer에서 permanent HTTP 요청 수 고정 검증

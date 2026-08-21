@@ -7292,3 +7292,157 @@ event_id 기반 receiver-side deduplication 가능
 현재 테스트 endpoint는 일시적인 localhost receiver이므로 테스트 종료 후 서버 runtime은 검증된 local-file transport로 되돌린다.
 
 Repository에는 Webhook-capable unit을 유지하되 실제 외부 Webhook URL이 결정되기 전까지 테스트용 localhost endpoint를 production configuration으로 남기지 않는다.
+
+---
+
+## Notification Permanent Failure Latch 및 명시적 재시도 정책
+
+### 해결하려는 문제
+
+Webhook adapter는 HTTP 3xx와 재시도로 해결되지 않는 일부 HTTP 4xx를 `permanent` failure로 분류한다.
+
+기존 동작은 permanent failure에도 pending event를 유지하고 매 실행마다 다시 Webhook을 호출했다.
+
+Production notification timer의 실제 실행 간격이 약 6초이므로 수정 전에는 다음 흐름이 무한 반복될 수 있었다.
+
+```text
+HTTP 400
+→ permanent failure-state 기록
+→ pending 유지
+→ 약 6초 후 동일 event 재전송
+→ failure_count 증가
+→ 다시 반복
+```
+
+이는 해결 가능성이 낮은 요청을 계속 전송하여 외부 Webhook 부하, 불필요한 네트워크 요청, journal 반복, 상대 시스템 rate limit을 유발할 수 있다.
+
+### 검토한 대안
+
+#### Permanent failure도 계속 재시도
+
+구현은 단순하지만 permanent 분류의 의미가 사라지고 무한 재전송 문제가 유지되므로 선택하지 않았다.
+
+#### Retry 횟수 또는 시간 제한
+
+일정 횟수나 시간이 지나면 멈출 수 있지만 retry cadence에 정책이 종속되고, 같은 잘못된 요청을 여러 차례 불필요하게 전송한다.
+
+#### 즉시 dead-letter 이동 및 pending ACK
+
+다음 event 처리를 계속할 수 있지만 아직 전달되지 않은 notification을 정상 처리한 것처럼 pending에서 제거할 위험이 있다.
+
+Dead-letter lifecycle, 운영자 재처리, 보존 기간이 없는 현재 단계에서는 조용한 알림 유실 가능성이 있으므로 보류했다.
+
+#### Persistent permanent failure latch
+
+첫 permanent failure만 실제 전송하고 동일 event의 후속 자동 실행은 Webhook 호출 전에 차단한다.
+
+원인을 수정한 운영자가 명시적으로 1회 재시도할 수 있게 한다.
+
+현재 단계에서는 이 방식을 선택했다.
+
+### 선택한 정책
+
+```text
+retryable failure
+→ 기존 자동 재시도 유지
+
+permanent 최초 실패
+→ 실제 Webhook 요청
+→ permanent failure-state 저장
+→ pending 유지
+→ exit code 5
+
+동일 event의 permanent latch 발견
+→ 실제 Webhook 요청하지 않음
+→ failure-state를 다시 쓰지 않음
+→ failure_count 증가하지 않음
+→ pending 유지
+→ BLOCKED_PERMANENT_FAILURE
+→ exit code 5
+
+운영자가 원인을 수정한 뒤
+→ --retry-permanent-failure로 명시적 1회 재시도
+```
+
+`failure_count`는 timer 실행 횟수가 아니라 실제 Webhook delivery 실패 횟수를 의미하도록 유지한다.
+
+### Receipt 복구 우선순위
+
+Permanent latch는 `deliver_to_webhook()`의 receipt 확인 뒤에 평가한다.
+
+```text
+기존 receipt 확인
+→ ACK_EXISTING crash-window 복구
+→ permanent latch 확인
+→ 실제 Webhook 요청
+```
+
+순서를 반대로 하면 외부 delivery는 성공했지만 내부 ACK가 중단된 상태에서 permanent latch가 `ACK_EXISTING` 복구까지 막을 수 있다.
+
+### 명시적 재시도
+
+새 옵션:
+
+```text
+--retry-permanent-failure
+```
+
+이 옵션은 다음 조건에서만 허용한다.
+
+```text
+--transport webhook
+--failure-state-file <path>
+```
+
+Local-file transport 또는 failure-state 경로가 없는 Webhook 실행에서 사용하면 configuration error와 exit code 4를 반환한다.
+
+명시적 재시도 결과가 다시 permanent failure라면 실제 요청이 한 번 수행되고 `failure_count`가 증가한 뒤 다시 latch된다.
+
+명시적 재시도가 성공하면 기존 성공 순서를 따른다.
+
+```text
+receipt durable 저장
+→ failure-state 삭제
+→ pending ACK
+```
+
+### Exit code와 관측성
+
+Latched 실행도 permanent failure의 미해결 상태를 숨기지 않도록 exit code 5를 유지한다.
+
+따라서 systemd timer는 계속 실행되고 journal에는 차단 상태가 반복될 수 있지만 실제 HTTP POST는 수행되지 않는다.
+
+Persistent failure-state checker는 permanent failure를 즉시 CRITICAL로 평가한다.
+
+### 적용 범위
+
+Latch는 다음 조건에서만 동작한다.
+
+```text
+transport=webhook
+failure-state-file 설정
+failure_kind=permanent
+failed_event_id가 현재 pending event와 일치
+```
+
+Failure-state 기능을 사용하지 않는 수동 Webhook 실행은 이전 호환성을 유지한다.
+
+Production Webhook unit은 `--failure-state-file`을 사용하므로 latch 적용 대상이다.
+
+### 현재 한계
+
+- Permanent event는 pending에 남아 다음 event를 막는다.
+- 운영자가 원인을 수정하고 명시적으로 재시도해야 한다.
+- Latched 상태에서도 timer journal은 주기적으로 기록될 수 있다.
+- HTTP timeout처럼 상대 서버 처리 여부를 알 수 없는 retryable failure의 중복 POST 가능성은 그대로다.
+- Exactly-once delivery를 보장하지 않는다.
+- Python adapter의 회귀 테스트는 현재 수동 black-box fixture 방식이며 CI 자동화는 후속 기술 부채다.
+
+### 재검토 조건
+
+다음 요구가 생기면 dead-letter 또는 quarantine 구조를 재검토한다.
+
+- 특정 payload 하나만 permanent failure가 발생하여 뒤 event 처리가 필요한 경우
+- 운영자용 pending event 조회·재처리 기능이 필요한 경우
+- 여러 notification channel을 독립적으로 처리하는 경우
+- 장기간 미처리 permanent event 보존 정책이 필요한 경우
