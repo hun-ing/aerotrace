@@ -14,7 +14,9 @@
 ```text
 branch=feature/notification-contract-slo-tests
 upstream HEAD before Slack receiver work=a9187fe
+Slack receiver implementation commit=063b7b2
 draft PR=#1
+GitHub Actions run 32445952757=sender/receiver jobs PASS
 ```
 
 Slack receiver와 후속 문서·자동 검증 범위:

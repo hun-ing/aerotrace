@@ -15029,3 +15029,98 @@ Installed runtime은 계속 local-file 기준선이다.
 - Synthetic 202, Slack 1회, duplicate와 `/health`를 검증한다.
 - UptimeRobot `/health` DOWN/UP email, HMAC rotation과 local-file rollback을 rehearsal한다.
 - 결과를 문서에 반영하고 전체 문서 review 후 commit/push한다.
+
+### GitHub Actions와 PR
+
+Implementation commit:
+
+```text
+063b7b2 Slack용 영속 Webhook 리시버 추가
+```
+
+기존 draft PR #1을 새로 만들지 않고 재사용했다. PR 제목과 body에서 과거 `8 tests`, provider/auth/SLO `TBD` 문구를 제거하고 현재 Slack/Cloudflare/HMAC/24 tests와 production 미활성 상태로 갱신했다.
+
+GitHub Actions:
+
+```text
+workflow=Notification Pipeline Tests
+run_id=32445952757
+run_number=5
+conclusion=success
+
+job=notification-outbox
+conclusion=success
+
+job=cloudflare-slack-receiver
+conclusion=success
+locked install=success
+Node tests=success
+syntax=success
+Worker dry-run=success
+fresh D1 migration=success
+```
+
+PR은 open/draft, mergeable 상태를 유지했다.
+
+### 문서 전면 review
+
+현재 상태 문서:
+
+```text
+WEBHOOK_RECEIVER_CONTRACT.md
+NOTIFICATION_SLO.md
+OPERATIONS_RUNBOOK.md
+receiver/cloudflare-slack/README.md
+AEROTRACE_CONTEXT.md의 최상단 current context
+```
+
+검토 기준:
+
+```text
+현재값 상호 모순
+명령과 실제 package/systemd option 일치
+sender 2xx와 Slack delivered 의미 분리
+secret 이름과 저장 위치
+retry 횟수, delay, threshold, owner
+duplicate/timeout/DLQ/requeue/rollback 경계
+local link와 Markdown heading 구조
+실제 credential 포함 여부
+과거 기록과 current truth 구분
+```
+
+Review에서 수정한 항목:
+
+1. Provider/auth/SLO 미확정 문구를 current 문서에서 제거했다.
+2. Slack 3xx가 fetch exception으로 retryable이 되지 않도록 manual redirect 분류와 테스트를 추가했다.
+3. Invalid UTF-8을 replacement decode하지 않도록 변경했다.
+4. DLQ duplicate가 delivered final state를 덮어쓰지 않도록 했다.
+5. D1 `event_id`에 explicit NOT NULL/length와 hash/attempt constraint를 추가했다.
+6. 성공 payload redaction과 receiver final failure health를 문서·코드에 일치시켰다.
+7. `/health` SQL이 delivered row를 full scan하지 않고 covering reconciliation index를 사용함을 query plan으로 확인했다.
+8. Generic email fallback을 UptimeRobot Free 5분 HTTP(S) + operator email로 확정했다.
+9. Root runbook과 receiver README의 중복은 각각 host incident/rollback과 Cloudflare deploy라는 독자 범위로 분리했다.
+10. Test count를 sender 10, receiver 14, total 24로 모든 current 문서에서 일치시켰다.
+
+Historical engineering/decision section의 `8 tests`, `TBD`, `signature 없음` 문장은 당시 상태를 설명하는 기록이므로 현재 사실처럼 고치지 않았다. Current truth는 각 문서 header와 context 최상단을 기준으로 한다.
+
+### 추가 문서 제안 review
+
+현재 production activation 전 필수 문서는 contract, SLO, operations runbook과 receiver README로 충분하다. 같은 내용을 반복하는 별도 deployment/test 문서는 만들지 않는다.
+
+다음 문서는 조건이 생길 때 추가한다.
+
+```text
+SECURITY.md
+  trigger=외부 contributor 또는 public vulnerability report 접수 경로가 필요할 때
+  scope=notification secret뿐 아니라 AeroTrace repository 전체 disclosure policy
+
+DATA_RETENTION_POLICY.md
+  trigger=remote D1 30일 사용량과 event volume을 측정한 뒤
+  scope=delivered metadata retention, failed payload maximum retention, purge evidence
+
+NOTIFICATION_INCIDENT_TEMPLATE.md
+  trigger=첫 실제 notification incident 또는 secondary on-call 도입 전
+  scope=timeline, event_id, sender/receiver state, duplicate, requeue, SLO impact
+```
+
+지금 이 문서들을 미리 만들면 owner, 실제 D1 volume, 첫 incident workflow가 없는 placeholder와 runbook 중복이 된다. Trigger 시점에 실측 근거로 작성한다.
