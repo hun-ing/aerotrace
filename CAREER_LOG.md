@@ -1,8 +1,10 @@
 # AeroTrace Career Log
 
-> 마지막 업데이트: 2026-08-04  
-> 현재 Portfolio 단계: 수집, 저장, 장애 복구, 데이터 수명주기, 멀티테넌트 조회, Trace Explorer까지 End-to-End MVP 검증  
-> 다음 Checkpoint: 로컬 통합 실행과 실제 배포
+> 마지막 업데이트: 2026-08-21
+> 현재 Portfolio 단계: 수집·저장·조회 MVP, 장애 복구와 Cloudflare/Slack notification production 활성화 검증
+> 다음 Checkpoint: notification 첫 7일 health review와 30일 SLI·Free tier 사용량 검토
+
+이 문서는 checkpoint를 시간순으로 누적한다. 과거 항목의 `현재`와 `다음 검증`은 당시 상태이며 마지막 checkpoint가 최신 범위다.
 
 ---
 
@@ -1846,6 +1848,3258 @@ batch rewrite 적용 후 COPY 비교 필요성
 
 ---
 
+## Portfolio Checkpoint — OpenTelemetry Persistent Queue 장애 복구 및 Capacity 설계
+
+### 직접 경험한 문제
+
+OpenTelemetry Collector에서 `block_on_overflow=true`를 적용해 queue overflow 시 silent telemetry loss를 방지한 뒤, persistent queue가 실제 장애 상황에서 어느 정도 데이터를 보호할 수 있는지 직접 검증했다.
+
+단순히 persistent queue 설정을 추가하는 데서 끝내지 않고 다음 장애를 순차적으로 재현했다.
+
+```text
+Backend 완전 중단
+Collector graceful restart
+Collector SIGKILL
+190,000 Span backlog
+queue capacity 확대
+```
+
+### 직접 검증한 내용
+
+20,000 Span을 persistent queue에 저장한 상태에서 Collector를 정상 재시작했다.
+
+```text
+restart 전:
+queue = 20,000
+DB    = 0
+
+restart 후:
+Loaded queue metadata
+itemsSize = 20,000
+
+Backend 복구:
+DB = 20,000 / 20,000
+```
+
+이후 Collector를 SIGKILL로 강제 종료했다.
+
+```text
+exit code = 137
+```
+
+재시작 후:
+
+```text
+Loaded queue metadata
+itemsSize       = 20,000
+dispatchedItems = 2
+```
+
+가 확인됐으며 최종:
+
+```text
+DB = 20,000 / 20,000
+```
+
+으로 전부 복구됐다.
+
+### Queue Capacity 설계 경험
+
+기존 `queue_size=50,000`은 운영 후보 workload인 3,250 spans/s에서 Backend 완전 장애를 약 15.4초밖에 흡수하지 못한다는 점을 계산했다.
+
+목표를:
+
+```text
+3,250 spans/s에서 약 1분 완전 장애 흡수
+```
+
+로 설정했다.
+
+필요 queue:
+
+```text
+3,250 × 60
+= 195,000 spans
+```
+
+이므로:
+
+```yaml
+queue_size: 200000
+```
+
+을 후보로 선정했다.
+
+설정을 바로 운영에 넣지 않고 임시 Collector config로 실제 용량 실험을 수행했다.
+
+### 실제 190k Backlog 측정
+
+```text
+checkpoint  queue    allocated_bytes
+baseline    0        32,768
+50k         50,000   6,049,792
+100k        100,000  11,894,784
+150k        150,000  17,547,264
+190k        190,000  21,954,560
+```
+
+190,000 Span을 queue에 보유했을 때 baseline 대비 filesystem allocated 증가량은 약 20.9 MiB였다.
+
+Backend 장애 중:
+
+```text
+DB = 0 / 190,000
+```
+
+Backend 복구 후:
+
+```text
+DB        = 190,000 / 190,000
+queue     = 0
+in_flight = 0
+```
+
+을 확인했다.
+
+### 설계 변경 결과
+
+기존:
+
+```text
+queue_size=50,000
+
+3,250 spans/s 기준
+약 15.4초 장애 buffer
+```
+
+변경:
+
+```text
+queue_size=200,000
+
+3,250 spans/s 기준
+약 61.5초 장애 buffer
+```
+
+로 확대했다.
+
+정식 운영 후보 설정:
+
+```yaml
+sending_queue:
+  sizer: items
+  queue_size: 200000
+  block_on_overflow: true
+  storage: file_storage/aerotrace
+```
+
+### 채용 담당자 또는 면접관이 평가할 수 있는 부분
+
+이 경험의 핵심은 OpenTelemetry 설정값 자체가 아니다.
+
+다음 문제 해결 과정이 중요하다.
+
+```text
+장애 시 telemetry 보존 요구 정의
+→ persistent queue storage 구조 확인
+→ 실제 disk 사용량 측정
+→ graceful restart 장애 재현
+→ SIGKILL crash 재현
+→ queue metadata 기반 복구 과정 확인
+→ 최종 DB 데이터 보존 검증
+→ ingest rate에서 outage budget 계산
+→ capacity 목표 설정
+→ 190k 실제 backlog 검증
+→ 운영 기본값 승격
+```
+
+운영 설정을 감으로 결정하지 않고 실제 workload, failure semantics, disk 비용을 측정해서 결정한 경험으로 설명할 수 있다.
+
+### 보존할 자료
+
+포트폴리오에서 다음 자료를 보존한다.
+
+```text
+graceful restart 전후 queue=20000 출력
+Loaded queue metadata itemsSize=20000 로그
+dispatchedItems=2 복구 로그
+graceful restart DB=20000/20000 결과
+
+SIGKILL exit=137 출력
+SIGKILL 후 Loaded queue metadata 로그
+SIGKILL 후 DB=20000/20000 결과
+
+growth.tsv:
+baseline
+50k
+100k
+150k
+190k
+
+190k:
+allocated_bytes=21954560
+db_during=0/190000
+final_db=190000/190000
+
+queue_size:
+50000 → 200000 diff
+
+정식 설정 smoke:
+sender_rc=0
+DB=200/200
+queue=0
+in_flight=0
+```
+
+가능하면 터미널 결과와 함께 queue 증가/감소 그래프를 추후 포트폴리오 자료로 만든다.
+
+### 이력서 성과 문장 초안
+
+- OpenTelemetry Collector persistent queue의 graceful restart 및 SIGKILL 장애를 직접 재현해 각각 20,000/20,000 Span 복구를 검증하고, 실제 telemetry workload 기반 storage 사용량과 장애 허용 시간을 측정해 데이터 유실 방지 구조의 내구성을 검증
+- 운영 후보 workload 3,250 spans/s에서 기존 50,000 Span queue가 약 15초의 완전 장애만 흡수하는 한계를 확인하고, 190,000 Span backlog의 약 21 MiB filesystem 사용량과 190,000/190,000 복구를 검증한 뒤 queue capacity를 200,000으로 확대해 약 1분의 outage buffer 확보
+
+두 번째 문장의 수치는 이번 실험에서 직접 측정하거나 측정값에서 계산한 범위에 한정한다.
+
+### 예상 면접 질문
+
+```text
+왜 persistent queue가 필요한가?
+memory queue와 persistent queue의 차이는 무엇인가?
+왜 graceful restart와 SIGKILL을 따로 테스트했는가?
+SIGKILL 후 진행 중이던 exporter item은 어떻게 처리됐는가?
+Dropping data 로그가 있었는데 왜 최종 데이터는 유실되지 않았는가?
+queue_size=200000은 왜 선택했는가?
+왜 더 크게 1,000,000으로 잡지 않았는가?
+queue size를 disk size 기준으로 결정하지 않은 이유는?
+190k에서 bbolt file size가 증가하지 않았는데 allocated bytes가 증가한 이유를 어떻게 해석했는가?
+persistent queue만 있으면 데이터 유실이 완전히 없어지는가?
+현재 아직 검증하지 않은 장애는 무엇인가?
+```
+
+### 블로그 주제
+
+**제목**
+
+> OpenTelemetry Persistent Queue는 정말 장애에서 데이터를 지켜줄까? Restart부터 SIGKILL까지 직접 검증해봤다
+
+**해결한 문제**
+
+```text
+Collector 설정에 persistent queue가 있다고 해서
+실제 장애에서 telemetry가 살아남는다고 확신할 수 있는가?
+```
+
+**핵심 메시지**
+
+```text
+설정 존재 여부보다 실제 장애 복구 실험이 중요하다.
+queue 용량은 ingest rate와 목표 outage duration에서 역산해야 한다.
+```
+
+**글 구성**
+
+```text
+1. 왜 persistent queue를 검증했는가
+2. AeroTrace Collector storage 구조
+3. Backend pause로 backlog 생성
+4. 실제 disk 사용량 측정
+5. graceful restart 실험
+6. shutdown 중 Dropping data 로그 분석
+7. SIGKILL crash 실험
+8. queue_size=50k의 실제 outage budget
+9. 200k capacity 목표 선정
+10. 50k → 190k storage 성장 실험
+11. 운영 기본값 변경
+12. 아직 보장할 수 없는 failure scenario
+```
+
+### 다음에 경험할 한 단계 높은 과제
+
+현재 검증은 Collector process 수준의 장애까지다.
+
+다음 단계에서는 다음 중 우선순위가 높은 failure boundary를 검증한다.
+
+```text
+queue 완전 포화 이후 failure semantics
+file_storage write 실패
+host reboot 이후 persistent queue 복구
+disk/storage 한계 접근 시 운영 동작
+```
+
+특히 실제 운영에서는 queue가 100%에 도달하기 전에 감지할 수 있도록 queue utilization과 persistent storage 사용량에 대한 monitoring/alerting 정책까지 연결해야 한다.
+
+---
+
+### Portfolio Checkpoint 추가 — Persistent Queue 완전 포화 Backpressure 검증
+
+`queue_size=200000`을 운영 기본값으로 결정한 뒤 실제 운영 후보 workload인 3,250 spans/s에서 queue를 완전히 포화시키는 장애 실험을 수행했다.
+
+실제 effective saturation:
+
+```text
+configured queue = 200,000
+actual plateau    = 199,500
+saturation time   = 62.622 sec
+```
+
+설계 시 계산했던:
+
+```text
+200,000 / 3,250
+≈ 61.5 sec
+```
+
+와 실제 결과가 근접해 약 1분의 Backend 완전 장애 buffer가 실제 workload에서도 동작함을 검증했다.
+
+queue 포화 이후 telemetry를 버리는 대신 upstream backpressure가 발생했다.
+
+```text
+Backpressure wait total      = 6,953.442 ms
+Producer backpressure events = 155
+Producer lag p99             = 5,503.897 ms
+Send-start lag p99           = 5,996.734 ms
+```
+
+이 영향으로 목표 rate 유지에는 실패했지만:
+
+```text
+Requested spans = 211,250
+Accepted spans  = 211,250
+Failed requests = 0
+
+Delivery success        = PASS
+Sustained-rate validity = FAIL
+```
+
+이었다.
+
+Backend 복구 후:
+
+```text
+DB        = 211,250 / 211,250
+queue     = 0
+in_flight = 0
+```
+
+으로 전체 데이터 보존을 확인했다.
+
+Collector raw metric에서도 이전 200 Span smoke를 제외한 실험 delta가:
+
+```text
+accepted delta = 211,250
+sent delta     = 211,250
+refused        = 0
+```
+
+으로 확인됐다.
+
+실험 과정에서 Collector metric helper가 모든 metric에 `data_type="traces"` label을 요구하면서 span counter를 읽지 못하고 빈 값을 0으로 처리하는 계측 오류도 발견했다.
+
+Raw Prometheus metric을 직접 확인하여:
+
+```text
+queue gauge에는 data_type label이 존재하지만
+span counter에는 해당 label이 존재하지 않는다
+```
+
+는 차이를 확인하고 잘못된 계측 결과와 실제 시스템 동작을 분리했다.
+
+#### 이력서 성과 문장 보강
+
+- OpenTelemetry Collector persistent queue를 3,250 spans/s workload에서 완전 포화시켜 199,500 Span effective capacity와 62.6초의 장애 buffer를 실측하고, 포화 후 upstream backpressure가 발생하는 동안에도 211,250/211,250 Span이 최종 저장되는 것을 검증
+- Collector 내부 metric label 차이로 발생한 잘못된 zero metric을 raw Prometheus 데이터로 추적해 계측 오류를 식별하고, Collector counter와 최종 DB row를 교차 검증하여 실제 telemetry 유실 여부를 판단
+
+#### 면접에서 설명할 포인트
+
+```text
+왜 queue_size=200000으로 결정했는가?
+이론상 61.5초와 실제 62.6초 차이는 왜 발생했는가?
+왜 실제 queue가 200000이 아니라 199500에서 멈췄는가?
+Delivery PASS인데 sustained-rate FAIL인 이유는?
+backpressure가 데이터 유실 문제를 어떤 문제로 바꾸는가?
+sender_rc=22를 왜 전송 실패로 보지 않았는가?
+internal metric이 잘못 측정된 것을 어떻게 발견했는가?
+왜 DB row count까지 함께 검증했는가?
+```
+
+#### 보존할 핵심 스크린샷/로그
+
+```text
+queue=199500 stable=4
+saturation_elapsed_sec=62.622
+
+5초 hold 후 queue=199500
+
+Producer backpressure events=155
+Backpressure wait total=6953.442 ms
+
+Requested/Accepted=211250
+Failed requests=0
+
+DB=211250/211250
+
+raw Collector metrics:
+sent_spans=211450
+accepted_spans=211450
+refused_spans=0
+```
+
+---
+
+### Portfolio Checkpoint 추가 — Host Reboot 이후 Telemetry 복구 검증
+
+OpenTelemetry Collector persistent queue의 장애 내구성을 process restart와 SIGKILL 수준에서 끝내지 않고 Host OS reboot까지 확장해서 검증했다.
+
+Backend를 정상 stop한 상태에서 20,000 Span을 Collector persistent queue에 저장했다.
+
+Host reboot 직전:
+
+```text
+queue = 20,000
+DB    = 0 / 20,000
+```
+
+이 상태에서 실제 host를 reboot했다.
+
+```text
+sudo reboot
+```
+
+재부팅 후:
+
+```text
+Collector   = running
+TimescaleDB = healthy
+Backend     = exited
+```
+
+이었기 때문에 Backend가 queue를 drain하기 전에 persistent queue 복구 상태를 직접 확인할 수 있었다.
+
+Collector startup log:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20,000
+bytesSize       = 2,234,800
+dispatchedItems = 2
+```
+
+진행 중이던 두 item도:
+
+```text
+Moved items for dispatching back to queue
+numberOfItems = 2
+```
+
+로 다시 queue에 복원됐다.
+
+Backend가 여전히 중단된 상태에서:
+
+```text
+queue = 20,000
+DB    = 0 / 20,000
+```
+
+을 확인했다.
+
+Backend 복구 후:
+
+```text
+queue:
+18,950
+→ 15,800
+→ 13,700
+→ 10,550
+→ 6,350
+→ 3,150
+→ 0
+
+DB = 20,000 / 20,000
+```
+
+으로 전체 telemetry가 최종 저장됐다.
+
+현재까지 직접 검증한 failure boundary:
+
+```text
+Collector graceful restart → 20,000 / 20,000
+Collector SIGKILL          → 20,000 / 20,000
+Host OS reboot             → 20,000 / 20,000
+```
+
+#### 포트폴리오에서 강조할 부분
+
+단순히 OpenTelemetry persistent queue를 설정한 것이 아니라 장애 경계를 단계적으로 확장했다.
+
+```text
+process restart
+→ SIGKILL
+→ host reboot
+```
+
+각 단계에서:
+
+```text
+장애 전 queue 상태
+DB 미저장 상태
+startup queue metadata
+진행 중 item 복원
+queue drain
+최종 DB 데이터
+```
+
+를 모두 확인했다.
+
+특히 host reboot 실험에서는 shell과 `/tmp` 상태가 사라지는 문제를 고려해 실험 metadata를 persistent host 파일로 따로 저장하고 재접속 후 동일 telemetry를 추적했다.
+
+#### 이력서 성과 문장 보강
+
+- OpenTelemetry Collector persistent queue의 장애 내구성을 graceful restart, SIGKILL, Host OS reboot까지 단계적으로 검증하고, 각 장애에서 20,000/20,000 Span이 최종 DB까지 복구되는 것을 확인해 telemetry 수집 경로의 장애 복구 신뢰성을 검증
+- Host reboot 전 DB 미저장 상태의 20,000 Span backlog를 생성하고 Docker volume 재마운트 후 `itemsSize=20000` queue 복원과 최종 20,000/20,000 저장을 검증하여 process lifecycle을 넘어선 데이터 보존 특성을 확인
+
+#### 예상 면접 질문
+
+```text
+왜 docker restart와 host reboot를 따로 테스트했는가?
+Backend를 pause하지 않고 stop한 이유는?
+왜 reboot 이후 Backend가 자동으로 올라오지 않는 상태가 오히려 테스트에 유리했는가?
+reboot 전에 DB=0인지 확인한 이유는?
+왜 실험 metadata를 홈 디렉터리에 저장했는가?
+Loaded queue metadata에서 무엇을 확인했는가?
+dispatchedItems=2는 어떤 의미로 해석했는가?
+Docker volume을 사용하면 host reboot에서도 항상 안전하다고 말할 수 있는가?
+아직 검증하지 않은 storage failure는 무엇인가?
+```
+
+#### 보존할 핵심 증거
+
+```text
+reboot state 파일
+queue_before_reboot=20000
+DB_before_reboot=0
+
+재부팅 후 container 상태:
+Collector Up
+TimescaleDB healthy
+Backend Exited
+
+Loaded queue metadata:
+itemsSize=20000
+bytesSize=2234800
+dispatchedItems=2
+
+queue_after_reboot=20000
+DB_after_reboot=0
+
+final_db=20000/20000
+final_queue=0
+final_in_flight=0
+Backend healthy
+```
+
+#### 블로그 소재
+
+**제목**
+
+> OpenTelemetry Persistent Queue는 서버 재부팅도 버틸까? Process Crash에서 Host Reboot까지 장애 실험
+
+**핵심 흐름**
+
+```text
+왜 process restart 테스트만으로 부족한가
+→ Docker volume과 persistent queue 구조
+→ reboot 전 DB=0인 backlog 만들기
+→ 실험 metadata 보존
+→ 실제 Host reboot
+→ Collector metadata reload 확인
+→ dispatch 중 item 복구
+→ Backend 복구
+→ 최종 20,000/20,000 검증
+→ 아직 검증하지 않은 power-loss 영역
+```
+
+---
+
+### Portfolio Checkpoint — Collector 장애 자동 탐지 및 Alert Storm 방지
+
+Collector queue monitoring을 수동 스크립트 수준에서 끝내지 않고 systemd timer를 이용한 실제 운영 자동화 경로까지 확장했다.
+
+구조:
+
+```text
+Collector metrics
+→ queue 상태 checker
+→ stateful alert evaluator
+→ systemd oneshot service
+→ 5초 timer
+```
+
+운영 상태 판정 로직은 systemd에 넣지 않고 Python 코드에 유지해 scheduler와 monitoring logic을 분리했다.
+
+#### 정상 상태 polling 검증
+
+5초 단위 timer를 활성화한 뒤 state file의:
+
+```text
+last_evaluated_at
+```
+
+이 반복 갱신되는 것을 확인했다.
+
+```text
+timer_state_update=PASS
+timer_repeat=PASS
+```
+
+정상 상태에서는 `event=NONE` 상세 출력을 억제해 5초마다 Collector metric 전체가 journal에 기록되는 문제를 방지했다.
+
+#### 실제 Collector 장애 자동 탐지
+
+Collector container를 실제 중단했다.
+
+```text
+running=false
+status=exited
+```
+
+사람이 checker/evaluator를 직접 실행하지 않은 상태에서 systemd timer가 자동으로:
+
+```text
+previous_status=OK
+current_status=UNKNOWN
+event=ALERT
+alert_required=true
+```
+
+를 생성했다.
+
+실제 원인:
+
+```text
+Collector metrics endpoint
+Connection refused
+```
+
+도 journal에 남았다.
+
+동일 장애가 계속되는 동안 timer가 반복 실행됐지만:
+
+```text
+alert_count=1
+```
+
+로 중복 alert가 억제됐다.
+
+#### 자동 Recovery 감지
+
+Collector를 복구한 뒤:
+
+```text
+previous_status=UNKNOWN
+current_status=OK
+event=RECOVERY
+alert_required=true
+```
+
+가 자동 발생했다.
+
+최종:
+
+```text
+alert_count=1
+recovery_count=1
+```
+
+이었다.
+
+#### 직접 경험한 운영 문제
+
+이번 단계에서 다음 실무 문제를 직접 다뤘다.
+
+```text
+짧은 polling 주기와 로그 증가
+alert storm
+상태 persistence
+process exit code와 서비스 상태 분리
+monitoring 대상 자체가 죽은 경우의 UNKNOWN 처리
+recovery notification
+systemd oneshot lifecycle
+timer 실제 실행 여부 검증
+runtime state 권한 관리
+```
+
+또한 최초 quiet mode 구현에서 argument만 추가되고 실제 early-return 조건이 빠져 정상 상태에서도 출력이 계속되는 문제를 실행 결과로 발견하고 수정했다.
+
+#### 이력서 성과 문장 초안
+
+- OpenTelemetry Collector queue 상태를 5초 주기로 자동 평가하는 systemd 기반 운영 monitoring을 구성하고, persistent alert state와 상태 전이 기반 중복 억제를 적용해 Collector 장애 시 UNKNOWN ALERT 1회와 복구 시 RECOVERY 1회가 자동 발생하는 E2E 경로를 검증
+- 짧은 polling 환경에서 정상 상태 metric dump로 발생할 수 있는 journal 증가를 event 기반 quiet mode로 억제하고, monitoring 대상 자체의 장애를 UNKNOWN 상태로 분리해 실제 Collector 중단 시 Connection Refused를 자동 탐지하도록 운영 경로를 구축
+
+#### 면접에서 설명할 포인트
+
+```text
+왜 1분 cron이 아니라 5초 polling을 선택했는가?
+왜 systemd에 threshold 로직을 직접 넣지 않았는가?
+OnUnitInactiveSec를 선택한 이유는?
+왜 WARNING/CRITICAL에서 evaluator exit code를 non-zero로 만들지 않았는가?
+UNKNOWN과 evaluator failure는 어떻게 다른가?
+동일 장애의 alert storm은 어떻게 막았는가?
+왜 recovery notification이 필요한가?
+StateDirectory를 사용한 이유는?
+정상 상태에서 journal spam은 어떻게 방지했는가?
+timer가 active인 것과 실제 실행되고 있는 것을 어떻게 구분해 검증했는가?
+```
+
+#### 보존할 증거
+
+```text
+timer enabled/active 출력
+
+timer_state_update=PASS
+timer_repeat=PASS
+
+systemd state:
+current_status=OK
+
+Collector stop:
+running=false status=exited
+
+자동 장애 탐지:
+event=ALERT
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+Connection refused
+
+alert_count=1
+
+자동 복구:
+event=RECOVERY
+previous_status=UNKNOWN
+current_status=OK
+
+recovery_count=1
+```
+
+#### 다음 한 단계 높은 과제
+
+현재는 Collector process 자체 장애를 자동 감지했다.
+
+다음 단계에서는 Collector는 살아 있지만 downstream 장애로 persistent queue가 증가하는 상황에서:
+
+```text
+OK
+→ WARNING
+→ CRITICAL
+→ RECOVERY
+```
+
+상태 변화가 자동으로 탐지되는지 검증한다.
+
+그 이후 실제 notification adapter를 연결해 운영자가 외부 채널에서 장애와 복구를 받을 수 있는 구조로 확장한다.
+
+---
+
+### Portfolio Checkpoint — 실제 Collector Queue 기반 Alert Severity State Machine 검증
+
+Collector process 중단에 대한 UNKNOWN 자동 탐지에 이어 실제 persistent queue backlog를 이용해 운영 alert severity 전체 경로를 검증했다.
+
+### 구현한 구조
+
+Evaluator가 checker option을 전달할 수 있도록 다음 기능을 추가했다.
+
+```text
+--checker-arg
+```
+
+이를 이용해 production threshold:
+
+```text
+WARNING 50%
+CRITICAL 80%
+```
+
+를 변경하지 않고 테스트 환경에서만 낮은 threshold를 적용했다.
+
+테스트 threshold는 repository나 영구 systemd 설정에 저장하지 않고 다음 runtime 영역의 drop-in으로 적용했다.
+
+```text
+/run/systemd/system
+```
+
+실험 종료 후 drop-in을 제거하고:
+
+```text
+production_execstart=PASS
+```
+
+로 production 설정이 정상 복구된 것을 확인했다.
+
+### 실제 Queue WARNING 자동 탐지
+
+Backend를 pause하고 실제 2,000 spans를 전송했다.
+
+Sender:
+
+```text
+Accepted spans=2000
+Failed requests=0
+Observed accepted spans/sec=999.87
+Rate error=0.013%
+Delivery success=PASS
+Sustained-rate validity=PASS
+```
+
+Queue:
+
+```text
+queue_size=2000
+queue_capacity=200000
+utilization=1.00%
+```
+
+Production checker는 기존 50%/80% 기준을 유지해:
+
+```text
+status=OK
+```
+
+이었다.
+
+반면 테스트 threshold가 적용된 systemd timer 경로에서는 자동으로:
+
+```text
+OK
+→ WARNING
+
+event=ALERT
+alert_required=true
+```
+
+가 발생했다.
+
+동일 WARNING 상태가 반복돼도:
+
+```text
+warning_alert_count=1
+```
+
+로 중복 alert를 억제했다.
+
+Backend 복구 후:
+
+```text
+WARNING
+→ OK
+
+event=RECOVERY
+```
+
+가 자동 발생했고 DB에는:
+
+```text
+2000/2000
+```
+
+이 저장됐다.
+
+### 실제 WARNING → CRITICAL 승격 검증
+
+두 번째 실험에서도 실제 2,000 spans backlog를 사용했다.
+
+Sender:
+
+```text
+Accepted spans=2000
+Failed requests=0
+Observed accepted spans/sec=999.91
+Rate error=0.009%
+Delivery success=PASS
+Sustained-rate validity=PASS
+```
+
+먼저 다음 자동 전이를 확인했다.
+
+```text
+OK
+→ WARNING
+
+event=ALERT
+```
+
+Backend를 계속 pause한 상태에서 실제 queue는 그대로 두고 test severity 기준만 변경했다.
+
+그 결과:
+
+```text
+WARNING
+→ CRITICAL
+
+event=STATUS_CHANGE
+alert_required=true
+checker_exit_code=2
+```
+
+가 systemd timer를 통해 자동 생성됐다.
+
+Event count:
+
+```text
+ALERT=1
+STATUS_CHANGE=1
+```
+
+이었다.
+
+Backend 복구 후 queue는 다음과 같이 drain됐다.
+
+```text
+1000
+1000
+0
+```
+
+그리고:
+
+```text
+CRITICAL
+→ OK
+
+event=RECOVERY
+```
+
+가 자동 발생했다.
+
+최종:
+
+```text
+RECOVERY=1
+DB=2000/2000
+queue_size=0
+current_status=OK
+timer_enabled=enabled
+timer_active=active
+production_execstart=PASS
+```
+
+을 확인했다.
+
+### 직접 경험한 실무 영역
+
+이번 단계에서 다음 운영 문제를 직접 다뤘다.
+
+```text
+production configuration과 test configuration 격리
+systemd runtime drop-in
+실제 metric 기반 severity transition
+WARNING과 CRITICAL의 운영 의미 분리
+alert storm 방지
+severity escalation
+recovery lifecycle
+실험 후 production 설정 복원 검증
+queue drain 관찰
+telemetry 최종 DB 정합성 검증
+```
+
+단순 unit test가 아니라 실제 다음 전체 경로에서 상태 전이를 검증했다.
+
+```text
+OTLP sender
+→ OpenTelemetry Collector
+→ persistent queue
+→ Collector metrics
+→ queue checker
+→ alert evaluator
+→ systemd timer
+→ journal
+→ Backend
+→ TimescaleDB
+```
+
+### 이력서 성과 문장 초안
+
+- OpenTelemetry Collector의 실제 persistent queue metric을 기반으로 `OK → WARNING → CRITICAL → RECOVERY` 상태 머신을 구축하고, systemd 5초 polling 환경에서 ALERT·severity escalation·RECOVERY가 각각 1회 발생하며 동일 상태의 중복 alert가 억제되는 것을 E2E 검증
+- Production 50%/80% queue threshold를 변경하지 않고 systemd runtime-only drop-in과 checker argument 전달 구조를 적용해 작은 실제 backlog로 alert severity 전이를 안전하게 재현하고, 테스트 종료 후 production 설정 복원 및 span 2,000/2,000 최종 저장을 검증
+
+### 면접에서 설명할 포인트
+
+```text
+왜 실제 100k/160k backlog를 다시 만들지 않았는가?
+Production threshold를 직접 낮추지 않은 이유는?
+왜 /etc가 아니라 /run의 systemd drop-in을 사용했는가?
+ExecStart override에서 빈 ExecStart=가 필요한 이유는?
+WARNING과 CRITICAL을 boolean failure 하나로 처리하지 않은 이유는?
+WARNING → CRITICAL은 왜 ALERT가 아니라 STATUS_CHANGE인가?
+동일 WARNING의 alert storm은 어떻게 방지했는가?
+테스트 설정이 production에 남지 않았다는 것을 어떻게 증명했는가?
+왜 sender 성공뿐 아니라 DB 2000/2000까지 확인했는가?
+Queue가 1000 → 1000 → 0으로 보인 것은 무엇을 의미하는가?
+```
+
+### 보존할 로그와 증거
+
+WARNING 실험:
+
+```text
+queue_size=2000
+queue_utilization_pct=1.00
+
+event=ALERT
+previous_status=OK
+current_status=WARNING
+
+warning_alert_count=1
+
+event=RECOVERY
+previous_status=WARNING
+current_status=OK
+
+db=2000/2000
+```
+
+CRITICAL 승격 실험:
+
+```text
+event=ALERT
+previous_status=OK
+current_status=WARNING
+
+event=STATUS_CHANGE
+previous_status=WARNING
+current_status=CRITICAL
+
+alert_count=1
+status_change_count=1
+
+queue drain:
+1000
+1000
+0
+
+event=RECOVERY
+previous_status=CRITICAL
+current_status=OK
+
+recovery_count=1
+db=2000/2000
+```
+
+최종 운영 상태:
+
+```text
+production_execstart=PASS
+queue_size=0
+current_status=OK
+timer_enabled=enabled
+timer_active=active
+```
+
+### 이번 단계에서 설명할 수 있어야 하는 핵심
+
+- Production threshold와 alert state machine 테스트 조건을 왜 분리했는가?
+- `--checker-arg`는 evaluator와 checker 사이에서 어떤 역할을 하는가?
+- 왜 테스트 설정을 `/run/systemd/system`에 두었는가?
+- WARNING 반복과 WARNING → CRITICAL 전환은 운영적으로 무엇이 다른가?
+- 왜 CRITICAL에서 바로 OK가 됐을 때도 RECOVERY 하나로 처리하는가?
+- queue alert 테스트에서 DB 최종 저장량까지 확인한 이유는 무엇인가?
+
+### 한 단계 높은 다음 과제
+
+현재 AeroTrace는 장애 상태를 자동 판단하고 systemd journal에 이벤트를 생성할 수 있다.
+
+다음 단계에서는 판단 로직과 전달 로직을 분리한 notification adapter를 추가해:
+
+```text
+ALERT
+STATUS_CHANGE
+RECOVERY
+```
+
+이벤트를 실제 운영자에게 전달하는 경로를 구성한다.
+
+Notification 전송 실패가 Collector queue monitoring 자체를 막지 않도록 timeout, retry, duplicate notification 정책을 별도로 설계한다.
+
+---
+
+### Portfolio Checkpoint — Durable Notification Pipeline과 Failure Isolation
+
+OpenTelemetry Collector의 queue 상태를 판단하는 monitoring 경로와 운영자 notification 전달 경로를 독립적으로 분리했다.
+
+### 해결한 문제
+
+기존에는 Collector 장애를 자동으로 감지해도 결과가 systemd journal에서 끝났다.
+
+외부 notification을 evaluator에 직접 넣으면 Slack, Discord 또는 webhook 장애가 monitoring 자체의 실행에 영향을 줄 수 있다.
+
+이를 방지하기 위해 다음 구조를 구현했다.
+
+```text
+Collector metrics
+→ queue checker
+→ alert evaluator
+→ durable JSON outbox
+→ independent notification adapter
+→ transport
+```
+
+### 직접 검증한 Event Contract
+
+Evaluator는 기존 text 출력을 유지하면서 opt-in JSON contract를 제공한다.
+
+```text
+schema_version
+event_id
+event
+alert_required
+previous_status
+current_status
+checker_exit_code
+evaluated_at
+checker_output
+```
+
+JSON contract:
+
+```text
+한 이벤트당 한 줄
+schema_version=1
+previous status 없음은 null
+boolean/int/null 타입 보존
+```
+
+을 자동 assertion으로 검증했다.
+
+### Alert Event 유실 방지
+
+Outbox를 evaluator state보다 먼저 저장하도록 구성했다.
+
+Outbox write를 의도적으로 실패시킨 결과:
+
+```text
+outbox_failure_rc=4
+state_after_outbox_failure=PASS_not_written
+```
+
+이었다.
+
+Outbox 경로 복구 후 동일 Collector 상태에서 최초 ALERT를 다시 생성할 수 있음을 확인했다.
+
+따라서 state만 진행되고 alert event가 사라지는 failure mode를 방지했다.
+
+### Notification Adapter Failure Semantics
+
+독립 notification adapter를 구현해:
+
+```text
+pending event
+→ delivery
+→ 성공 시 ACK
+→ 실패 시 pending 유지
+```
+
+로 동작하게 했다.
+
+정상:
+
+```text
+pending 1 → 0
+delivered 0 → 1
+DELIVERED
+```
+
+전송 실패:
+
+```text
+delivery_failure_rc=2
+pending=1
+```
+
+전송 복구:
+
+```text
+pending=0
+delivered=1
+DELIVERED
+```
+
+을 검증했다.
+
+### Crash Window 중복 처리
+
+전송은 성공했지만 pending ACK 전에 process가 종료되는 상황을 재현했다.
+
+동일 event_id가 이미 delivered돼 있는 경우:
+
+```text
+delivery_result=ACK_EXISTING
+```
+
+으로 처리해 중복 local delivery를 발생시키지 않았다.
+
+### 실제 systemd 자동 E2E
+
+Evaluator와 notification adapter를 별도 systemd timer로 실행했다.
+
+사람이 evaluator 또는 adapter를 수동 실행하지 않은 상태에서 Collector를 실제 중단했다.
+
+자동 경로:
+
+```text
+Collector stop
+→ OK → UNKNOWN
+→ ALERT
+→ outbox
+→ notification timer
+→ DELIVERED
+```
+
+실제 로그:
+
+```text
+event=ALERT
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+```
+
+Notification:
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+processed_events=1
+remaining_events=0
+```
+
+Collector를 다시 시작하자:
+
+```text
+UNKNOWN → OK
+→ RECOVERY
+→ outbox
+→ notification timer
+→ DELIVERED
+```
+
+까지 자동 실행됐다.
+
+최종:
+
+```text
+delivered_event_sequence=PASS
+final_pending=0
+final_delivered=2
+```
+
+### Notification 장애 격리 실험
+
+Notification transport만 의도적으로 실패시켰다.
+
+Collector 장애 발생 후:
+
+```text
+state=UNKNOWN
+pending=1
+```
+
+이 됐고 adapter journal에는:
+
+```text
+adapter_error=delivery failed
+failed_event_id=1787035511951348652-1520983
+remaining_events=1
+```
+
+이 기록됐다.
+
+동시에 evaluator는 계속 실행됐다.
+
+```text
+last_evaluated_at
+06:44:47
+→
+06:45:29
+
+evaluator_independent_from_notification=PASS
+```
+
+Timer 상태:
+
+```text
+evaluator_timer=active
+notification_timer=active
+```
+
+Evaluator service:
+
+```text
+Result=success
+ExecMainStatus=0
+```
+
+따라서 실제 systemd 환경에서:
+
+```text
+Notification 장애
+≠
+Collector monitoring 장애
+```
+
+를 검증했다.
+
+### 자동 Retry
+
+Notification transport를 복구한 뒤 adapter를 수동 실행하지 않았다.
+
+다음 timer trigger에서 기존 pending ALERT가 자동 처리됐다.
+
+```text
+pending=0
+delivered=3
+automatic_pending_retry=PASS
+```
+
+원래 event_id:
+
+```text
+1787035511951348652-1520983
+```
+
+가 그대로 전달됐다.
+
+Collector 복구 후 RECOVERY도 자동 전달됐다.
+
+```text
+delivered=4
+automatic_recovery_after_notification_failure=PASS
+failure_recovery_sequence=PASS
+```
+
+마지막 event lifecycle:
+
+```text
+ALERT
+OK → UNKNOWN
+
+RECOVERY
+UNKNOWN → OK
+```
+
+### 운영 환경 복구
+
+모든 notification systemd 설정은 `/run/systemd/system`의 runtime-only configuration으로 검증했다.
+
+실험 종료 후 모두 제거했다.
+
+```text
+production_evaluator=PASS
+notification_runtime_cleanup=PASS
+
+evaluator_timer_enabled=enabled
+evaluator_timer_active=active
+
+Collector running
+queue_size=0
+current_status=OK
+```
+
+### 이력서 성과 문장 초안
+
+- OpenTelemetry Collector 장애 감지와 notification 전달 경로를 JSON outbox 기반으로 분리하고, notification transport 장애 중에도 alert event를 pending 상태로 보존하면서 Collector 상태 평가 timer가 계속 실행되는 failure isolation 구조를 구현·E2E 검증
+- systemd 기반 독립 evaluator/notification timer를 구성해 실제 Collector 중단 시 `OK → UNKNOWN → ALERT`, 복구 시 `UNKNOWN → OK → RECOVERY`가 자동 전달되는 것을 검증하고, notification 실패 후 기존 event_id의 자동 retry와 최종 `pending=0` 복구를 확인
+- Notification 전송 성공 후 ACK 전 process crash를 가정한 중복 event 시나리오에서 event_id 기반 `ACK_EXISTING` 처리를 적용해 동일 local delivery의 중복 생성을 방지
+
+### 면접에서 설명할 수 있는 내용
+
+```text
+왜 evaluator가 Slack을 직접 호출하지 않게 설계했는가?
+
+왜 단순 stdout pipe 대신 durable outbox가 필요한가?
+
+왜 outbox를 evaluator state보다 먼저 저장하는가?
+
+Outbox 성공 후 state 저장 전에 crash하면 어떤 일이 생기는가?
+
+Delivery 성공 후 pending 삭제 전에 crash하면 어떻게 처리하는가?
+
+Notification adapter 장애가 evaluator에 전파되지 않는다는 것을 어떻게 검증했는가?
+
+같은 UNKNOWN 상태가 계속될 때 pending ALERT가 증가하지 않는 이유는 무엇인가?
+
+systemd timer의 Result=success만 보고 과거 실행 실패 여부를 판단하면 왜 위험한가?
+
+왜 local sink 테스트 이후 바로 Slack을 붙이지 않았는가?
+
+At-most-once와 at-least-once 중 현재 구조는 어느 쪽에 가까운가?
+```
+
+### 보존할 증거
+
+```text
+json_contract=PASS
+alert_json_contract=PASS
+
+stdout_outbox_match=PASS
+outbox_contract=PASS
+
+state_after_outbox_failure=PASS_not_written
+
+delivery_result=DELIVERED
+delivery_result=ACK_EXISTING
+
+delivery_failure_rc=2
+pending_after_delivery_failure=1
+
+automatic_alert_delivery=PASS
+automatic_recovery_delivery=PASS
+delivered_event_sequence=PASS
+
+evaluator_independent_from_notification=PASS
+
+pending_during_failure=1
+
+automatic_pending_retry=PASS
+retried_alert_contract=PASS
+
+automatic_recovery_after_notification_failure=PASS
+failure_recovery_sequence=PASS
+
+production_evaluator=PASS
+notification_runtime_cleanup=PASS
+```
+
+### 아직 과장하면 안 되는 부분
+
+현재 outbox는 process/systemd failure 경계에서 검증됐다.
+
+아직 다음까지 증명하지 않았다.
+
+```text
+abrupt host power loss 직전 outbox durability
+filesystem corruption
+disk full
+외부 webhook timeout 후 실제 수신 여부가 불명확한 상황
+Slack/Discord 등 provider 자체의 duplicate semantics
+```
+
+따라서 포트폴리오에서는 현재 구조를 “process/systemd notification failure isolation 및 retry 검증”으로 표현하고 “power-loss safe exactly-once notification”으로 표현하지 않는다.
+
+### 다음 한 단계 높은 과제
+
+실제 외부 notification transport를 연결하기 전에 다음 두 의미를 정리한다.
+
+```text
+Evaluator가 notification event를 발생시킨 시각
+외부 transport가 실제 delivery에 성공한 시각
+```
+
+현재 evaluator의:
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+는 실제 외부 delivery 시각이 아니므로 책임과 명칭을 재검토한다.
+
+그 다음 Generic Webhook / Slack / Discord 중 MVP transport를 선택하고 HTTP timeout, retry, ambiguous delivery, credential 관리까지 검증한다.
+
+---
+
+### Portfolio Checkpoint — Notification Outbox 적체와 실제 장애 지속 상태 관측
+
+Webhook notification을 단순히 재시도하는 것에서 끝내지 않고, 전달 장애가 장기화될 때 미전송 event가 얼마나 쌓이고 얼마나 오래 대기하고 있는지 확인할 수 있는 Notification Outbox checker를 구현하고 실제 장애를 발생시켜 상태 전이를 검증했다.
+
+### 구현한 관측 구조
+
+Notification Outbox에서 다음 지표를 확인할 수 있도록 했다.
+
+```text
+pending event count
+pending bytes
+oldest pending age
+oldest event ID
+oldest evaluated_at
+```
+
+상태와 exit code:
+
+```text
+OK       = 0
+WARNING  = 1
+CRITICAL = 2
+UNKNOWN  = 3
+```
+
+Count와 age threshold를 독립적으로 설정할 수 있으며 두 상태 중 더 높은 severity를 전체 상태로 사용하도록 했다.
+
+### 기본 동작
+
+Threshold를 지정하지 않으면 pending event가 있더라도 관측값만 출력한다.
+
+```text
+pending_events > 0
+threshold 없음
+→ status=OK
+```
+
+운영 데이터를 측정하기 전에 테스트용 숫자를 production alert 기준으로 고정하지 않기 위한 선택이다.
+
+### Outbox 관측 검증
+
+Test event 두 개에서 다음 값을 실제로 확인했다.
+
+```text
+pending_events=2
+pending_bytes=585
+oldest_pending_age_sec=94.694
+oldest_event_id=v7b41-oldest
+```
+
+자동 검증:
+
+```text
+outbox_observability=PASS
+```
+
+### 데이터 손상 검출
+
+손상된 JSON:
+
+```text
+{broken json
+```
+
+을 Outbox에 배치했을 때:
+
+```text
+status=UNKNOWN
+broken_event_rc=3
+```
+
+을 반환하는 것을 확인했다.
+
+Outbox path가 directory가 아닌 일반 파일인 경우도:
+
+```text
+status=UNKNOWN
+outbox_path_error_rc=3
+```
+
+으로 처리했다.
+
+### Count Threshold 검증
+
+실제 pending 두 개에서:
+
+```text
+warn-count=2
+critical-count=3
+→ WARNING
+→ rc=1
+```
+
+그리고:
+
+```text
+warn-count=1
+critical-count=2
+→ CRITICAL
+→ rc=2
+```
+
+를 확인했다.
+
+### Age Threshold 검증
+
+약 120초 된 event에서:
+
+```text
+warn-age-sec=60
+critical-age-sec=3600
+→ WARNING / rc=1
+```
+
+그리고:
+
+```text
+warn-age-sec=60
+critical-age-sec=90
+→ CRITICAL / rc=2
+```
+
+를 확인했다.
+
+Count가 WARNING이고 age가 CRITICAL인 경우:
+
+```text
+overall=CRITICAL
+combined_status_rc=2
+```
+
+가 됐다.
+
+### 실제 장애 실험
+
+Synthetic event만 사용하는 것으로 끝내지 않고 실제 webhook connection failure를 발생시켰다.
+
+사용한 endpoint:
+
+```text
+http://127.0.0.1:1/aerotrace
+```
+
+실제 결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+delivery_failure_rc=2
+pending_after_failure=1
+receipts_after_failure=0
+```
+
+생성된 실제 pending event:
+
+```text
+1787182663140772001-653546
+```
+
+### 실제 시간 경과에 따른 상태 전이
+
+동일 event를 유지한 상태에서 실제 시간이 흐르도록 하고 age를 연속 측정했다.
+
+초기:
+
+```text
+oldest_pending_age_sec=5.853
+status=OK
+initial_rc=0
+```
+
+시간 경과 후:
+
+```text
+oldest_pending_age_sec=17.889
+status=WARNING
+warning_rc=1
+```
+
+추가 시간 경과 후:
+
+```text
+oldest_pending_age_sec=31.927
+status=CRITICAL
+critical_rc=2
+```
+
+검증:
+
+```text
+actual_pending_age_transition=PASS
+```
+
+세 시점 모두 동일 event ID를 유지했다.
+
+```text
+event_id=1787182663140772001-653546
+```
+
+최종 상태:
+
+```text
+final_pending=1
+final_receipts=0
+pending_event_identity_preserved=PASS
+```
+
+### 테스트 실패 원인 분석 경험
+
+첫 번째 상태 전이 실험에서는 baseline age가:
+
+```text
+23.407s
+```
+
+였고 WARNING threshold를:
+
+```text
+33.407s
+```
+
+로 설정했다.
+
+하지만 사람이 명령을 입력하는 사이 시간이 지나 최초 검사 값이:
+
+```text
+33.408s
+```
+
+가 되어 즉시 WARNING으로 진입했다.
+
+이 결과를 checker 버그로 수정하지 않고 실제 수치를 비교해 테스트 자체의 timing race임을 확인했다.
+
+이후 fresh event를 만들고 전체 상태 전이를 하나의 연속 shell 실행으로 묶어 사람의 입력 시간을 제거했다.
+
+이를 통해:
+
+```text
+OK → WARNING → CRITICAL
+```
+
+상태 전이를 안정적으로 재현했다.
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 다음 운영 관점을 직접 다뤘다.
+
+```text
+queue depth와 queue age의 차이
+oldest pending age
+event timestamp와 filesystem mtime의 차이
+threshold severity aggregation
+UNKNOWN 상태와 monitoring failure
+실제 장애 지속에 따른 상태 악화
+운영 threshold와 테스트 threshold의 분리
+시간 의존 테스트의 race condition
+측정 결과를 기반으로 한 테스트 원인 분석
+```
+
+특히 단순히 "pending file이 있다"는 사실보다 oldest pending age가 notification 장애 지속 정도를 파악하는 데 더 직접적인 지표가 될 수 있음을 실제 데이터로 확인했다.
+
+### 보존할 로그와 증거
+
+다음 결과는 포트폴리오와 기술 블로그 자료로 보존한다.
+
+```text
+outbox_observability=PASS
+
+pending_events=2
+pending_bytes=585
+oldest_pending_age_sec=94.694
+
+broken_event_rc=3
+outbox_path_error_rc=3
+
+count_warning_rc=1
+count_critical_rc=2
+
+age_warning_rc=1
+age_critical_rc=2
+combined_status_rc=2
+
+delivery_failure_rc=2
+pending_after_failure=1
+receipts_after_failure=0
+
+baseline_age=5.792
+warn_age=15.792
+critical_age=30.792
+
+initial_age=5.853
+warning_age=17.889
+critical_age=31.927
+
+actual_pending_age_transition=PASS
+pending_event_identity_preserved=PASS
+
+final_pending=1
+final_receipts=0
+```
+
+### 이력서 성과 문장 초안
+
+- Webhook 장애 장기화 시 알림 유실 여부뿐 아니라 미전송 Outbox의 pending 수, 저장량, oldest event age를 관측하는 checker를 구현하고 실제 connection failure 상태에서 동일 event의 age가 `5.853s → 17.889s → 31.927s`로 증가하며 `OK → WARNING → CRITICAL`로 전이되는 과정을 검증
+- 운영 임계값을 임의로 고정하지 않고 pending count와 oldest age threshold를 외부 설정으로 분리해 실제 장애 데이터 측정 후 정책을 결정할 수 있는 notification monitoring 구조를 설계
+- 시간 기반 상태 전이 테스트에서 명령 입력 지연으로 threshold가 먼저 초과되는 문제를 측정값으로 원인 분석하고, fresh event와 연속 실행 방식으로 테스트를 재설계해 안정적으로 상태 전이를 재현
+
+현재 테스트 threshold를 실제 production SLA처럼 표현하지 않는다.
+
+### 예상 면접 질문
+
+```text
+왜 queue count만 보지 않고 oldest age도 보는가?
+
+왜 filesystem mtime 대신 evaluated_at을 사용하는가?
+
+pending event가 하나뿐인데 CRITICAL이 될 수 있는 이유는 무엇인가?
+
+count WARNING, age CRITICAL이면 전체 상태는 어떻게 결정하는가?
+
+왜 production threshold를 지금 정하지 않았는가?
+
+모니터링 대상 JSON 자체가 손상되면 어떤 상태를 반환하는가?
+
+Outbox oldest age와 실제 transport failure duration은 항상 같은가?
+
+첫 번째 상태 전이 테스트가 실패한 이유는 무엇이었는가?
+
+시간 기반 테스트를 어떻게 안정화했는가?
+
+장애가 복구된 뒤 이 상태는 어떻게 정상화되어야 하는가?
+```
+
+### 블로그 소재
+
+제목 후보:
+
+```text
+Webhook 장애는 몇 초째 지속되고 있을까?
+Notification Outbox의 Depth와 Age를 함께 관측한 이유
+```
+
+또는:
+
+```text
+시간 기반 모니터링 테스트가 1ms 차이로 실패한 이유와 재현 가능한 테스트로 바꾼 과정
+```
+
+글의 핵심 흐름:
+
+```text
+1. Webhook retry만으로 부족했던 이유
+2. Pending count만 봤을 때의 한계
+3. Oldest pending age 도입
+4. evaluated_at과 filesystem mtime 비교
+5. Count / Age threshold 설계
+6. UNKNOWN 상태가 필요한 이유
+7. 실제 connection refused 장애 생성
+8. 동일 event의 age 증가 측정
+9. OK → WARNING → CRITICAL 전이
+10. 첫 테스트의 timing race
+11. 테스트 재설계 과정
+12. Production threshold를 아직 정하지 않은 이유
+```
+
+### 다음 한 단계 높은 과제
+
+Outbox age는 "미전송 event가 얼마나 오래됐는가"를 보여주지만 transport 자체의 연속 실패 횟수와 최초 실패 시각을 직접 기록하지는 않는다.
+
+다음 단계에서는 notification adapter에 persistent failure state를 추가해 다음 정보를 기록한다.
+
+```text
+first_failed_at
+last_failed_at
+failure_count
+failure_kind
+failed_event_id
+```
+
+성공 시 이 상태를 어떻게 초기화하거나 보존할지도 함께 검증한다.
+
+이를 통해 다음 두 개념을 분리해서 관찰할 수 있게 한다.
+
+```text
+oldest pending age
+vs
+actual transport failure duration
+```
+
+---
+
+### Portfolio Checkpoint — Notification Transport 장애 상태 영속화와 Crash-window 복구
+
+Webhook notification의 미전송 event age뿐 아니라 실제 transport 장애가 언제 시작됐고 몇 번 연속 실패했는지 추적하기 위해 persistent failure state를 구현하고 실제 network/filesystem failure를 조합해 복구 semantics를 검증했다.
+
+### 구현한 Persistent Failure State
+
+현재 상태:
+
+```text
+failure_state_schema_version
+transport
+failed_event_id
+failure_kind
+failure_reason
+first_failed_at
+last_failed_at
+failure_count
+```
+
+을 저장한다.
+
+Failure state는 webhook transport에서 optional로 활성화할 수 있다.
+
+### 연속 장애 추적 실험
+
+사용하지 않는 localhost port에 webhook을 전송해 connection refused를 발생시켰다.
+
+첫 실패:
+
+```text
+failure_count=1
+failure_kind=retryable
+failure_reason=connection_error
+first_failed_at=2026-08-20T00:25:34+00:00
+last_failed_at=2026-08-20T00:25:34+00:00
+```
+
+검증:
+
+```text
+failure_state_first_attempt=PASS
+```
+
+동일 event 두 번째 실패:
+
+```text
+failure_count=2
+first_failed_at=2026-08-20T00:25:34+00:00
+last_failed_at=2026-08-20T00:25:49+00:00
+```
+
+검증:
+
+```text
+failure_state_second_attempt=PASS
+```
+
+이를 통해 최초 장애 시각과 최근 장애 시각을 분리해 추적할 수 있음을 확인했다.
+
+### Permanent Failure 구조화
+
+HTTP 400을 실제 서버에서 반환하도록 했다.
+
+결과:
+
+```text
+http_400_failure_rc=5
+failure_count=1
+failure_kind=permanent
+failure_reason=http_400
+```
+
+검증:
+
+```text
+permanent_failure_state=PASS
+```
+
+따라서 retryable/permanent를 로그 문자열이 아닌 구조화된 상태로 저장할 수 있게 했다.
+
+### 성공 Recovery
+
+연속 failure 이후 HTTP 204를 반환하는 local server로 동일 pending event를 성공시켰다.
+
+결과:
+
+```text
+failure_state_cleared=true
+delivery_result=DELIVERED
+remaining_events=0
+recovery_rc=0
+
+failure_state_removed=PASS
+pending_after_recovery=0
+receipts_after_recovery=1
+```
+
+현재 연속 장애가 끝나면 failure state를 제거하는 구조를 검증했다.
+
+### 성공 후 내부 상태 정리 실패 발견
+
+초기 구현 검토 중 다음 crash-window를 발견했다.
+
+```text
+HTTP 성공
+→ receipt 저장
+→ pending 삭제
+→ failure state 삭제 실패
+```
+
+이 경우 pending이 이미 없어 stale failure state만 남을 수 있었다.
+
+이를 방지하기 위해 성공 finalization 순서를 수정했다.
+
+```text
+HTTP 성공
+→ receipt 저장
+→ failure state 삭제
+→ pending ACK
+```
+
+### Filesystem Permission Failure 실험
+
+Failure state directory를 read/execute-only로 만들어 state unlink가 실패하도록 했다.
+
+```text
+chmod 500 <state-directory>
+```
+
+Receiver는 HTTP 204를 반환했지만 failure state clear는 permission denied로 실패했다.
+
+결과:
+
+```text
+clear_failure_rc=4
+
+pending_after_clear_failure=1
+receipts_after_clear_failure=1
+failure_state_after_clear_failure=1
+```
+
+즉 외부 notification 성공 증거인 receipt는 보존하면서 pending ACK를 하지 않아 복구 가능한 상태를 유지했다.
+
+### Duplicate HTTP Delivery 없는 Recovery
+
+위 실패 상태에서 HTTP server를 완전히 종료했다.
+
+서버가 없으므로 network 요청을 다시 실행했다면 connection refused가 발생해야 했다.
+
+하지만 adapter는 기존 receipt를 발견했다.
+
+결과:
+
+```text
+failure_state_cleared=true
+delivery_result=ACK_EXISTING
+ack_existing_rc=0
+```
+
+최종:
+
+```text
+final_pending=0
+final_receipts=1
+final_failure_state=0
+```
+
+즉 external delivery 성공 후 local bookkeeping 실패가 발생하더라도 receipt 기반으로 HTTP를 재전송하지 않고 복구하는 경로를 실제로 검증했다.
+
+### 손상 State 방어
+
+Failure state를:
+
+```text
+{broken json
+```
+
+으로 손상시켰다.
+
+실행 결과:
+
+```text
+corrupt_failure_state_rc=4
+```
+
+그리고 실행 전후 SHA-256 값이 동일했다.
+
+```text
+c3e7d1b00a65589b59f816c0b0b668d795a3c28123697d5ab9555bdb8aa04604
+```
+
+검증:
+
+```text
+corrupt_state_preserved=PASS
+```
+
+따라서 손상된 운영 상태를 조용히 덮어써 장애 정보를 숨기지 않고 명시적으로 실패하도록 했다.
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 다음 개념을 실제 코드와 failure injection으로 다뤘다.
+
+```text
+persistent failure state
+retryable vs permanent failure
+structured failure reason
+first failure timestamp
+last failure timestamp
+consecutive failure count
+durable state write
+file fsync
+directory fsync
+atomic replace
+success finalization ordering
+partial success
+crash-window
+receipt-based recovery
+idempotent ACK
+filesystem permission failure injection
+corrupted state detection
+```
+
+특히 단순 HTTP 오류 처리보다 외부 side effect와 로컬 상태 변경 사이에서 어느 순서로 durable state를 남겨야 복구 가능한지를 직접 검증했다.
+
+### 보존할 로그와 증거
+
+```text
+failure_state_first_attempt=PASS
+
+failure_count=1
+failure_kind=retryable
+failure_reason=connection_error
+
+failure_state_second_attempt=PASS
+
+failure_count=2
+first_failed_at=2026-08-20T00:25:34+00:00
+last_failed_at=2026-08-20T00:25:49+00:00
+
+failure_state_removed=PASS
+pending_after_recovery=0
+receipts_after_recovery=1
+
+clear_failure_rc=4
+
+pending_after_clear_failure=1
+receipts_after_clear_failure=1
+failure_state_after_clear_failure=1
+
+delivery_result=ACK_EXISTING
+ack_existing_rc=0
+
+final_pending=0
+final_receipts=1
+final_failure_state=0
+
+http_400_failure_rc=5
+failure_kind=permanent
+failure_reason=http_400
+permanent_failure_state=PASS
+
+corrupt_failure_state_rc=4
+corrupt_state_preserved=PASS
+corrupt_pending_after=1
+corrupt_receipts_after=0
+```
+
+### 이력서 성과 문장 초안
+
+- Webhook notification의 연속 transport 장애를 추적하기 위해 `first_failed_at`, `last_failed_at`, `failure_count`, 구조화된 failure reason을 persistent state로 저장하고 connection failure 및 HTTP 400 시나리오를 실제 서버로 검증
+- 외부 Webhook 전달 성공 후 로컬 failure-state 정리가 실패하는 partial-success 시나리오를 filesystem permission failure로 재현하고, `receipt → failure-state clear → pending ACK` 순서로 finalization을 재설계해 receipt 기반 `ACK_EXISTING` 복구 시 HTTP 중복 전송을 방지
+- 손상된 persistent failure state를 hash 비교로 검증해 자동 덮어쓰기 대신 delivery 이전에 `rc=4`로 중단하도록 설계하여 운영 상태 손실을 방지
+
+실제 production systemd 배포나 외부 SaaS webhook provider까지 완료된 것으로 표현하지 않는다.
+
+### 예상 면접 질문
+
+```text
+Outbox oldest age와 transport failure duration은 왜 다른가?
+
+왜 failure_count를 state에 저장하는가?
+
+왜 exception 문자열을 파싱하지 않고 failure_reason을 구조화했는가?
+
+왜 webhook URL을 failure state에 저장하지 않는가?
+
+HTTP 성공 후 failure state를 언제 삭제해야 하는가?
+
+왜 receipt보다 먼저 failure state를 삭제하지 않는가?
+
+왜 pending을 failure state보다 먼저 삭제하면 위험한가?
+
+ACK_EXISTING은 어떤 장애를 복구하는가?
+
+HTTP server를 종료했는데도 ACK_EXISTING이 성공한 이유는 무엇인가?
+
+failure state가 손상됐을 때 왜 자동 초기화하지 않았는가?
+
+이 구조가 exactly-once delivery를 보장하는가?
+```
+
+### 블로그 소재
+
+제목 후보:
+
+```text
+Webhook은 성공했는데 로컬 상태 저장이 실패한다면?
+Receipt와 ACK 순서를 장애 주입으로 검증한 과정
+```
+
+핵심 구성:
+
+```text
+1. Outbox age만으로 부족했던 이유
+2. Persistent failure state 도입
+3. 연속 실패 count와 timestamps
+4. Retryable / Permanent 구조화
+5. HTTP 성공 후 state clear 순서
+6. Permission denied 장애 주입
+7. Receipt는 있는데 pending도 남은 상태
+8. Server를 내리고 재시도
+9. ACK_EXISTING으로 network 호출 없이 복구
+10. exactly-once와 idempotency의 차이
+```
+
+### 다음 한 단계 높은 과제
+
+Persistent failure state는 현재 장애 정보를 저장할 수 있지만 운영자가 이를 직접 상태로 평가하는 checker는 아직 없다.
+
+다음 단계에서는 다음 값을 읽어 상태를 계산할 수 있도록 한다.
+
+```text
+failure_count
+first_failed_at
+last_failed_at
+failure_kind
+failure_reason
+failure_duration
+```
+
+그리고 Outbox checker의:
+
+```text
+oldest_pending_age
+```
+
+와 함께 비교해 다음 두 상태를 분리해서 관측한다.
+
+```text
+notification backlog age
+vs
+actual webhook transport failure duration
+```
+
+---
+
+### Portfolio Checkpoint — Webhook 장애 지표를 실제 반복 실패로 분리 측정
+
+Persistent webhook failure state를 구현한 뒤 단순히 값을 저장하는 것에서 끝내지 않고, 운영자가 현재 장애 상태를 평가할 수 있는 checker를 추가하고 실제 connection failure를 반복 발생시켜 각 지표의 의미를 분리했다.
+
+### 구현한 Failure State Checker
+
+추가 파일:
+
+```text
+scripts/check-notification-failure-state.py
+```
+
+관측값:
+
+```text
+active_failure
+failure_kind
+failure_reason
+failure_count
+failure_duration_sec
+last_failure_age_sec
+first_failed_at
+last_failed_at
+```
+
+상태:
+
+```text
+OK
+WARNING
+CRITICAL
+UNKNOWN
+```
+
+을 제공한다.
+
+### 실제 Failure State 관측
+
+실제 connection refused를 발생시켰다.
+
+첫 관측:
+
+```text
+failure_count=1
+failure_duration_sec=6.718
+last_failure_age_sec=6.718
+persistent_failure_observability=PASS
+```
+
+동일 event에 다시 실패를 발생시킨 뒤:
+
+```text
+failure_count=2
+failure_duration_sec=17.820
+last_failure_age_sec=1.820
+persistent_failure_retry_observability=PASS
+```
+
+을 확인했다.
+
+이를 통해:
+
+```text
+failure_duration
+→ 최초 실패 이후 전체 장애 시간
+
+last_failure_age
+→ 가장 최근 실패 이후 경과 시간
+```
+
+이 서로 다른 지표임을 실제로 확인했다.
+
+### Retryable Severity Threshold
+
+Retryable failure는 threshold가 없으면 active failure가 있어도 관측 전용으로 `OK`를 유지한다.
+
+실제:
+
+```text
+failure_count=2
+failure_duration_sec=201.062
+active_failure=true
+status=OK
+default_retryable_rc=0
+```
+
+을 확인했다.
+
+Count threshold:
+
+```text
+failure_count=2
+warn=2
+critical=3
+→ WARNING / rc=1
+```
+
+```text
+failure_count=2
+warn=1
+critical=2
+→ CRITICAL / rc=2
+```
+
+Duration threshold도:
+
+```text
+WARNING / rc=1
+CRITICAL / rc=2
+```
+
+전이를 실제로 검증했다.
+
+### Permanent Failure 정책
+
+Permanent failure는 threshold를 기다리지 않고 즉시 CRITICAL로 처리했다.
+
+검증 fixture:
+
+```text
+failure_kind=permanent
+failure_reason=http_400
+failure_count=1
+failure_duration_sec=9.958
+```
+
+결과:
+
+```text
+failure_kind_status=CRITICAL
+status=CRITICAL
+permanent_failure_checker_rc=2
+```
+
+### 잘못된 Monitoring 설정 방어
+
+다음 잘못된 threshold를 모두 UNKNOWN으로 검출했다.
+
+```text
+warn-count >= critical-count
+warn-duration >= critical-duration
+threshold <= 0
+```
+
+또 failure state 자체가 존재하지 않아도 checker 설정 오류를 먼저 검증했다.
+
+```text
+status=UNKNOWN
+bad_config_without_state_rc=3
+```
+
+따라서 모니터링 설정 오류를 정상 상태로 숨기지 않는 구조를 검증했다.
+
+### 실제 반복 장애 실험
+
+동일 notification event에 대해 실제 connection refused를 4회 반복했다.
+
+Event:
+
+```text
+1787210007147775125-1271557
+```
+
+측정:
+
+```text
+Attempt 1
+failure_count=1
+failure_duration_sec=0.136
+last_failure_age_sec=0.136
+oldest_pending_age_sec=5.168
+
+Attempt 2
+failure_count=2
+failure_duration_sec=4.285
+last_failure_age_sec=0.285
+oldest_pending_age_sec=9.318
+
+Attempt 3
+failure_count=3
+failure_duration_sec=8.434
+last_failure_age_sec=0.434
+oldest_pending_age_sec=13.467
+
+Attempt 4
+failure_count=4
+failure_duration_sec=12.586
+last_failure_age_sec=0.586
+oldest_pending_age_sec=17.618
+```
+
+자동 검증:
+
+```text
+repeated_failure_measurement=PASS
+```
+
+네 번 모두:
+
+```text
+pending_events=1
+```
+
+이었고 동일 event ID를 유지했다.
+
+### Backlog Age와 Failure Duration의 차이
+
+실제 측정에서:
+
+```text
+oldest_pending_age
+-
+failure_duration
+```
+
+차이가:
+
+```text
+5.032 ~ 5.033초
+```
+
+로 거의 일정했다.
+
+이는 notification event가 생성된 뒤 실제 첫 webhook 전송 실패가 발생하기까지의 시간이다.
+
+따라서 다음 두 개념을 실제 데이터로 분리했다.
+
+```text
+oldest_pending_age
+→ 사용자가 받아야 할 notification이 전체적으로 얼마나 지연됐는가
+
+failure_duration
+→ webhook transport 자체가 실제로 얼마나 오래 실패했는가
+```
+
+### Failure Count에 대한 운영 판단
+
+실험에서는 retry 간격이 약 4초였으므로:
+
+```text
+failure_count
+1 → 2 → 3 → 4
+```
+
+로 증가했다.
+
+하지만 count는 retry cadence에 의존한다.
+
+같은 1분 장애도:
+
+```text
+5초 retry
+→ 약 12회
+
+30초 retry
+→ 약 2회
+```
+
+가 될 수 있다.
+
+따라서 단순 count를 장애 severity의 주 기준으로 삼는 것보다 실제 시간인 `failure_duration_sec`를 주 기준으로 삼는 것이 더 안정적이라는 판단을 얻었다.
+
+### Last Failure Age에 대한 운영 판단
+
+각 retry 직후:
+
+```text
+0.136
+0.285
+0.434
+0.586
+```
+
+으로 낮게 유지됐다.
+
+Retry를 멈춘 이후에는:
+
+```text
+last_failure_age_sec=18.185
+```
+
+까지 증가했다.
+
+따라서 `last_failure_age`는 장애 심각도 자체보다:
+
+```text
+retry loop가 최근에도 실제로 실행되고 있는가
+```
+
+를 관찰하는 liveness 지표 후보로 볼 수 있다.
+
+### 현재 지표 역할
+
+이번 실험을 통해 다음 운영 역할을 정리했다.
+
+```text
+failure_kind
+→ 장애 유형
+
+permanent
+→ 즉시 CRITICAL
+
+failure_duration
+→ retryable 장애 severity의 주 기준
+
+failure_count
+→ retry 횟수 및 보조 진단 정보
+
+last_failure_age
+→ retry loop liveness 후보
+
+oldest_pending_age
+→ notification 사용자 영향 / backlog age
+
+pending_events
+→ backlog 크기
+```
+
+### 최종 실험 상태
+
+Retry를 중단한 뒤 실제 상태:
+
+```text
+failure_count=4
+failure_duration_sec=30.185
+last_failure_age_sec=18.185
+
+pending_events=1
+oldest_pending_age_sec=35.218
+
+final_pending=1
+final_receipts=0
+```
+
+아직 webhook 전달이 성공하지 않았으므로 pending과 active failure가 남아 있는 것이 정상이다.
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 다음 운영 개념을 실제 failure injection과 측정으로 경험했다.
+
+```text
+failure duration
+retry count
+retry cadence
+last-attempt age
+backlog age
+user impact와 transport health의 차이
+monitoring configuration validation
+severity aggregation
+permanent failure policy
+retry loop liveness
+실제 측정을 바탕으로 한 alert 기준 설계
+```
+
+특히 비슷해 보이는 여러 시간 지표를 임의로 하나로 합치지 않고 각각 어떤 운영 질문에 답하는지 실제 수치로 검증했다.
+
+### 보존할 증거
+
+```text
+persistent_failure_observability=PASS
+
+failure_duration_sec=6.718
+last_failure_age_sec=6.718
+
+persistent_failure_retry_observability=PASS
+
+failure_count=2
+failure_duration_sec=17.820
+last_failure_age_sec=1.820
+
+failure_count_warning_rc=1
+failure_count_critical_rc=2
+
+failure_duration_warning_rc=1
+failure_duration_critical_rc=2
+
+permanent_failure_checker_rc=2
+
+bad_failure_count_threshold_rc=3
+bad_failure_duration_threshold_rc=3
+zero_failure_threshold_rc=3
+bad_config_without_state_rc=3
+corrupt_threshold_regression_rc=3
+
+event_id=1787210007147775125-1271557
+
+attempt1:
+failure_count=1
+failure_duration=0.136
+last_failure_age=0.136
+oldest_pending_age=5.168
+
+attempt2:
+failure_count=2
+failure_duration=4.285
+last_failure_age=0.285
+oldest_pending_age=9.318
+
+attempt3:
+failure_count=3
+failure_duration=8.434
+last_failure_age=0.434
+oldest_pending_age=13.467
+
+attempt4:
+failure_count=4
+failure_duration=12.586
+last_failure_age=0.586
+oldest_pending_age=17.618
+
+backlog_minus_failure_min_sec=5.032
+backlog_minus_failure_max_sec=5.033
+
+repeated_failure_measurement=PASS
+
+final failure_count=4
+final failure_duration_sec=30.185
+final last_failure_age_sec=18.185
+final oldest_pending_age_sec=35.218
+final_pending=1
+final_receipts=0
+```
+
+### 이력서 성과 문장 초안
+
+- Webhook transport 장애를 `failure duration`, `retry count`, `last retry age`, `notification backlog age`로 분리 관측하는 checker를 구현하고 실제 connection failure 4회 실험을 통해 동일 event에서 `failure_count 1→4`, `failure_duration 0.136s→12.586s`, `oldest pending age 5.168s→17.618s` 변화를 측정
+- Retry 횟수가 retry cadence에 종속된다는 점을 실제 장애 실험으로 검증하고, retryable alert severity는 `failure_duration`을 주 기준으로, `failure_count`는 보조 진단값, `last_failure_age`는 retry-loop liveness 지표로 분리하는 운영 정책을 설계
+- Notification event 생성부터 첫 transport failure까지 약 `5.032~5.033초` 차이를 실측해 사용자 관점의 backlog age와 transport 장애 지속시간을 구분하고, permanent failure는 threshold 없이 즉시 CRITICAL로 평가하도록 구성
+
+Production alert threshold 숫자가 실제 운영에서 확정된 것처럼 표현하지 않는다.
+
+### 예상 면접 질문
+
+```text
+failure_duration과 oldest_pending_age는 왜 다른가?
+
+failure_count를 주 alert 기준으로 사용하지 않은 이유는 무엇인가?
+
+retry cadence가 바뀌면 failure_count는 어떻게 달라지는가?
+
+last_failure_age는 어떤 운영 문제를 발견하는 데 사용할 수 있는가?
+
+active retryable failure인데 status=OK일 수 있는 이유는 무엇인가?
+
+왜 permanent failure는 즉시 CRITICAL인가?
+
+state 파일이 없는데 checker 설정이 잘못된 경우 왜 UNKNOWN이어야 하는가?
+
+사용자 영향과 transport health를 각각 어떤 지표로 보는가?
+
+Production WARNING/CRITICAL 값을 아직 정하지 않은 이유는 무엇인가?
+```
+
+### 블로그 소재
+
+제목 후보:
+
+```text
+Webhook 장애를 몇 번 실패했는지가 아니라 얼마나 오래 실패했는지 봐야 하는 이유
+```
+
+또는:
+
+```text
+Retry Count, Failure Duration, Queue Age는 같은 장애 지표가 아니다
+```
+
+구성:
+
+```text
+1. Persistent failure state 도입
+2. Failure checker 구현
+3. Count / Duration threshold
+4. Permanent 즉시 CRITICAL 정책
+5. Connection refused 4회 반복 실험
+6. Failure count 증가
+7. Failure duration 증가
+8. Last failure age의 의미
+9. Outbox age와 약 5초 차이가 난 이유
+10. Retry cadence가 count를 왜곡하는 방식
+11. Production threshold를 아직 정하지 않은 이유
+12. 실제 운영에서 사용할 지표 역할
+```
+
+### 다음 한 단계 높은 과제
+
+현재 checker와 threshold 구조는 준비됐지만 실제 production retry cadence와 alert threshold 숫자는 아직 없다.
+
+다음 단계에서는 systemd notification 실행 경로에 다음 요소를 연결하는 것을 검토한다.
+
+```text
+persistent failure state path
+failure state checker
+notification outbox checker
+실제 retry cadence
+```
+
+그 후 의도적인 장시간 webhook 장애를 만들어 실제 production 실행 주기에서 수치를 측정하고 WARNING/CRITICAL 기준을 결정할 수 있다.
+
+---
+
+### Portfolio Checkpoint — Production systemd Notification Outbox 연결
+
+개별적으로 구현했던 Collector queue evaluator, durable notification Outbox, notification adapter, delivery receipt를 실제 production systemd 실행 경로로 연결하고 실제 Collector 장애/복구를 통해 end-to-end로 검증했다.
+
+### 구현한 운영 구조
+
+```text
+Collector queue checker
+→ 5초 systemd evaluator
+→ durable notification Outbox
+→ 5초 notification processor timer
+→ adapter
+→ receipt
+→ pending ACK
+```
+
+운영 상태는:
+
+```text
+/var/lib/aerotrace-monitoring
+```
+
+StateDirectory 아래에서 관리하도록 구성했다.
+
+### 실제 장애 검증
+
+OpenTelemetry Collector를 실제로 중지했다.
+
+Evaluator:
+
+```text
+16:41:43
+OK → UNKNOWN
+event=ALERT
+```
+
+Notification processor:
+
+```text
+16:41:49
+delivery_result=DELIVERED
+event=ALERT
+remaining_events=0
+```
+
+검증:
+
+```text
+systemd_alert_receipt=PASS
+```
+
+이번 측정에서는 evaluator ALERT 생성부터 receipt delivery까지 약 6초가 걸렸다.
+
+### 실제 복구 검증
+
+Collector를 다시 시작했다.
+
+Evaluator:
+
+```text
+16:42:13
+UNKNOWN → OK
+event=RECOVERY
+```
+
+Notification processor:
+
+```text
+16:42:19
+delivery_result=DELIVERED
+event=RECOVERY
+remaining_events=0
+```
+
+검증:
+
+```text
+systemd_recovery_receipt=PASS
+```
+
+이번 측정에서도 약 6초가 걸렸다.
+
+### 테스트 종료 상태
+
+```text
+production_receipts=2
+pending_events=0
+```
+
+두 systemd timer 모두:
+
+```text
+active (waiting)
+```
+
+상태로 유지됐다.
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 단순 script 실행이 아닌 실제 Linux 서비스 운영 경로를 구성하고 검증했다.
+
+```text
+systemd oneshot service
+systemd timer
+StateDirectory
+service sandbox
+durable Outbox
+independent consumer timer
+ALERT / RECOVERY transition
+실제 프로세스 장애 주입
+receipt 기반 전달 확인
+운영 경로와 외부 transport 문제의 분리
+```
+
+특히 Webhook부터 바로 붙이지 않고 local-file transport로 systemd 실행 경로 자체를 먼저 검증하여 infrastructure wiring 문제와 external network 문제를 분리했다.
+
+### 보존할 증거
+
+```text
+systemd_alert_receipt=PASS
+
+event_id=1787211703960728995-1310439
+event=ALERT
+current_status=UNKNOWN
+
+ALERT evaluator timestamp=16:41:43
+ALERT delivery timestamp=16:41:49
+
+systemd_recovery_receipt=PASS
+
+event_id=1787211733960954909-1311457
+event=RECOVERY
+previous_status=UNKNOWN
+current_status=OK
+
+RECOVERY evaluator timestamp=16:42:13
+RECOVERY delivery timestamp=16:42:19
+
+pending_events=0
+production_receipts=2
+```
+
+### 이력서 성과 문장 초안
+
+- Collector 장애 감지 evaluator와 durable Notification Outbox를 독립적인 5초 systemd timer 기반 producer/consumer 구조로 연결하고 실제 Collector stop/start 장애 주입을 통해 ALERT·RECOVERY 생성, receipt 저장, pending ACK까지 end-to-end 검증
+- 외부 Webhook 장애와 systemd 실행 문제를 분리하기 위해 local-file transport를 운영 기준선으로 먼저 구성하고, 실제 테스트에서 ALERT와 RECOVERY가 각각 event 생성 후 약 6초 내 consumer에 처리되며 최종 Outbox pending 0을 확인
+
+현재 local-file transport가 실제 사용자 notification까지 제공하는 것처럼 표현하지 않는다.
+
+### 예상 면접 질문
+
+```text
+왜 evaluator가 직접 Webhook을 호출하지 않고 Outbox를 거치는가?
+
+왜 notification processor를 별도 timer로 분리했는가?
+
+systemd oneshot service가 inactive(dead)인데 정상인 이유는 무엇인가?
+
+왜 Webhook보다 local-file transport를 먼저 production systemd에 연결했는가?
+
+StateDirectory는 어떤 문제를 해결하는가?
+
+Evaluator와 notification consumer가 각각 5초 timer일 때 notification latency는 어떻게 결정되는가?
+
+Consumer가 중지되면 event는 어디에 남는가?
+
+Collector 장애와 복구를 어떻게 실제로 검증했는가?
+```
+
+### 다음 한 단계 높은 과제
+
+현재 systemd pipeline 자체는 검증됐다.
+
+다음에는 transport만 실제 Webhook으로 변경하고:
+
+```text
+Webhook configuration 분리
+persistent failure state
+retryable failure
+permanent failure
+recovery
+```
+
+를 production systemd 실행 경로에서 검증한다.
+
+---
+
+### Portfolio Checkpoint — Production Webhook 장애 자동 복구 검증
+
+Notification Outbox와 Webhook adapter를 실제 systemd timer 실행 경로에 연결하고 Webhook receiver 장애를 직접 주입하여 persistent failure state, 반복 retry, 동일 event 보존, transport 자동 복구를 end-to-end로 검증했다.
+
+### 실제 운영 장애 실험
+
+정상 상태:
+
+```text
+pending_events=0
+active_failure=false
+```
+
+에서 Webhook receiver를 완전히 종료한 뒤 실제 OpenTelemetry Collector를 중지했다.
+
+결과:
+
+```text
+failure_kind=retryable
+failure_reason=connection_error
+pending_events=1
+persistent failure state 생성
+```
+
+Event:
+
+```text
+1787212535955638444-1330962
+```
+
+가 failure state와 Outbox에 동일하게 보존됨을 확인했다.
+
+```text
+failure_pending_identity=PASS
+```
+
+### systemd Retry 측정
+
+실제 systemd timer가 수동 개입 없이 계속 retry했다.
+
+```text
+failure_count 2 → 4
+```
+
+를 12초 측정 구간에서 확인했고 journal에서는:
+
+```text
+2 → 3 → 4 → 5 → 6
+```
+
+까지 증가했다.
+
+검증:
+
+```text
+systemd_webhook_retry=PASS
+```
+
+### 설정값과 실제 Retry Cadence 차이
+
+Timer는:
+
+```text
+OnUnitInactiveSec=5s
+```
+
+로 설정돼 있지만 실제 실패 시도 timestamp는:
+
+```text
+16:55:47
+16:55:53
+16:55:59
+16:56:05
+16:56:11
+```
+
+로 약 6초 간격이었다.
+
+이를 통해 monitoring threshold나 failure count를 계산할 때 설정값만 보는 것이 아니라 실제 scheduler/service 실행시간까지 측정해야 한다는 운영 경험을 얻었다.
+
+### 자동 복구
+
+Collector는 계속 중지된 상태로 유지하고 Webhook receiver만 복구했다.
+
+Adapter를 수동 실행하지 않았다.
+
+Systemd timer가 자동으로 기존 pending ALERT를 재전송했다.
+
+```text
+automatic_webhook_recovery=1
+systemd_failure_recovery_identity=PASS
+```
+
+복구된 event:
+
+```text
+1787212535955638444-1330962
+```
+
+는 장애 발생 당시 failure state와 Outbox에 저장된 동일 event였다.
+
+성공 후:
+
+```text
+pending_events=0
+active_failure=false
+failure_count=0
+```
+
+으로 자동 복구됐다.
+
+### 실제 장애 지속시간
+
+최초 transport failure:
+
+```text
+16:55:41 KST
+```
+
+복구 ALERT 수신:
+
+```text
+16:56:17.940 KST
+```
+
+으로 이번 실험에서는 약 37초의 실제 Webhook transport 장애를 유지한 뒤 자동 복구를 확인했다.
+
+### Collector 복구
+
+Transport가 정상화된 뒤 Collector를 시작했다.
+
+최종 RECOVERY도 자동 Webhook 전달됐다.
+
+```text
+final_recovery_delivered=1
+```
+
+최종:
+
+```text
+pending_events=0
+active_failure=false
+두 systemd timer active/waiting
+```
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 다음 운영 문제를 실제 failure injection으로 경험했다.
+
+```text
+systemd EnvironmentFile
+root-owned runtime secret/config
+network sandbox
+Webhook success path
+connection refused
+persistent transport failure state
+timer 기반 retry
+실제 retry cadence 측정
+event identity 보존
+transport-only recovery
+automatic retry recovery
+Outbox ACK
+failure-state cleanup
+ALERT / RECOVERY ordering
+```
+
+단순히 retry 코드를 작성한 것이 아니라 실제 Linux service scheduler에서 외부 transport를 중단하고 복구하면서 데이터와 상태가 어떻게 남는지를 검증했다.
+
+### 보존할 증거
+
+```text
+systemd_webhook_alert=PASS
+systemd_webhook_recovery=PASS
+
+production_failure_state_created=1
+
+failed_event_id=1787212535955638444-1330962
+failure_kind=retryable
+failure_reason=connection_error
+
+failure_count_before_wait=2
+failure_count_after_wait=4
+
+systemd_webhook_retry=PASS
+failure_pending_identity=PASS
+
+journal:
+failure_count=2
+failure_count=3
+failure_count=4
+failure_count=5
+failure_count=6
+
+receiver_recovered=1
+automatic_webhook_recovery=1
+
+systemd_failure_recovery_identity=PASS
+
+webhook_receipts_after_transport_recovery=3
+
+final_recovery_delivered=1
+
+final pending_events=0
+final active_failure=false
+```
+
+### 이력서 성과 문장 초안
+
+- systemd timer 기반 Notification Outbox Webhook consumer에 persistent failure state를 연결하고 실제 receiver connection failure를 약 37초간 주입하여 pending event 보존, `failure_count` 증가, 동일 event ID retry, receiver 복구 후 자동 전달과 state cleanup까지 end-to-end 검증
+- `OnUnitInactiveSec=5s` 설정 환경에서 실제 Webhook 실패 retry가 약 6초 간격으로 실행됨을 journal timestamp로 측정하여 설정값과 실제 scheduler cadence 차이를 확인하고 향후 alert threshold를 실측값 기반으로 결정할 근거 확보
+- 외부 delivery 실패 중 receipt를 생성하지 않고 Outbox event를 유지하며 transport 복구 후 동일 event ID를 자동 재전송하도록 구성해 notification 순서와 복구 가능성을 검증
+
+Exactly-once delivery를 구현한 것으로 표현하지 않는다. Timeout 같은 ambiguous delivery에서는 동일 event가 중복 전송될 수 있으므로 현재 구조는 event ID 기반 deduplication이 가능한 at-least-once 성격이다.
+
+### 예상 면접 질문
+
+```text
+Webhook이 죽었을 때 event는 어디에 남는가?
+
+systemd timer가 실패한 oneshot service를 다시 실행하는 것을 어떻게 검증했는가?
+
+OnUnitInactiveSec=5s인데 실제 retry가 약 6초였던 이유는 무엇인가?
+
+왜 failure count만으로 장애 duration을 판단하면 안 되는가?
+
+왜 Collector보다 Webhook transport를 먼저 복구했는가?
+
+Transport 복구 후 동일 event인지 어떻게 검증했는가?
+
+Connection refused 테스트가 exactly-once를 증명하지 못하는 이유는 무엇인가?
+
+HTTP timeout에서는 어떤 중복 문제가 생길 수 있는가?
+
+Permanent HTTP 400은 현재 timer 환경에서 어떻게 동작하며 무엇이 개선되어야 하는가?
+```
+
+### 블로그 소재
+
+제목 후보:
+
+```text
+5초 systemd Timer인데 왜 Webhook Retry는 6초마다 실행됐을까?
+```
+
+또는:
+
+```text
+Webhook을 37초 동안 끊어보고 Outbox가 실제로 복구되는지 검증했다
+```
+
+핵심 구성:
+
+```text
+1. Notification Outbox 구조
+2. systemd Webhook consumer
+3. Receiver 장애 주입
+4. Persistent failure state
+5. failure_count 증가
+6. 실제 retry cadence 측정
+7. 동일 event ID 보존
+8. Receiver만 먼저 복구
+9. systemd 자동 재전송
+10. Collector RECOVERY 전달
+11. exactly-once가 아닌 이유
+12. 남은 permanent failure / backoff 문제
+```
+
+---
+
+## Portfolio Checkpoint — Permanent Webhook Failure Latch
+
+### 직접 얻은 실무 경험
+
+- Retryable failure와 permanent failure에 서로 다른 재시도 정책을 적용했다.
+- Persistent failure-state를 단순 관측 자료가 아니라 process 재시작 이후에도 유지되는 delivery latch로 활용했다.
+- Receipt를 latch보다 먼저 확인하여 외부 전송 성공 후 내부 ACK가 중단되는 crash-window 복구를 보존했다.
+- 자동 재시도와 운영자 명시적 재시도를 분리했다.
+- HTTP 요청 횟수, failure count, pending, receipt, state 파일을 함께 측정하여 재전송 차단을 검증했다.
+- Local-file production 기준선을 유지한 상태에서 격리된 Webhook fixture로 변경을 검증했다.
+
+### 보존할 증거
+
+```text
+permanent_latch_no_resend=PASS
+actual_webhook_requests=1
+failure_count=1
+pending_events=1
+receipts=0
+
+explicit_retry_and_recovery=PASS
+actual_webhook_requests_total=3
+pending_events=0
+receipts=1
+failure_state_exists=False
+
+ack_existing_precedes_latch=PASS
+actual_webhook_requests=0
+
+retryable_automatic_retry=PASS
+retryable_automatic_recovery=PASS
+retryable_failure_count=1->2
+
+permanent_retry_configuration=PASS
+local_file_regression=PASS
+```
+
+추가로 보존할 자료:
+
+- 최초 HTTP 400과 후속 latch 실행 로그
+- 명시적 HTTP 400 재시도와 `failure_count=2`
+- HTTP 204 복구 시 receipt와 state 삭제 결과
+- ACK_EXISTING 실행 중 닫힌 endpoint를 호출하지 않은 결과
+- retryable connection refused의 `failure_count 1 → 2`
+- 변경 전후 Git diff
+
+### 이력서 성과 문장 초안
+
+- 재시도로 해결되지 않는 Webhook HTTP 4xx가 systemd 주기 실행마다 무한 재전송되는 문제를 persistent failure latch와 운영자 명시적 재시도로 차단하고, 동일 event의 adapter 실행 2회 중 실제 HTTP 요청이 1회만 발생함을 검증
+- Notification receipt를 permanent latch보다 우선 평가하도록 설계하여 외부 전송 성공 후 내부 ACK가 중단된 crash-window에서 추가 HTTP 요청 없이 state 정리와 pending ACK가 완료됨을 검증
+- Permanent failure 차단과 retryable 자동 복구를 분리하여 connection failure는 연속 재시도되고 HTTP 204 정상화 후 별도 override 없이 복구되는 동작을 검증
+
+### 블로그 주제
+
+```text
+HTTP 400을 6초마다 다시 보내던 알림 시스템에 Persistent Latch를 넣은 과정
+```
+
+핵심 구성:
+
+1. Retryable과 permanent를 분류하는 이유
+2. 단순 retry count 제한의 문제
+3. Pending 보존과 dead-letter 사이의 선택
+4. Failure-state를 latch로 재사용한 구조
+5. Receipt가 latch보다 먼저 실행돼야 하는 이유
+6. 운영자 명시적 재시도 설계
+7. 실제 HTTP 요청 수로 검증한 방법
+8. 남아 있는 timeout 중복과 dead-letter 과제
+
+### 예상 면접 질문
+
+- Permanent failure를 pending에서 바로 삭제하지 않은 이유는 무엇인가?
+- Latch를 receipt 확인보다 먼저 적용하면 어떤 장애가 생기는가?
+- `failure_count`를 timer 실행 횟수가 아닌 실제 요청 실패 횟수로 유지한 이유는 무엇인가?
+- Latched 실행에서 exit code 5를 유지한 이유는 무엇인가?
+- Dead-letter queue를 도입한다면 재처리와 보존 정책을 어떻게 설계할 것인가?
+- HTTP timeout에서 exactly-once가 불가능한 이유는 무엇인가?
+
+### 다음 한 단계 높은 과제
+
+- Permanent event quarantine/dead-letter lifecycle 설계
+- 운영자용 pending 조회와 안전한 재처리 도구
+- 실제 receiver를 사용하는 durable deduplication acceptance test
+- Production systemd timer에서 permanent HTTP 요청 수 고정 검증
+
+---
+
 ## PostgreSQL WAL checkpoint와 Telemetry 유실 분석 Portfolio Checkpoint
 
 ### 직접 얻은 실무 경험
@@ -2128,3 +5382,168 @@ TimescaleDB 컨테이너 재생성 전후 데이터:
 > 실제 telemetry 유실을 재현하고, 관측 지표의 의미를 재정의하고, benchmark 자체의 오류까지 수정한 뒤 PostgreSQL과 Collector 사이의 장애 연쇄를 반복 가능한 A/B 실험으로 해결했다.
 
 는 운영 경험이다.
+
+---
+
+## Portfolio Checkpoint — Durable Slack Notification Receiver
+
+### 직접 구현한 범위
+
+```text
+AeroTrace filesystem outbox
+-> HMAC-signed HTTPS
+-> Cloudflare Worker
+-> D1 durable event_id dedup
+-> Cloudflare Queue retry/DLQ
+-> Slack Incoming Webhook
+```
+
+Sender가 Slack을 직접 호출하게 만들지 않고 provider-neutral HTTP contract와 receiver-side state machine을 분리했다.
+
+핵심 구현:
+
+- Exact request body와 timestamp를 HMAC-SHA256으로 서명하고 ±300초 replay window에서 검증
+- D1 `event_id` primary key와 canonical payload hash로 new, duplicate, conflict를 원자적으로 구분
+- D1 insert와 Queue disk write가 완료된 뒤에만 HTTP 202 반환
+- Queue publish 실패 시 durable `accepted` row를 보존하고 sender retry로 복구
+- Slack 429 `Retry-After`, 408/5xx, network/timeout의 bounded retry와 DLQ exhaustion 상태 구현
+- Slack 성공 후 diagnostic payload redaction, hash와 delivery metadata 보존
+- Receiver 내부 Slack failure를 `/health` HTTP 503으로 노출해 UptimeRobot Free 5분 email fallback 연결점 제공
+- Sender와 receiver failure/retry budget을 분리한 초기 SLO와 runbook 작성
+
+### 검증 증거
+
+```text
+Python sender tests=10/10 PASS
+Node receiver tests=14/14 PASS
+Wrangler 4.125.0 bundle dry-run=PASS
+fresh local D1 migration=PASS
+npm audit vulnerabilities=0
+production runtime mutation=없음
+```
+
+### 장애 semantics에서 얻은 경험
+
+Receiver의 202는 Slack 표시 완료가 아니라 D1과 Queue의 durable acceptance다. 따라서 sender receipt와 Slack delivery timestamp를 같은 성공 시각으로 사용하지 않았다.
+
+다음 두 ambiguous window도 분리했다.
+
+```text
+Sender -> Worker timeout
+  D1 event_id duplicate로 side effect 재시작을 억제
+
+Worker -> Slack timeout 또는 success 후 D1 update 전 crash
+  Slack provider idempotency key가 없어 user-visible duplicate 가능
+```
+
+따라서 “exactly-once Slack notification”이라고 표현하지 않는다. 정확한 표현은 “durable receiver deduplication과 at-least-once Slack delivery”다.
+
+### 이력서 문장 초안
+
+> Filesystem Outbox 기반 운영 알림에 exact-body HMAC 인증과 Cloudflare Worker·D1·Queue receiver를 구현해, `event_id` 원자적 중복 방지와 payload conflict 탐지, Slack 429/5xx bounded retry·DLQ·reconciliation을 24개 sender/receiver 회귀 테스트와 D1 migration dry-run으로 검증
+
+짧은 버전:
+
+> HMAC Webhook과 Cloudflare D1/Queue 기반 Slack 알림 receiver를 설계해 durable acceptance, 중복 억제, retry/DLQ 및 비동기 delivery 관측 경계를 자동 테스트로 고정
+
+### 예상 면접 질문
+
+- Slack Webhook을 sender에서 직접 호출하지 않은 이유는 무엇인가?
+- 왜 Worker가 Slack 성공 전에 sender에 202를 반환해도 안전한가?
+- D1 insert와 Queue send 사이의 dual-write 실패는 어떻게 복구하는가?
+- Canonical payload hash가 필요한 이유는 무엇인가?
+- HTTP duplicate와 user-visible duplicate는 어떻게 다른가?
+- Slack 성공 후 D1 update 전에 Worker가 죽으면 어떤 일이 생기는가?
+- Sender retry는 무제한인데 receiver Queue retry는 유한한 이유는 무엇인가?
+- Notification pipeline 장애를 같은 Slack 경로로만 알리면 왜 위험한가?
+- 성공 payload를 redaction하면서 dedup을 어떻게 유지하는가?
+- HMAC secret rotation에서 timer를 중지하는 이유는 무엇인가?
+
+### 과장하지 않을 범위
+
+현재 repository 구현, local tests, Wrangler dry-run과 local D1 migration까지 완료했다. 다음 항목은 아직 완료됐다고 표현하지 않는다.
+
+```text
+Cloudflare remote production deploy
+Slack real channel acceptance
+UptimeRobot /health email monitor
+production sender Webhook activation
+real provider failure injection
+24x7 on-call operation
+```
+
+### 다음 검증
+
+- Remote Cloudflare D1/Queue와 Slack synthetic end-to-end
+- 같은 signed event의 duplicate Slack side effect 1회 확인
+- Controlled Slack credential failure와 D1 requeue
+- HMAC rotation rehearsal
+- Installed local-file rollback rehearsal
+- 첫 30일 SLI measurement와 threshold review
+
+---
+
+## Portfolio Checkpoint — Slack Notification Production Activation
+
+### 이전 체크포인트에서 실제로 완료한 것
+
+```text
+Cloudflare Worker/D1/Queue/DLQ remote deploy and migration
+private Slack Incoming Webhook direct acceptance
+HMAC-signed isolated synthetic 202 and one Slack message
+UptimeRobot GET /health 5-minute operator email fallback
+production filesystem outbox -> systemd -> Worker -> Queue -> Slack smoke
+local-file rollback -> Webhook restoration round trip
+```
+
+Production sender secret은 root:root mode 0600 환경 파일에 두고 Cloudflare secret과의 exact match만 출력 없이 확인했다. Installed systemd service는 outbound HTTPS에 필요한 address family만 추가하고, retryable backoff 5초부터 300초 상한과 permanent latch를 유지했다.
+
+### Production 검증 증거
+
+```text
+activation timestamp=2026-08-21 16:18 KST
+notification timer=active
+latest service Result=success, ExecMainStatus=0
+pending_events=0
+active_failure=false
+receiver /health=HTTP 200, all failure counts 0
+isolated synthetic Slack side effect=1
+controlled production smoke receipt=1
+controlled production smoke Slack side effect=1
+D1 delivered rows=2
+delivered rows retaining original payload=0
+local-file rollback backup=preserved
+```
+
+UptimeRobot에서는 최초 URL에 `/health`를 빼먹은 root 404가 DOWN email로 감지됐고, 올바른 `GET /health`로 수정한 뒤 recovery UP email을 받았다. 이 결과를 receiver failed-state 기반 `/health` 503 live rehearsal로 과장하지 않는다.
+
+### 이력서 성과 문장 초안
+
+> Filesystem Outbox와 HMAC Webhook, Cloudflare Worker·D1·Queue, private Slack을 실제 production 경로로 연결하고, durable receipt와 payload redaction을 확인한 controlled E2E smoke 및 local-file rollback·Webhook 복원 rehearsal로 운영 전환 가능성을 검증
+
+짧은 버전:
+
+> Cloudflare D1/Queue 기반 Slack 알림 경로를 production에 활성화하고 systemd outbox E2E 전달과 rollback round trip을 검증
+
+### 과장하지 않을 범위
+
+다음 항목은 아직 live production evidence가 없다.
+
+```text
+exact duplicate signed replay
+real Slack 429/permanent/DLQ exhaustion
+receiver final-failure requeue
+HMAC secret rotation
+ALERT -> RECOVERY pair through Slack
+30-day SLO compliance
+24x7 or multi-operator incident response
+```
+
+Exact duplicate/conflict, retryable/permanent response, Queue exhaustion과 `/health` degraded state는 tracked automated tests로 검증했다. 실제 rotation과 requeue는 승인된 maintenance window 또는 incident에서 수행해야 한다.
+
+### 다음 검증
+
+- 최초 7일 daily health/failure review
+- 첫 eligible production notification의 두 delivery boundary 기록
+- 첫 30일 SLI sample size와 Free tier 사용량 review
+- 승인된 maintenance window의 HMAC rotation 또는 첫 실제 incident의 receiver requeue 기록

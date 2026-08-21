@@ -1,9 +1,144 @@
 # AeroTrace 프로젝트 컨텍스트
 
-> 마지막 업데이트: 2026-08-04  
-> 현재 상태: Phase 8 웹 대시보드 MVP 완료  
-> 현재 Phase: Phase 9 — 로컬 통합 실행 및 배포 준비  
-> 다음 작업: 현재 Docker Compose와 환경변수 구성을 점검하고 Backend, Frontend, TimescaleDB, OpenTelemetry Collector의 통합 실행 절차를 확정한다.
+> 마지막 업데이트: 2026-08-21
+> 현재 상태: Slack + Cloudflare Worker/D1/Queue notification production 활성, HMAC sender와 독립 email health fallback 운영
+> 현재 Phase: Phase 9 — notification production 활성화 완료 및 초기 운영 관찰
+> 다음 작업: 첫 7일 health/failure daily review와 첫 30일 SLI 관찰을 수행하고, 실제 incident 또는 승인된 maintenance window에서만 rotation/requeue 절차를 훈련한다.
+
+이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
+
+---
+
+## 현재 작업 컨텍스트 — 2026-08-21
+
+현재 feature branch 기준점:
+
+```text
+branch=feature/notification-contract-slo-tests
+upstream HEAD before Slack receiver work=a9187fe
+Slack receiver implementation commit=063b7b2
+Slack verification/docs commit=0e80ace
+draft PR=#1
+GitHub Actions run 32445952757=sender/receiver jobs PASS
+```
+
+Slack receiver와 후속 문서·자동 검증 범위:
+
+```text
+WEBHOOK_RECEIVER_CONTRACT.md
+NOTIFICATION_SLO.md
+OPERATIONS_RUNBOOK.md
+tests/test_notification_outbox.py
+receiver/cloudflare-slack/
+.github/workflows/notification-outbox-tests.yml
+```
+
+다음 untracked 파일은 별도 성능 분석 작업이므로 이번 변경에서 수정하거나 커밋하지 않는다.
+
+```text
+scripts/sample-collector-exporter.py
+scripts/sample-postgres-waits.py
+scripts/summarize-postgres-waits.py
+```
+
+Webhook retryable failure에는 persistent failure-state의 `failure_count`와 `last_failed_at`을 기준으로 bounded exponential backoff를 적용한다.
+
+기본 지연은 다음과 같다.
+
+```text
+failure_count 1  → 5초
+failure_count 2  → 10초
+failure_count 3  → 20초
+failure_count 4  → 40초
+failure_count 5  → 80초
+failure_count 6  → 160초
+failure_count 7+ → 300초
+```
+
+Backoff 중인 동일 event는 `DEFERRED_RETRYABLE_FAILURE`와 exit code 0을 반환한다. 이 경로에서는 HTTP 요청, failure-state 재작성, `failure_count` 증가가 발생하지 않는다.
+
+Webhook 처리 우선순위는 다음과 같다.
+
+```text
+기존 receipt 확인 및 ACK_EXISTING
+→ permanent failure latch
+→ retryable failure backoff
+→ 실제 HTTP 요청
+```
+
+따라서 receipt 기반 crash-window 복구는 permanent latch와 retryable backoff보다 항상 우선한다. Permanent failure는 기존 latch를 유지하며 운영자가 원인을 수정한 뒤 `--retry-permanent-failure`로만 명시적으로 재시도한다.
+
+Backoff 설정 기본값:
+
+```text
+--retryable-backoff-initial-sec 5
+--retryable-backoff-max-sec 300
+```
+
+두 값은 finite number여야 하고 initial은 0보다 커야 하며 max는 initial 이상이어야 한다. 잘못된 설정은 HTTP 요청 전에 exit code 4로 종료한다.
+
+Repository에는 Webhook 자동 처리 unit과 permanent failure 수동 재시도용 oneshot unit이 있다. 수동 unit은 한 번에 최대 한 event만 처리한다.
+
+외부 channel은 Slack, receiver는 Cloudflare Worker + D1 + Queue로 선택했다. Sender는 `v1.timestamp.exact_body` 형식의 HMAC-SHA256 header를 전송하고 receiver는 기본 ±300초 replay window에서 검증한다.
+
+Receiver는 D1 `event_id` primary key와 canonical payload hash로 new/duplicate/conflict를 구분한 뒤 Queue write까지 성공해야 202를 반환한다. Slack delivery는 비동기이며 retryable response와 network failure를 Queue가 최대 10회 재시도하고 최종 failure를 D1에 보존한다. `/health`는 permanent/exhausted/stale 상태를 HTTP 503으로 노출한다.
+
+초기 notification SLO와 threshold는 `NOTIFICATION_SLO.md`에 확정했다.
+
+```text
+receiver durable acceptance=99% within 60초, rolling 30 days
+Slack delivery=99% within additional 300초
+outbox warning/critical age=60/300초
+sender failure warning/critical duration=60/300초
+receiver stale health threshold=600초
+owner=AeroTrace service operator
+fallback=UptimeRobot Free /health email monitor, 5분
+```
+
+이 수치는 2026-08-21 16:18 KST 최종 Webhook 재활성화 시점부터 적용하는 초기 목표다. Synthetic과 controlled smoke는 production SLI 분모에서 분리하므로, eligible production event가 생기기 전 compliance는 `NO_DATA`다.
+
+Tracked 회귀 테스트:
+
+```text
+tests/test_notification_outbox.py
+```
+
+표준 실행:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+이 suite는 backoff 계산과 configuration, local-file smoke, HMAC request contract, retryable defer/복구, `ACK_EXISTING` 우선순위, permanent latch와 explicit retry를 local fake HTTP receiver로 검증한다. 현재 10개가 통과한다.
+
+Receiver suite:
+
+```bash
+cd receiver/cloudflare-slack
+npm test
+npm run check
+npm run deploy:dry-run
+npm run db:migrate:local
+```
+
+현재 Node test 14개, Wrangler 4.125.0 bundle dry-run과 fresh local D1 migration이 통과했다. GitHub Actions에는 Python 3.10 sender job과 Node.js 22 receiver job이 포함된다.
+
+현재 서버에 설치된 production runtime은 Webhook 기준선이다.
+
+```text
+transport=webhook
+EnvironmentFile=/etc/aerotrace/notification.env
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+notification timer=active (waiting)
+pending_events=0
+active_failure=false
+receiver /health=HTTP 200, status=ok
+fallback=UptimeRobot Free GET /health, 5분, operator email
+```
+
+Repository Webhook unit과 permanent retry oneshot unit을 production에 설치했다. 기존 local-file unit은 `/etc/systemd/system/aerotrace-notification-outbox.service.local-file.bak`에 보존했고, local-file rollback과 Webhook 재설치 rehearsal을 완료했다.
+
+Activation acceptance에서는 isolated synthetic 한 건과 controlled production outbox smoke 한 건이 각각 Slack에 한 번 전달됐고, D1은 두 row 모두 `delivered`, 성공 payload 원문 보존 row는 0건이었다. Exact duplicate/conflict, Slack failure/DLQ, `/health` degraded는 tracked test로 검증했다. 실제 HMAC rotation, receiver final-failure requeue, ALERT→RECOVERY pair는 정상 production에 인위적 위험을 만들지 않기 위해 아직 live drill하지 않았다.
 
 ---
 
@@ -2048,4 +2183,3 @@ Collector queue는 Run1에서 최대 3150 및 연속 `3150 → 2100`이 관찰�
 사전에 정의한 queue 경계 조건이 한 번 발생했고 DB headroom도 상당히 감소했으므로 더 높은 rate 탐색은 중단한다.
 
 다음 단계는 설정 변경 없이 3,250 spans/s에서 Collector, Backend, JDBC, TimescaleDB를 분리 측정해 실제 병목 위치를 확인하는 것이다.
-

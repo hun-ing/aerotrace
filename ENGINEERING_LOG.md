@@ -1,8 +1,10 @@
 # AeroTrace Engineering Log
 
-> 마지막 업데이트: 2026-08-04  
-> 현재 Phase: Phase 9 — 로컬 통합 실행 및 배포 준비  
+> 마지막 업데이트: 2026-08-21
+> 현재 Phase: Phase 9 — notification production 활성화 및 초기 운영 관찰
 > 기록 원칙: 사용자가 직접 적용하고 실행한 결과만 완료로 기록하며, 원본 출력이 없는 수치는 추측하지 않는다.
+
+이 문서는 검증 결과를 시간순으로 누적한다. 중간 항목의 `현재`와 `다음 단계`는 해당 실험 시점의 표현이며 최종 항목과 `AEROTRACE_CONTEXT.md` 최상단이 최신 상태다.
 
 ---
 
@@ -6461,6 +6463,7843 @@ Backend healthy / restart=0 출력
 
 ---
 
+## Collector Queue Overflow 데이터 유실 및 Backpressure 장애 실험
+
+### 문제 발견
+
+OpenTelemetry Collector의 exporter `sending_queue`가 가득 찼을 때 현재 설정이 telemetry 보존에 어떤 영향을 주는지 검증했다.
+
+초기 설정:
+
+```yaml
+sending_queue:
+  enabled: true
+  num_consumers: 2
+  sizer: items
+  queue_size: 50000
+  block_on_overflow: false
+  storage: file_storage/aerotrace
+```
+
+Backend 장애를 `docker pause`로 재현하고 70,000 Span sustained workload를 전송했다.
+
+### block_on_overflow=false 장애 결과
+
+측정 결과:
+
+```text
+requested        = 70,000
+sender accepted  = 70,000
+receiver accepted Δ = 70,000
+
+enqueue_failed Δ = 20,250
+sent Δ           = 49,750
+
+DB               = 49,750
+missing          = 20,250
+```
+
+Sender와 Collector receiver 관점에서는 70,000 Span이 수락됐지만 exporter queue 진입 실패로 20,250 Span이 최종 저장되지 않았다.
+
+이 실험을 통해 queue overflow 시 telemetry가 조용히 유실될 수 있음을 확인했다.
+
+### block_on_overflow=true A/B
+
+임시 Collector config를 사용하여 다음 설정으로 동일한 장애를 재현했다.
+
+```yaml
+block_on_overflow: true
+```
+
+정상 경로를 먼저 200 Span smoke로 검증했다.
+
+```text
+Requested spans = 200
+Accepted spans  = 200
+Failed requests = 0
+DB              = 200 / 200
+queue           = 0
+enqueue_failed  = 0
+```
+
+이후 70,000 Span 장애 실험:
+
+```text
+enqueue_failed Δ = 0
+sent Δ           = 70,000
+accepted Δ       = 70,000
+refused Δ        = 0
+DB               = 70,000
+missing          = 0
+```
+
+대신 Sender에서는 backpressure가 관찰됐다.
+
+```text
+Request latency p99          = 170.502 ms
+Producer lag p99             = 7,854.452 ms
+Send-start lag p99           = 8,654.874 ms
+Producer backpressure events = 312
+
+Delivery success        = PASS
+Sustained-rate validity = FAIL
+```
+
+데이터 유실이 upstream 지연으로 이동한 것으로 판단했다.
+
+### 장기 Queue Saturation
+
+queue 포화 상태를 15초 유지했다.
+
+포화 중:
+
+```text
+queue      = 49,750
+in_flight  = 2
+enqueue_failed = 0
+```
+
+Sender 결과:
+
+```text
+Requested spans = 70,000
+Accepted spans  = 69,600
+Failed requests = 8
+
+Observed accepted spans/sec = 1,265.39
+Request latency max         = 10,011.129 ms
+Producer lag p99            = 25,679.388 ms
+Send-start lag p99          = 26,481.702 ms
+Backpressure wait total     = 28,323.182 ms
+
+Delivery success        = FAIL
+Sustained-rate validity = FAIL
+```
+
+Sender는 8개 요청, 총 400 Span을 timeout으로 실패 판단했다.
+
+하지만 Backend 복구와 Collector drain 후:
+
+```text
+enqueue_failed Δ = 0
+sent Δ           = 70,000
+accepted Δ       = 70,000
+refused Δ        = 0
+
+DB               = 70,000
+missing          = 0
+```
+
+이었다.
+
+client timeout과 실제 telemetry 저장 결과가 다를 수 있다는 점을 확인했다.
+
+### 고정 Payload 기반 Ambiguous Timeout 재현
+
+Timeout된 요청이 실제로 저장되는지 명확히 추적하기 위해 고정 OTLP payload를 생성했다.
+
+```text
+request files = 8
+spans/request = 50
+total spans   = 400
+```
+
+사전 DB count:
+
+```text
+0
+```
+
+Backend를 pause한 후 filler load로 Collector queue를 포화시켰다.
+
+첫 번째 saturation detector는 `queue >= 49,750`이라는 고정 임계값을 사용했지만 queue가 `49,350`에서 장시간 정체돼 조건을 만족하지 못했다.
+
+이 결과를 통해 절대 queue 값 하나만을 saturation 조건으로 사용하는 테스트가 workload의 batch 크기에 의존한다는 문제를 발견했다.
+
+포화 판정을 다음처럼 수정했다.
+
+```text
+queue >= 49,000
+in_flight >= 2
+동일 queue 값이 연속적으로 유지
+```
+
+재실험에서:
+
+```text
+queue_saturated     = 49,550
+in_flight_saturated = 2
+```
+
+를 확인했다.
+
+고정된 8개 요청을 동시에 전송한 결과:
+
+```text
+request 01 curl_rc=28 HTTP=000
+request 02 curl_rc=28 HTTP=000
+request 03 curl_rc=28 HTTP=000
+request 04 curl_rc=28 HTTP=000
+request 05 curl_rc=28 HTTP=000
+request 06 curl_rc=28 HTTP=000
+request 07 curl_rc=28 HTTP=000
+request 08 curl_rc=28 HTTP=000
+```
+
+모든 요청이 client timeout이었다.
+
+Backend 복구 후:
+
+```text
+probe_db = 400 / 400
+```
+
+각 요청별:
+
+```text
+request 01 ~ 08
+DB = 50 / 50
+```
+
+최종 Collector:
+
+```text
+queue     = 0
+in_flight = 0
+```
+
+따라서 client가 timeout으로 실패 판단한 요청도 Collector 내부에 이미 수락되어 이후 저장될 수 있음을 재현했다.
+
+### Ambiguous Timeout Retry Idempotency
+
+Timeout된 8개의 JSON payload를 수정하지 않고 그대로 다시 전송했다.
+
+Retry 전:
+
+```text
+count             = 400
+distinct identity = 400
+max ingested_at   = 2026-08-14 03:35:59.609128+00
+```
+
+Retry 결과:
+
+```text
+request 01 ~ 08
+curl_rc = 0
+HTTP    = 200
+```
+
+Retry 후:
+
+```text
+count             = 400
+distinct identity = 400
+max ingested_at   = 2026-08-14 03:35:59.609128+00
+row growth        = 0
+```
+
+현재 DB Unique Identity:
+
+```text
+tenant_id
+project_id
+trace_id
+span_id
+start_time
+```
+
+저장 로직:
+
+```sql
+ON CONFLICT (
+    tenant_id,
+    project_id,
+    trace_id,
+    span_id,
+    start_time
+)
+DO NOTHING
+```
+
+동일 telemetry retry가 실제 DB 중복을 만들지 않는 것을 장애 조건에서 확인했다.
+
+### 운영 설정 적용
+
+실험 결과를 근거로 정식 Collector 설정을 변경했다.
+
+변경 파일:
+
+```text
+otel-collector-config.yaml
+```
+
+변경:
+
+```diff
+- block_on_overflow: false
++ block_on_overflow: true
+```
+
+임시 `/tmp` overlay 없이 Compose를 다시 구성했고 Runtime mount를 확인했다.
+
+```text
+source=/home/huning/aerotrace/otel-collector-config.yaml
+destination=/etc/otel-collector-config.yaml
+```
+
+정식 설정으로 Collector를 재기동한 후 200 Span smoke:
+
+```text
+Requested spans        = 200
+Accepted spans         = 200
+Failed requests        = 0
+Observed accepted rate = 99.97 spans/s
+Delivery success       = PASS
+Sustained-rate validity= PASS
+sender_rc              = 0
+DB                     = 200 / 200
+```
+
+Collector 최종 상태:
+
+```text
+queue     = 0
+in_flight = 0
+```
+
+`git diff --check` 오류 없음.
+
+### 최종 판단
+
+AeroTrace는 Collector exporter queue overflow에서 silent telemetry loss보다 upstream backpressure를 우선한다.
+
+```text
+block_on_overflow=true
+```
+
+를 정식 기본값으로 사용한다.
+
+장애가 길어질 경우 client latency 증가와 timeout은 발생할 수 있지만, 이번 실험에서는 queue 진입 단계 데이터 유실을 방지했고 timeout 후 동일 Span retry도 DB idempotency로 중복 저장 없이 처리됐다.
+
+### 실무적 교훈
+
+- OTLP request 성공과 최종 DB 저장 성공은 동일한 의미가 아니다.
+- Collector receiver accepted metric만으로 end-to-end 데이터 보존을 판단하면 안 된다.
+- queue overflow에서는 `enqueue_failed`와 최종 DB row 수를 함께 확인해야 한다.
+- backpressure를 활성화하면 데이터 유실 문제가 latency와 timeout 문제로 이동할 수 있다.
+- client timeout은 요청이 처리되지 않았다는 확정적인 증거가 아니다.
+- ambiguous timeout이 존재하는 시스템에서는 저장 계층의 idempotency가 중요하다.
+- retry 정책을 검증할 때 단순 정상 재전송뿐 아니라 실제 장애 조건에서 동일 payload를 재전송해야 한다.
+- queue saturation을 고정된 절대 수치 하나로 판정하면 workload의 batch granularity 때문에 잘못된 테스트가 될 수 있다.
+- 장애 실험에는 cleanup을 넣어 Backend가 pause 상태로 남지 않도록 해야 한다.
+- 데이터 보존 정책은 throughput뿐 아니라 failure semantics까지 측정한 뒤 결정해야 한다.
+
+### 보존해야 할 증거
+
+다음 결과는 향후 포트폴리오와 운영 정책 검토를 위해 보존 가치가 있다.
+
+```text
+block_on_overflow=false 70,000 Span 결과
+enqueue_failed=20,250 / DB=49,750 결과
+
+block_on_overflow=true 70,000 Span 결과
+enqueue_failed=0 / DB=70,000 결과
+
+15초 saturation Sender timeout 결과
+Failed requests=8 / Sender accepted=69,600
+Collector accepted=70,000 / DB=70,000
+
+고정 400 Span ambiguous timeout 결과
+8/8 curl_rc=28
+DB=400/400
+
+동일 payload retry 결과
+before_count=400
+after_count=400
+row_growth=0
+ingested_at unchanged
+
+정식 설정 200 Span smoke
+sender_rc=0
+DB=200/200
+queue=0
+in_flight=0
+```
+
+---
+
+## Persistent Queue 장애 내구성 및 200k Queue Capacity 검증
+
+### 목적
+
+`block_on_overflow=true` 적용 후 AeroTrace Collector가 downstream 장애를 실제로 얼마나 버틸 수 있는지 검증했다.
+
+검증 항목:
+
+```text
+persistent queue 실제 disk 저장
+Collector graceful restart 복구
+Collector SIGKILL 복구
+queue item 수에 따른 storage 증가
+기존 queue_size=50,000의 outage budget
+queue_size=200,000 확대 가능성
+190,000 Span backlog end-to-end 복구
+```
+
+### 현재 Persistent Storage 구조
+
+Collector 설정:
+
+```yaml
+sending_queue:
+  enabled: true
+  num_consumers: 2
+  sizer: items
+  storage: file_storage/aerotrace
+
+file_storage/aerotrace:
+  directory: /var/lib/otelcol/storage
+  timeout: 1s
+  max_size: 536870912
+  fsync: true
+  compaction:
+    on_start: true
+    cleanup_on_start: true
+```
+
+Docker storage:
+
+```text
+volume = aerotrace-otelcol-data
+
+container:
+/var/lib/otelcol
+
+host:
+/var/lib/docker/volumes/aerotrace-otelcol-data/_data
+```
+
+Host filesystem 측정:
+
+```text
+/dev/sda2
+Size      ≈ 468 GiB
+Available ≈ 369 GiB
+Usage     = 17%
+```
+
+### 20,000 Span Persistent Storage 실험
+
+조건:
+
+```text
+Backend pause
+target rate = 2,000 spans/s
+duration    = 10 sec
+requested   = 20,000 spans
+```
+
+Sender:
+
+```text
+Accepted spans  = 20,000
+Failed requests = 0
+sender_rc       = 0
+```
+
+장애 중:
+
+```text
+queue     = 20,000
+in_flight = 2
+DB        = 0 / 20,000
+```
+
+Filesystem:
+
+```text
+before apparent = 77,824
+during apparent = 4,206,592
+growth          = 4,128,768 bytes
+
+before allocated = 57,344
+during allocated = 2,678,784
+growth           = 2,621,440 bytes
+```
+
+Backend 복구 후:
+
+```text
+DB        = 20,000 / 20,000
+queue     = 0
+in_flight = 0
+```
+
+### Collector Graceful Restart Recovery
+
+다시 20,000 Span backlog를 생성했다.
+
+Restart 전:
+
+```text
+queue     = 20,000
+in_flight = 2
+DB        = 0 / 20,000
+```
+
+`docker restart aerotrace-otel-collector` 실행.
+
+Collector는 SIGTERM 기반 정상 shutdown을 수행했다.
+
+Startup 이후:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20000
+bytesSize       = 2234800
+dispatchedItems = 2
+```
+
+진행 중이던 export item:
+
+```text
+Fetching items left for dispatch by consumers
+numberOfItems = 2
+
+Moved items for dispatching back to queue
+numberOfItems = 2
+```
+
+Restart 후 Backend가 계속 pause된 상태:
+
+```text
+queue     = 20,000
+in_flight = 2
+DB        = 0 / 20,000
+```
+
+Backend 복구 후:
+
+```text
+DB        = 20,000 / 20,000
+queue     = 0
+in_flight = 0
+```
+
+### Graceful Shutdown 중 Dropping Data 로그
+
+Shutdown 과정에서:
+
+```text
+Exporting failed. Dropping data.
+dropped_items = 1050
+```
+
+가 consumer 두 개에서 각각 발생했다.
+
+단순 로그 합계로는 2,100 Span drop처럼 보였지만 restart 후:
+
+```text
+itemsSize = 20,000
+final DB  = 20,000 / 20,000
+```
+
+이었다.
+
+이번 failure path에서는 진행 중 export가 shutdown으로 실패하면서 drop 로그가 발생했지만 persistent queue state가 항목을 다시 복구했다.
+
+교훈:
+
+```text
+Dropping data 로그만으로 실제 영구 유실을 단정하지 않는다.
+persistent queue metadata와 최종 저장 결과를 함께 확인한다.
+```
+
+### Collector SIGKILL Recovery
+
+Graceful shutdown이 불가능한 crash 상황을 재현했다.
+
+조건:
+
+```text
+Backend pause
+queue = 20,000
+DB    = 0
+```
+
+실행:
+
+```text
+docker kill --signal=KILL aerotrace-otel-collector
+```
+
+종료 결과:
+
+```text
+running = false
+status  = exited
+exit    = 137
+```
+
+다시 Collector를 시작한 뒤:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20000
+bytesSize       = 2234800
+dispatchedItems = 2
+```
+
+그리고 두 dispatched item을 다시 queue로 이동한 로그가 확인됐다.
+
+Backend가 계속 pause된 상태:
+
+```text
+queue = 20,000
+DB    = 0 / 20,000
+```
+
+Backend 복구 후:
+
+```text
+DB        = 20,000 / 20,000
+queue     = 0
+in_flight = 0
+```
+
+결과:
+
+```text
+graceful restart → 20,000 / 20,000 복구
+SIGKILL          → 20,000 / 20,000 복구
+```
+
+### 기존 Queue Capacity 분석
+
+기존:
+
+```yaml
+queue_size: 50000
+```
+
+Backend 처리량이 0인 완전 장애 기준:
+
+```text
+2,000 spans/s → 약 25초
+3,250 spans/s → 약 15.4초
+```
+
+3,250 spans/s workload는 앞선 운영 후보 서버 sustained ingest 검증에서 사용한 실제 측정 조건이다.
+
+따라서 50,000 Span capacity는 약 15초의 짧은 장애 buffer만 제공한다.
+
+### Queue 200,000 후보 선정
+
+목표:
+
+```text
+3,250 spans/s workload에서
+Backend 완전 장애 약 1분 흡수
+```
+
+계산:
+
+```text
+3,250 × 60
+= 195,000 spans
+```
+
+따라서 테스트 후보:
+
+```yaml
+queue_size: 200000
+```
+
+### 200k Queue 성장 곡선 실험
+
+Repository 설정을 바로 변경하지 않고 `/tmp` Collector config를 사용했다.
+
+조건:
+
+```text
+queue_size         = 200,000
+block_on_overflow  = true
+Backend            = paused
+incoming rate      = 2,000 spans/s
+```
+
+순차적으로 backlog를 증가시켰다.
+
+```text
+checkpoint  queue    in_flight  file_size    apparent_bytes  allocated_bytes
+baseline    0        0          32,768       45,056          32,768
+50k         50,000   2          8,388,608    8,400,896       6,049,792
+100k        100,000  2          16,777,216   16,789,504      11,894,784
+150k        150,000  2          33,599,488   33,611,776      17,547,264
+190k        190,000  2          33,599,488   33,611,776      21,954,560
+```
+
+각 workload:
+
+```text
+50k sender_rc  = 0
+100k sender_rc = 0
+150k sender_rc = 0
+190k sender_rc = 0
+```
+
+장애 중 최종:
+
+```text
+queue = 190,000
+DB    = 0 / 190,000
+```
+
+190k에서 baseline을 제외한 allocated storage 증가:
+
+```text
+21,921,792 bytes
+≈ 20.9 MiB
+```
+
+이번 payload 기준으로 단순 환산하면 약:
+
+```text
+115 bytes/span allocated
+```
+
+였지만 bbolt page allocation과 reuse가 존재하므로 일반적인 고정 Span storage size로 사용하지 않는다.
+
+특히:
+
+```text
+150k file_size = 33,599,488
+190k file_size = 33,599,488
+```
+
+로 file size 자체는 증가하지 않은 반면 allocated bytes는 증가했다.
+
+### 190k Backlog 복구
+
+Backend unpause 후 queue drain:
+
+```text
+145,900
+134,050
+118,300
+103,600
+87,300
+72,600
+55,800
+38,950
+26,350
+11,650
+0
+```
+
+최종:
+
+```text
+DB        = 190,000 / 190,000
+queue     = 0
+in_flight = 0
+```
+
+190,000 Span persistent backlog 전체가 최종 DB까지 복구됐다.
+
+### 정식 설정 승격
+
+실험 결과를 근거로 repository 설정을 변경했다.
+
+파일:
+
+```text
+otel-collector-config.yaml
+```
+
+변경:
+
+```diff
+- queue_size: 50000
++ queue_size: 200000
+```
+
+기존 정책:
+
+```yaml
+block_on_overflow: true
+```
+
+는 유지했다.
+
+최종:
+
+```yaml
+sending_queue:
+  enabled: true
+  num_consumers: 2
+  sizer: items
+  queue_size: 200000
+  block_on_overflow: true
+  storage: file_storage/aerotrace
+```
+
+임시 overlay 없이 실제 runtime mount:
+
+```text
+source=/home/huning/aerotrace/otel-collector-config.yaml
+destination=/etc/otel-collector-config.yaml
+```
+
+### 정식 설정 Smoke
+
+```text
+Requested spans = 200
+Accepted spans  = 200
+Failed requests = 0
+
+sender_rc       = 0
+DB              = 200 / 200
+
+final queue     = 0
+final in_flight = 0
+```
+
+`git diff --check` 오류 없음.
+
+### 장애 Budget 변화
+
+변경 전:
+
+```text
+queue_size=50,000
+
+2,000 spans/s → 약 25초
+3,250 spans/s → 약 15.4초
+```
+
+변경 후:
+
+```text
+queue_size=200,000
+
+2,000 spans/s → 약 100초
+3,250 spans/s → 약 61.5초
+```
+
+따라서 운영 후보 workload 기준 완전 장애 흡수 시간을 약 15초에서 약 1분으로 확대했다.
+
+### 실무적 교훈
+
+- persistent queue는 설정 존재 여부가 아니라 실제 restart/crash 실험으로 검증해야 한다.
+- graceful restart만 통과했다고 프로세스 crash 복구까지 검증된 것은 아니다.
+- SIGKILL 테스트를 통해 shutdown hook 없이도 persistent queue metadata가 복구되는지 확인할 수 있다.
+- exporter의 `Dropping data` 로그와 최종 영구 유실은 항상 동일하지 않을 수 있다.
+- queue logical bytes, bbolt file size, filesystem allocated bytes는 서로 다른 값이다.
+- persistent queue storage는 payload 크기와 bbolt page allocation 특성 때문에 단순 선형 증가를 가정하면 안 된다.
+- queue capacity는 임의의 큰 숫자가 아니라 목표 outage duration과 ingest rate에서 역산해야 한다.
+- 50,000 Span queue는 높은 ingest rate에서 생각보다 짧은 장애만 흡수한다.
+- capacity 변경 전 임시 config로 실제 workload를 재현하면 운영 설정 변경의 근거를 남길 수 있다.
+- 데이터 보존은 queue drain뿐 아니라 최종 DB row 수까지 확인해야 한다.
+
+### 아직 검증하지 않은 장애
+
+다음은 후속 장애 실험 대상으로 남긴다.
+
+```text
+host reboot
+강제 전원 차단
+filesystem corruption
+Docker volume loss
+file_storage max_size 도달
+host disk full
+queue_size=200000 완전 포화 이후 동작
+```
+
+현재 결과를 위 장애까지 포함하는 것으로 과장하지 않는다.
+
+### 보존해야 할 증거
+
+```text
+20k persistent storage filesystem 측정 결과
+itemsSize=20000 / bytesSize=2234800 startup log
+graceful restart 20000/20000 복구 결과
+SIGKILL exit=137 결과
+SIGKILL 후 Loaded queue metadata 로그
+SIGKILL 후 20000/20000 복구 결과
+
+50k / 100k / 150k / 190k growth.tsv
+190k allocated_bytes=21954560
+db_during=0/190000
+final_db=190000/190000
+
+queue_size=200000 정식 config diff
+정식 mount source 확인
+200 Span smoke 200/200
+final_queue=0
+final_in_flight=0
+```
+
+---
+
+## 200k Persistent Queue 완전 포화 Failure Semantics 검증
+
+### 목적
+
+`queue_size=200000`이 계산상 약 1분의 outage buffer를 제공하는 것에 그치지 않고 실제 운영 후보 workload에서도 같은 동작을 보이는지 확인했다.
+
+또한 queue가 실제 capacity에 도달한 이후:
+
+```text
+telemetry가 유실되는가?
+Collector가 요청을 거부하는가?
+upstream에 backpressure가 발생하는가?
+Backend 복구 후 전체 backlog가 저장되는가?
+```
+
+를 검증했다.
+
+### 테스트 조건
+
+```text
+Backend             = paused
+target rate         = 3,250 spans/s
+duration            = 65 sec
+requested spans     = 211,250
+batch size          = 50
+sender workers      = 4
+
+Collector:
+queue_size          = 200,000
+sizer               = items
+num_consumers       = 2
+block_on_overflow   = true
+persistent storage  = enabled
+```
+
+테스트 시작 상태:
+
+```text
+queue     = 0
+in_flight = 0
+
+Backend:
+running
+paused=false
+healthy
+```
+
+### Queue Saturation
+
+queue는 점진적으로 증가했고 최종:
+
+```text
+queue_saturated     = 199,500
+in_flight_saturated = 2
+saturation_elapsed  = 62.622 sec
+```
+
+에서 안정적으로 plateau를 형성했다.
+
+포화 판정은:
+
+```text
+queue >= 198,000
+in_flight >= 2
+동일 queue 값 4회 연속 관찰
+```
+
+조건으로 수행했다.
+
+설계 시 계산값:
+
+```text
+200,000 / 3,250
+≈ 61.54 sec
+```
+
+와 실제 62.622초가 근접하게 재현됐다.
+
+configured queue capacity 200,000보다 작은 199,500에서 plateau가 형성된 것은 현재 workload에서 관찰되는 약 1,050 Span 단위 Collector batch granularity 영향으로 해석한다.
+
+### Saturation Hold
+
+포화 상태를 추가 5초 유지했다.
+
+```text
+queue_after_hold     = 199,500
+in_flight_after_hold = 2
+```
+
+queue가 더 이상 증가하지 않았고 upstream sender에 backpressure가 전달됐다.
+
+### Sender Backpressure
+
+최종 Sender:
+
+```text
+Requested spans    = 211,250
+Accepted spans     = 211,250
+Requested requests = 4,225
+Accepted requests  = 4,225
+Failed requests    = 0
+
+Actual elapsed     = 69.354845 sec
+Target rate        = 3,250 spans/s
+Observed rate      = 3,045.93 spans/s
+Rate error         = 6.279%
+```
+
+Latency 및 backpressure:
+
+```text
+Request latency p99 = 7.932 ms
+Request latency max = 6,513.931 ms
+
+Producer lag p99    = 5,503.897 ms
+Producer lag max    = 5,961.468 ms
+
+Send-start lag p99  = 5,996.734 ms
+Send-start lag max  = 6,453.542 ms
+
+Backpressure wait total = 6,953.442 ms
+Backpressure wait p99   = 241.917 ms
+Backpressure wait max   = 5,961.325 ms
+
+Producer backpressure events = 155
+```
+
+결과:
+
+```text
+Delivery success        = PASS
+Sustained-rate validity = FAIL
+sender_rc               = 22
+```
+
+`sender_rc=22`는 데이터 delivery 실패를 의미하지 않는다.
+
+모든 211,250 Span 요청이 Collector에 전달됐지만 queue saturation으로 약 6초 수준의 지연이 upstream으로 전파되면서 목표 sustained rate를 유지하지 못한 결과다.
+
+### Backend 복구와 Queue Drain
+
+Backend 복구 후 queue:
+
+```text
+156,650
+141,950
+127,250
+112,550
+95,750
+81,050
+64,250
+47,450
+32,750
+15,950
+0
+```
+
+최종:
+
+```text
+queue     = 0
+in_flight = 0
+```
+
+DB:
+
+```text
+211,250 / 211,250
+```
+
+으로 전체 telemetry 저장을 확인했다.
+
+### Collector Counter Helper 오류 발견
+
+실험 초기에 사용한 metric helper가 모든 Collector metric에 다음 label을 요구했다.
+
+```text
+data_type="traces"
+```
+
+그 결과:
+
+```text
+sent_spans
+accepted_spans
+refused_spans
+enqueue_failed_spans
+```
+
+counter를 찾지 못하고 빈 값을 `0`으로 변환했다.
+
+최초 출력:
+
+```text
+sent_before=0
+accepted_before=0
+
+sent_delta=0
+accepted_delta=0
+```
+
+은 실제 metric 값이 아니라 helper 오류였다.
+
+Raw metrics를 확인한 결과 label 구조는 다음과 달랐다.
+
+Queue gauge:
+
+```text
+otelcol_exporter_queue_size{
+  data_type="traces",
+  exporter="otlp_http/aerotrace"
+}
+
+otelcol_exporter_in_flight_requests{
+  data_type="traces",
+  exporter="otlp_http/aerotrace"
+}
+```
+
+Span counters:
+
+```text
+otelcol_exporter_sent_spans{
+  exporter="otlp_http/aerotrace",
+  ...
+}
+
+otelcol_receiver_accepted_spans{
+  receiver="otlp",
+  transport="http"
+}
+
+otelcol_receiver_refused_spans{
+  receiver="otlp",
+  transport="http"
+}
+```
+
+즉 span counter에는 `data_type="traces"` label이 존재하지 않았다.
+
+실험 후 실제 raw metric:
+
+```text
+otelcol_exporter_sent_spans     = 211,450
+otelcol_receiver_accepted_spans = 211,450
+otelcol_receiver_refused_spans  = 0
+```
+
+현재 Collector lifecycle에서 포화 실험 전에 수행한 정식 설정 smoke가 200 Span이므로 실제 포화 실험 delta는:
+
+```text
+sent delta     = 211,250
+accepted delta = 211,250
+refused delta  = 0
+```
+
+이다.
+
+`otelcol_exporter_enqueue_failed_spans`는 raw metrics에 series 자체가 존재하지 않았다.
+
+따라서 존재하지 않는 counter series를 자동으로 0으로 변환한 값을 측정값으로 사용하지 않는다.
+
+### End-to-End 최종 결과
+
+```text
+Requested spans        = 211,250
+Sender accepted        = 211,250
+Failed sender requests = 0
+
+Collector accepted Δ   = 211,250
+Collector sent Δ       = 211,250
+Collector refused      = 0
+
+DB stored              = 211,250
+Missing                = 0
+
+Final queue            = 0
+Final in-flight        = 0
+```
+
+### 결론
+
+`queue_size=200000`은 3,250 spans/s workload에서 실제로 약 62.6초 후 effective saturation에 도달했다.
+
+따라서 설계 목표였던:
+
+```text
+약 1분 Backend 완전 장애 buffer
+```
+
+가 실제 workload에서도 검증됐다.
+
+queue가 포화된 이후에는 telemetry를 조용히 버리는 대신 upstream sender에 backpressure가 전달됐다.
+
+Backend 복구 후 211,250 Span 전체가 DB까지 저장됐으며 이번 실험에서 영구 missing telemetry는 0건이었다.
+
+### 실무적 교훈
+
+- queue capacity의 이론적 outage budget은 실제 장애 테스트로 확인해야 한다.
+- configured queue size와 실제 effective saturation point가 batch granularity 때문에 정확히 같지 않을 수 있다.
+- backpressure가 정상 작동하면 delivery는 성공하면서 sustained-rate 목표는 실패할 수 있다.
+- sender exit code만 보고 telemetry delivery 실패로 판단하면 안 된다.
+- Collector internal metric은 metric 이름별 실제 label schema를 확인하고 수집해야 한다.
+- 존재하지 않는 metric series를 무조건 0으로 변환하면 관측 오류를 실제 시스템 상태로 오인할 수 있다.
+- internal metric 검증과 end-to-end DB count를 함께 사용해야 failure semantics를 정확히 판단할 수 있다.
+
+### 보존해야 할 증거
+
+```text
+queue_saturated=199500
+in_flight_saturated=2
+saturation_elapsed_sec=62.622
+
+queue_after_hold=199500
+in_flight_after_hold=2
+
+Backpressure wait total=6953.442 ms
+Producer backpressure events=155
+
+Requested=211250
+Accepted=211250
+Failed requests=0
+
+DB=211250/211250
+final_queue=0
+final_in_flight=0
+
+raw metric:
+sent_spans=211450
+accepted_spans=211450
+refused_spans=0
+
+200 Span prior smoke를 제외한:
+sent delta=211250
+accepted delta=211250
+```
+
+---
+
+## Host Reboot Persistent Queue Recovery 실험
+
+### 목적
+
+앞선 실험에서 다음 Collector process 단위 장애에 대한 persistent queue 복구를 확인했다.
+
+```text
+graceful restart
+SIGKILL
+```
+
+이번에는 failure boundary를 host 수준까지 확대해 다음을 검증했다.
+
+```text
+Host OS reboot
+Docker daemon restart
+Docker named volume 재마운트
+Collector 재시작
+Backend가 없는 상태에서 persistent backlog 복원
+Backend 복구 후 최종 DB 저장
+```
+
+### 실험 준비
+
+시작 전 Collector:
+
+```text
+queue     = 0
+in_flight = 0
+```
+
+Backend:
+
+```text
+running
+healthy
+```
+
+Host reboot 직후 queue가 의도치 않게 drain되는 것을 방지하기 위해 Backend를 `pause`하지 않고 정상 stop했다.
+
+```text
+docker stop aerotrace-backend
+```
+
+이후 Backend가 없는 상태에서:
+
+```text
+target rate = 2,000 spans/s
+duration    = 10 sec
+batch size  = 50
+workers     = 4
+```
+
+조건으로 20,000 Span을 Collector에 전송했다.
+
+Reboot 직전:
+
+```text
+queue_before_reboot     = 20,000
+in_flight_before_reboot = 2
+DB_before_reboot        = 0 / 20,000
+```
+
+persistent storage file size:
+
+```text
+33,570,816 bytes
+```
+
+였다.
+
+실험 metadata는 shell과 `/tmp`가 reboot 후 사라질 수 있으므로 홈 디렉터리에 별도 저장했다.
+
+```text
+~/aerotrace-pq-host-reboot.state
+```
+
+저장 내용:
+
+```text
+REBOOT_RUN=20260814T053923Z
+PREFIX=aerotrace-sustained-20260814T053924Z-a954b5-
+QUEUE_BEFORE_REBOOT=20000
+INFLIGHT_BEFORE_REBOOT=2
+DB_BEFORE_REBOOT=0
+FILE_BEFORE_REBOOT=33570816
+```
+
+### Host Reboot
+
+실행:
+
+```text
+sudo reboot
+```
+
+SSH 연결이 종료된 뒤 host에 다시 접속했다.
+
+재부팅 후 container 상태:
+
+```text
+aerotrace-otel-collector = Up
+aerotrace-timescaledb    = Up / healthy
+aerotrace-backend        = Exited (143)
+```
+
+Backend가 자동 시작되지 않았기 때문에 Collector가 persistent queue를 복원한 직후 상태를 DB drain 전에 확인할 수 있었다.
+
+### Collector Persistent Queue 복구
+
+Collector startup log:
+
+```text
+Loaded queue metadata
+
+itemsSize       = 20000
+bytesSize       = 2234800
+dispatchedItems = 2
+```
+
+이어:
+
+```text
+Fetching items left for dispatch by consumers
+numberOfItems = 2
+
+Moved items for dispatching back to queue
+numberOfItems = 2
+```
+
+가 확인됐다.
+
+이는 host reboot 이전에 consumer가 dispatch 중이던 두 item까지 persistent metadata를 통해 다시 queue로 복구한 것이다.
+
+Backend가 여전히 stopped인 상태에서 실제 Collector metric:
+
+```text
+queue_after_reboot     = 20,000
+in_flight_after_reboot = 2
+```
+
+DB:
+
+```text
+0 / 20,000
+```
+
+이었다.
+
+따라서 reboot 전에 DB에 저장된 데이터를 잘못 복구 결과로 판단하는 가능성을 제거했다.
+
+### Backend 복구
+
+Backend를 수동으로 시작했다.
+
+```text
+docker start aerotrace-backend
+```
+
+health:
+
+```text
+running false starting
+...
+running false healthy
+```
+
+까지 정상 복구됐다.
+
+Collector queue drain:
+
+```text
+18,950
+15,800
+13,700
+10,550
+6,350
+3,150
+0
+```
+
+최종:
+
+```text
+queue     = 0
+in_flight = 0
+```
+
+DB:
+
+```text
+20,000 / 20,000
+```
+
+Backend:
+
+```text
+running
+healthy
+```
+
+### 최종 결과
+
+```text
+queue before reboot = 20,000
+DB before reboot    = 0 / 20,000
+
+Host reboot
+
+queue after reboot  = 20,000
+DB after reboot     = 0 / 20,000
+
+Backend recovery
+
+final DB            = 20,000 / 20,000
+final queue         = 0
+final in-flight     = 0
+Backend             = running / healthy
+```
+
+### 현재까지의 Persistent Queue 장애 복구 결과
+
+```text
+Collector graceful restart
+→ 20,000 / 20,000
+
+Collector SIGKILL
+→ 20,000 / 20,000
+
+Host OS reboot
+→ 20,000 / 20,000
+```
+
+세 실험 모두 Backend 복구 후 최종 DB row 수로 end-to-end 데이터 보존을 확인했다.
+
+### 실무적 교훈
+
+- process restart와 host reboot는 서로 다른 failure boundary이므로 별도로 검증해야 한다.
+- persistent Docker volume을 사용한다고 해서 host reboot 복구를 가정만 해서는 안 된다.
+- reboot 테스트에서는 downstream이 자동 복구되기 전에 queue 상태를 확인할 수 있도록 실험 조건을 설계해야 한다.
+- shell 변수와 `/tmp` 파일은 reboot 실험의 기준 데이터 보존 위치로 적합하지 않다.
+- reboot 전 prefix, queue size, DB count 등의 metadata를 persistent host path에 저장하면 재접속 후 동일 데이터를 정확히 추적할 수 있다.
+- Collector startup log의 `Loaded queue metadata`는 persistent queue 복구 확인에 중요한 증거다.
+- `itemsSize`뿐 아니라 dispatch 중이던 item이 다시 queue로 이동되는지도 확인해야 한다.
+- persistent queue 복구 성공 여부는 startup log만이 아니라 최종 DB row 수까지 확인해야 한다.
+- 정상 OS reboot 성공 결과를 강제 전원 차단이나 filesystem corruption 내구성까지 확대 해석하면 안 된다.
+
+### 아직 검증하지 않은 Host/Storage 장애
+
+```text
+강제 전원 차단
+filesystem corruption
+Docker volume 손실
+SSD 장애
+host disk full
+file_storage max_size 도달
+file_storage write 실패
+```
+
+### 보존해야 할 증거
+
+```text
+~/aerotrace-pq-host-reboot.state
+
+queue_before_reboot=20000
+DB_before_reboot=0
+
+Host reboot 후:
+Backend=Exited
+Collector=Up
+TimescaleDB=healthy
+
+Loaded queue metadata:
+itemsSize=20000
+bytesSize=2234800
+dispatchedItems=2
+
+Moved items for dispatching back to queue:
+numberOfItems=2
+
+queue_after_reboot=20000
+DB_after_reboot=0
+
+queue drain:
+18950 → 15800 → 13700 → 10550 → 6350 → 3150 → 0
+
+final_db=20000/20000
+final_queue=0
+final_in_flight=0
+backend=running health=healthy
+```
+
+---
+
+## Collector Queue 운영 체크 및 Threshold 검증
+
+### 목적
+
+Persistent queue 장애 복구 검증 후 운영자가 queue saturation 위험을 일관되게 판단할 수 있도록 재사용 가능한 운영 체크 도구를 구현했다.
+
+새 파일:
+
+```text
+scripts/check-collector-queue.py
+```
+
+### 제공 정보
+
+스크립트는 Collector metrics와 실제 repository config를 사용해 다음 정보를 출력한다.
+
+```text
+status
+queue_size
+queue_capacity
+queue_utilization_pct
+queue_remaining_items
+full_outage_headroom_sec
+reference_spans_per_sec
+
+in_flight
+
+sent_spans
+enqueue_failed_spans
+send_failed_spans
+
+accepted_spans
+refused_spans
+```
+
+### Queue Capacity
+
+다음 값을 코드에 중복 hard-code하지 않고:
+
+```text
+otel-collector-config.yaml
+```
+
+에서 읽도록 구현했다.
+
+현재:
+
+```text
+queue_size=200000
+```
+
+실제 실행에서도:
+
+```text
+queue_capacity=200000
+```
+
+으로 확인했다.
+
+### Metric Series 부재 처리
+
+이전 saturation 실험에서 metric helper가 존재하지 않는 series를 0으로 변환하는 문제가 있었다.
+
+새 스크립트에서는 해당 문제를 방지하기 위해 series가 없으면:
+
+```text
+N/A
+```
+
+로 표시한다.
+
+Host reboot 직후 실제 상태:
+
+```text
+sent_spans=20000
+
+enqueue_failed_spans=N/A
+send_failed_spans=N/A
+accepted_spans=N/A
+refused_spans=N/A
+```
+
+이었다.
+
+이는 Collector reboot 이후 새 OTLP 수신 없이 persistent queue에 복원된 20,000 Span만 exporter가 Backend로 전송한 현재 lifecycle과 일치한다.
+
+### 상태 및 Exit Code
+
+기본:
+
+```text
+OK       = exit 0
+WARNING  = exit 1
+CRITICAL = exit 2
+UNKNOWN  = exit 3
+```
+
+기본 threshold:
+
+```text
+warning  = 50%
+critical = 80%
+```
+
+### 정상 상태 검증
+
+```text
+status=OK
+queue_size=0
+queue_capacity=200000
+queue_utilization_pct=0.00
+queue_remaining_items=200000
+full_outage_headroom_sec=61.54
+reference_spans_per_sec=3250.00
+in_flight=0
+
+exit=0
+```
+
+### Threshold Validation 검증
+
+잘못된 설정:
+
+```text
+warn=0.9
+critical=0.8
+```
+
+결과:
+
+```text
+UNKNOWN: warning ratio must be lower than critical ratio.
+exit=3
+```
+
+잘못된 threshold로 운영 상태가 계산되지 않도록 방어했다.
+
+### 실제 Queue Backlog 생성
+
+Backend를 pause한 상태에서:
+
+```text
+target rate = 1,000 spans/s
+duration    = 2 sec
+requested   = 2,000 spans
+accepted    = 2,000 spans
+failed      = 0
+sender_rc   = 0
+```
+
+의 실제 telemetry backlog를 생성했다.
+
+Collector:
+
+```text
+queue_size=2000
+queue_capacity=200000
+queue_utilization_pct=1.00
+queue_remaining_items=198000
+full_outage_headroom_sec=60.92
+in_flight=2
+```
+
+### 기본 Threshold
+
+실제 queue utilization 1%에서는:
+
+```text
+status=OK
+exit=0
+```
+
+이었다.
+
+즉 작은 일시적 backlog를 운영 장애로 판단하지 않는다.
+
+### WARNING 경로 검증
+
+실제 queue를 대규모로 다시 채우지 않고 동일한 실제 2,000 Span backlog를 사용하면서 테스트 invocation에서만 threshold를 낮췄다.
+
+```text
+warning  = 0.5%
+critical = 2%
+```
+
+실제:
+
+```text
+queue utilization = 1%
+```
+
+결과:
+
+```text
+status=WARNING
+exit=1
+```
+
+### CRITICAL 경로 검증
+
+테스트 threshold:
+
+```text
+warning  = 0.1%
+critical = 0.5%
+```
+
+결과:
+
+```text
+status=CRITICAL
+exit=2
+```
+
+따라서 실제 Collector metric을 입력으로 사용해:
+
+```text
+OK
+WARNING
+CRITICAL
+UNKNOWN
+```
+
+네 상태와 exit code를 모두 검증했다.
+
+### Backend Recovery
+
+Backend unpause 후 health:
+
+```text
+unhealthy
+unhealthy
+healthy
+```
+
+queue는 첫 확인 시 이미:
+
+```text
+queue=0
+```
+
+까지 drain됐다.
+
+최종 DB:
+
+```text
+2000/2000
+```
+
+### 최종 상태
+
+```text
+status=OK
+queue_size=0
+queue_capacity=200000
+queue_utilization_pct=0.00
+full_outage_headroom_sec=61.54
+in_flight=0
+
+sent_spans=22000
+accepted_spans=2000
+refused_spans=0
+```
+
+`sent_spans=22000`과 `accepted_spans=2000`의 차이는 오류가 아니다.
+
+현재 Collector lifecycle에서:
+
+```text
+Host reboot 후 persistent queue 재전송 = 20,000
+이번 테스트 신규 receiver 수신          = 2,000
+```
+
+이므로:
+
+```text
+exported total = 22,000
+newly received = 2,000
+```
+
+과 일치한다.
+
+### 실무적 교훈
+
+- queue가 0보다 크다고 즉시 장애는 아니다.
+- queue utilization과 남은 장애 buffer를 함께 봐야 한다.
+- 운영 체크 도구는 사람이 읽는 출력뿐 아니라 자동화 가능한 exit code를 가져야 한다.
+- production threshold를 검증하기 위해 실제 queue를 위험한 수준까지 매번 채울 필요는 없다.
+- 실제 Collector metric을 사용하되 테스트 invocation에서 threshold만 낮춰 상태 분기 자체를 검증할 수 있다.
+- metric series 부재와 실제 counter 0은 반드시 구분해야 한다.
+- Collector counter는 process lifecycle에 종속된 cumulative metric이므로 서로 다른 restart 구간의 counter를 단순 비교하면 안 된다.
+- queue capacity는 운영 config와 단일 source of truth를 유지해야 한다.
+
+### 현재 기본 운영 기준
+
+```text
+queue < 50%
+→ OK
+
+queue >= 50%
+→ WARNING
+
+queue >= 80%
+→ CRITICAL
+```
+
+현재 3,250 spans/s reference workload에서는:
+
+```text
+0% used
+→ 약 61.54 sec remaining
+
+50% used
+→ 약 30.77 sec remaining
+
+80% used
+→ 약 12.31 sec remaining
+```
+
+단, 이는 Backend throughput이 완전히 0이라는 단순 outage 모델 기준이다.
+
+### 다음 작업
+
+현재 스크립트는 사람이 직접 실행해야 한다.
+
+다음 단계에서는:
+
+```text
+누가 주기적으로 실행하는가?
+어느 host/container에서 실행하는가?
+경고 상태를 어디로 전달하는가?
+중복 알림을 어떻게 방지하는가?
+Collector 자체가 죽어 metrics를 읽을 수 없는 UNKNOWN은 어떻게 처리하는가?
+```
+
+를 설계한다.
+
+---
+
+## Collector Queue Alert 상태 전이 및 중복 알림 억제 구현
+
+### 목적
+
+`check-collector-queue.py`를 반복 실행할 수 있게 된 뒤 실제 운영 자동화를 위해 다음 문제가 남았다.
+
+```text
+동일 WARNING/CRITICAL이 반복될 때 중복 알림 방지
+상태가 악화될 때 재알림
+복구 시 recovery 알림
+Collector 자체 장애 감지
+scheduler와 alert 상태 판정 분리
+```
+
+이를 위해 다음 파일을 추가했다.
+
+```text
+scripts/evaluate-collector-queue-alert.py
+```
+
+### 구성
+
+```text
+Collector metrics
+    ↓
+scripts/check-collector-queue.py
+    ↓
+scripts/evaluate-collector-queue-alert.py
+```
+
+queue checker는 현재 상태만 판정한다.
+
+```text
+OK       → exit 0
+WARNING  → exit 1
+CRITICAL → exit 2
+UNKNOWN  → exit 3
+```
+
+Evaluator는 이전 상태를 state file에 저장하고 상태 전이 여부를 판단한다.
+
+### Evaluator Event
+
+지원 event:
+
+```text
+NONE
+ALERT
+STATUS_CHANGE
+RECOVERY
+REMINDER
+```
+
+의미:
+
+```text
+NONE
+→ notification 필요 없음
+
+ALERT
+→ 정상에서 장애 상태로 전환되었거나 최초 non-OK 상태
+
+STATUS_CHANGE
+→ WARNING → CRITICAL 등 non-OK 상태 사이의 변화
+
+RECOVERY
+→ non-OK → OK
+
+REMINDER
+→ 동일 장애 상태가 repeat interval 이상 지속
+```
+
+### 실제 Collector 정상 상태 테스트
+
+실제 Collector queue가 비어 있는 상태에서:
+
+```text
+event=NONE
+alert_required=false
+previous_status=NONE
+current_status=OK
+checker_exit_code=0
+evaluator_rc=0
+```
+
+state file:
+
+```json
+{
+  "current_status": "OK",
+  "last_changed_at": "2026-08-14T06:09:15+00:00",
+  "last_evaluated_at": "2026-08-14T06:09:15+00:00"
+}
+```
+
+가 생성됐다.
+
+### 상태 머신 테스트
+
+실제 queue를 반복적으로 채우는 대신 임시 fake checker를 사용해 evaluator의 상태 전이 로직을 독립적으로 검증했다.
+
+#### 최초 OK
+
+```text
+event=NONE
+alert_required=false
+previous_status=NONE
+current_status=OK
+checker_exit_code=0
+```
+
+#### OK → WARNING
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=WARNING
+checker_exit_code=1
+
+evaluator_rc=0
+```
+
+#### WARNING 지속
+
+```text
+event=NONE
+alert_required=false
+previous_status=WARNING
+current_status=WARNING
+
+evaluator_rc=0
+```
+
+동일 WARNING이 반복돼도 새로운 alert event가 발생하지 않았다.
+
+#### WARNING → CRITICAL
+
+```text
+event=STATUS_CHANGE
+alert_required=true
+previous_status=WARNING
+current_status=CRITICAL
+checker_exit_code=2
+```
+
+장애 수준이 상승하면 새로운 notification event가 발생한다.
+
+#### CRITICAL → OK
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=CRITICAL
+current_status=OK
+checker_exit_code=0
+```
+
+복구 상태 역시 notification 대상으로 분류된다.
+
+#### 최초 UNKNOWN
+
+```text
+event=ALERT
+alert_required=true
+previous_status=NONE
+current_status=UNKNOWN
+checker_exit_code=3
+
+evaluator_rc=0
+```
+
+UNKNOWN을 단순 무시하지 않는다.
+
+### Checker 자체 실행 실패
+
+존재하지 않는 checker 경로:
+
+```text
+/tmp/aerotrace-does-not-exist.py
+```
+
+를 사용했다.
+
+결과:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=NONE
+current_status=UNKNOWN
+checker_exit_code=N/A
+
+checker_stderr=
+checker execution failed:
+No such file or directory
+
+missing_checker_rc=0
+```
+
+즉 checker/Collector 계층의 문제는 운영 상태 UNKNOWN으로 정상 분류했다.
+
+Evaluator 자체는 정상적으로 한 번의 평가를 수행했으므로 exit code는 0이다.
+
+### Evaluator 자체 실패
+
+잘못된 설정:
+
+```text
+--repeat-after-sec -1
+```
+
+결과:
+
+```text
+evaluator_error=
+--repeat-after-sec must be >= 0
+
+evaluator_error_rc=4
+```
+
+따라서 다음을 구분할 수 있다.
+
+```text
+Collector/checker 문제
+→ UNKNOWN
+→ evaluator exit 0
+
+Evaluator 자체 문제
+→ evaluator exit 4
+```
+
+### Alert Storm 방지
+
+향후 evaluator를 5초마다 실행하더라도 상태가 변하지 않으면:
+
+```text
+WARNING → WARNING
+CRITICAL → CRITICAL
+```
+
+에서는 `event=NONE`이므로 매 실행마다 알림을 보내지 않는다.
+
+단, 장시간 장애를 완전히 잊는 것을 막기 위해:
+
+```text
+--repeat-after-sec
+```
+
+기능을 제공한다.
+
+기본:
+
+```text
+300 sec
+```
+
+이후 실제 alert sender가 추가되면 REMINDER 경로도 함께 검증한다.
+
+### Persistent State
+
+기본 state file:
+
+```text
+~/.local/state/aerotrace/collector-queue-alert.json
+```
+
+state 기록은:
+
+```text
+temporary file write
+→ flush
+→ fsync
+→ rename
+```
+
+순서로 처리해 일부만 기록된 state를 읽을 위험을 줄였다.
+
+### 실무적 교훈
+
+- 상태 판정과 notification 발생 여부는 서로 다른 책임이다.
+- polling 주기가 짧다고 동일 장애 알림도 같은 빈도로 전송하면 안 된다.
+- WARNING에서 CRITICAL로 악화되는 상태 변화는 새로운 이벤트로 취급해야 한다.
+- 장애 발생 알림만큼 복구 알림도 중요하다.
+- UNKNOWN은 정상 상태가 아니며 monitoring path 자체의 장애일 수 있다.
+- scheduler가 해석하는 process failure와 실제 서비스 WARNING/CRITICAL을 분리해야 한다.
+- state machine을 실제 대규모 장애 실험 없이 fake checker로 독립 검증하면 테스트 비용과 위험을 낮출 수 있다.
+- 상태를 파일에 저장할 경우 partial write 가능성을 고려해야 한다.
+
+### 다음 작업
+
+현재 evaluator는 수동 실행 방식이다.
+
+다음 단계에서는 SaaS host에서:
+
+```text
+systemd service
++
+systemd timer
+```
+
+를 이용해 주기 실행한다.
+
+판정 로직은 Python script에 유지하고 systemd는 실행 scheduling만 담당하도록 해 향후 온프레미스 환경에서 다른 scheduler로 교체할 수 있게 한다.
+
+---
+
+## Collector Queue Alert systemd 자동 실행 및 E2E 장애 감지 검증
+
+### 목적
+
+수동으로 검증한 queue checker와 alert evaluator를 실제 운영 scheduler에 연결해 다음 전체 경로를 검증했다.
+
+```text
+주기 실행
+상태 persistence
+정상 상태 로그 억제
+Collector 장애 자동 탐지
+동일 장애 중복 억제
+Collector 복구 자동 탐지
+```
+
+### Quiet Mode 추가
+
+Evaluator에:
+
+```text
+--quiet-no-event
+```
+
+옵션을 추가했다.
+
+최초 구현 과정에서는 argparse option만 추가되고 실제 return 조건이 누락돼:
+
+```text
+quiet_rc=0
+quiet_output_bytes=455
+```
+
+로 정상 상태 출력이 계속 발생하는 문제를 발견했다.
+
+원인:
+
+```text
+--quiet-no-event option은 존재
+event=NONE 조건의 early return은 누락
+```
+
+수정:
+
+```python
+if args.quiet_no_event and event == "NONE":
+    return 0
+```
+
+을 state write 이후, 출력 직전에 추가했다.
+
+재검증:
+
+```text
+quiet_rc=0
+quiet_output_bytes=0
+```
+
+state:
+
+```json
+{
+  "current_status": "OK",
+  "last_changed_at": "2026-08-18T03:14:32+00:00",
+  "last_evaluated_at": "2026-08-18T03:14:32+00:00"
+}
+```
+
+로 정상 기록됐다.
+
+이벤트가 발생하면 quiet mode에서도 출력하도록 유지했다.
+
+### systemd Unit
+
+Repository:
+
+```text
+deploy/systemd/aerotrace-collector-queue-alert.service
+deploy/systemd/aerotrace-collector-queue-alert.timer
+```
+
+Service 구조:
+
+```text
+Type=oneshot
+User=huning
+Group=huning
+WorkingDirectory=/home/huning/aerotrace
+```
+
+Evaluator:
+
+```text
+--state-file
+/var/lib/aerotrace-monitoring/collector-queue-alert.json
+
+--repeat-after-sec 300
+--checker-timeout-sec 10
+--quiet-no-event
+```
+
+Timer:
+
+```text
+OnBootSec=30s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+```
+
+### Static Verification
+
+`systemd-analyze verify` 실행 시 AeroTrace unit 자체 오류는 발생하지 않았다.
+
+Host에 이미 존재하는 다른 unit에서 다음 메시지가 출력됐다.
+
+```text
+netplan-ovs-cleanup.service permission warning
+snapd.service RestartMode unknown key
+```
+
+AeroTrace service/timer를 가리키는 오류는 없었다.
+
+Python compile 및:
+
+```text
+git diff --check
+```
+
+도 통과했다.
+
+### systemd 설치
+
+Unit을:
+
+```text
+/etc/systemd/system
+```
+
+에 설치하고:
+
+```text
+systemctl daemon-reload
+```
+
+를 수행했다.
+
+실제 systemd가 읽은 service 값:
+
+```text
+User=huning
+Group=huning
+WorkingDirectory=/home/huning/aerotrace
+StateDirectory=aerotrace-monitoring
+```
+
+을 확인했다.
+
+### Service 단독 실행
+
+Timer를 활성화하기 전에 service를 한 번 직접 실행했다.
+
+결과:
+
+```text
+Type=oneshot
+Active=inactive (dead)
+Result=success
+ExecMainStatus=0
+```
+
+`inactive (dead)`는 oneshot 실행 종료 후의 정상 상태다.
+
+### Persistent StateDirectory 검증
+
+실제 생성:
+
+```text
+/var/lib/aerotrace-monitoring
+```
+
+State:
+
+```text
+/var/lib/aerotrace-monitoring/collector-queue-alert.json
+```
+
+권한:
+
+```text
+directory:
+huning:huning
+750
+
+state file:
+huning:huning
+640
+```
+
+현재 상태:
+
+```text
+current_status=OK
+```
+
+을 확인했다.
+
+### Timer 활성화
+
+실행:
+
+```text
+systemctl enable --now
+aerotrace-collector-queue-alert.timer
+```
+
+결과:
+
+```text
+enabled
+active
+```
+
+Timer status:
+
+```text
+active (waiting)
+```
+
+이며 약 5~6초 간격으로 service 실행이 반복됐다.
+
+### 실제 반복 실행 검증
+
+State file의 mtime과 `last_evaluated_at`을 비교했다.
+
+첫 측정:
+
+```text
+before_evaluated=
+2026-08-18T03:42:28+00:00
+
+after_evaluated=
+2026-08-18T03:42:40+00:00
+
+timer_state_update=PASS
+```
+
+다음 cycle:
+
+```text
+timer_repeat=PASS
+```
+
+따라서 timer가 active 표시만 되는 것이 아니라 실제 evaluator 실행을 반복하는 것을 검증했다.
+
+### 정상 상태 Journal
+
+최근 journal:
+
+```text
+Starting AeroTrace Collector queue alert evaluator...
+Deactivated successfully.
+Finished AeroTrace Collector queue alert evaluator.
+```
+
+가 반복됐다.
+
+정상 `event=NONE` 상태에서는 다음 상세 출력이 기록되지 않았다.
+
+```text
+checker_output_begin
+queue_size=...
+checker_output_end
+```
+
+따라서 5초 polling에서 정상 metric dump로 인한 journal spam을 억제했다.
+
+### Collector 장애 자동 감지 E2E 테스트
+
+시작:
+
+```text
+timer=enabled/active
+current_status=OK
+Collector=running
+Backend=healthy
+```
+
+Collector를 실제 중단했다.
+
+```text
+docker stop aerotrace-otel-collector
+
+running=false
+status=exited
+exit=0
+```
+
+Timer가 자동 실행된 뒤 state:
+
+```text
+current_status=UNKNOWN
+last_changed_at=2026-08-18T03:46:39+00:00
+```
+
+Journal:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+
+checker_stderr=
+UNKNOWN: <urlopen error [Errno 111] Connection refused>
+```
+
+사람이 evaluator를 직접 실행하지 않고 systemd timer가 Collector 장애를 자동 감지했다.
+
+### 동일 장애 중복 억제
+
+Collector가 계속 중단된 상태에서 timer가 여러 번 평가됐지만:
+
+```text
+alert_count=1
+```
+
+이었다.
+
+즉:
+
+```text
+최초 OK → UNKNOWN
+→ ALERT
+
+이후 UNKNOWN 유지
+→ event=NONE
+→ quiet output
+```
+
+이 실제 scheduler 환경에서도 동작했다.
+
+### Collector Recovery 자동 감지
+
+Collector를 다시 시작했다.
+
+```text
+docker start aerotrace-otel-collector
+```
+
+metrics endpoint 복구 확인 후 timer가 자동으로 상태 변화를 발견했다.
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=UNKNOWN
+current_status=OK
+checker_exit_code=0
+```
+
+state:
+
+```text
+current_status=OK
+last_changed_at=2026-08-18T03:47:15+00:00
+```
+
+최종 이벤트 수:
+
+```text
+alert_count=1
+recovery_count=1
+```
+
+### 최종 자동화 경로
+
+현재 실제 검증된 흐름:
+
+```text
+Collector healthy
+    ↓
+systemd timer 5초 polling
+    ↓
+OK
+
+Collector stop
+    ↓
+metrics Connection refused
+    ↓
+UNKNOWN
+    ↓
+ALERT 1회
+    ↓
+동일 UNKNOWN 중복 억제
+
+Collector start
+    ↓
+metrics 복구
+    ↓
+OK
+    ↓
+RECOVERY 1회
+```
+
+### 실무적 교훈
+
+- scheduler가 active인 것과 실제 workload가 반복 실행되는 것은 별도로 검증해야 한다.
+- persistent state의 mtime과 timestamp를 확인하면 실제 scheduler execution을 증명할 수 있다.
+- 정상 상태의 짧은 polling은 로그 억제가 없으면 불필요한 journal 사용량을 만든다.
+- Collector 자체 장애는 queue CRITICAL이 아니라 metrics 접근 불가 UNKNOWN으로 감지해야 한다.
+- UNKNOWN 상태 역시 alert 대상이어야 monitoring system 자체 장애를 놓치지 않는다.
+- polling과 notification을 분리하면 동일 장애의 반복 실행과 반복 알림을 독립적으로 제어할 수 있다.
+- recovery event를 실제 scheduler 경로에서 검증해야 장애 종료까지 운영 자동화가 완성된다.
+
+### 다음 작업
+
+현재 자동화는 event를 systemd journal에 출력하는 단계까지다.
+
+다음에는 실제 queue backlog에 대해:
+
+```text
+OK
+→ WARNING
+→ CRITICAL
+→ RECOVERY
+```
+
+자동 상태 전이를 검증한다.
+
+대규모 100k/160k backlog를 다시 생성하지 않고 테스트용 threshold를 안전하게 전달할 수 있는 구조를 먼저 만든다.
+
+이후 외부 notification adapter를 연결한다.
+
+---
+
+## Collector Queue WARNING / CRITICAL / RECOVERY 자동 전이 E2E 검증
+
+### 목적
+
+Collector process 자체 장애에 대한 UNKNOWN 자동 탐지 검증 이후 실제 persistent queue backlog를 이용해 다음 severity state transition 전체를 systemd timer 자동 실행 경로에서 검증했다.
+
+```text
+OK
+→ WARNING
+→ CRITICAL
+→ RECOVERY
+```
+
+대규모 production threshold backlog를 반복 생성하지 않기 위해 production configuration은 그대로 유지하면서 runtime-only test threshold를 사용했다.
+
+### Evaluator Checker Argument 전달 기능
+
+수정 파일:
+
+```text
+scripts/evaluate-collector-queue-alert.py
+```
+
+반복 지정 가능한 옵션을 추가했다.
+
+```text
+--checker-arg
+```
+
+특징:
+
+```text
+action=append
+여러 번 지정 가능
+checker subprocess argv에 순서대로 전달
+```
+
+기존 evaluator 실행 호환성 테스트:
+
+```text
+event=NONE
+alert_required=false
+previous_status=NONE
+current_status=OK
+checker_exit_code=0
+base_rc=0
+```
+
+통과.
+
+Test threshold 전달:
+
+```text
+--checker-arg=--warn-ratio
+--checker-arg=0.001
+--checker-arg=--critical-ratio
+--checker-arg=0.005
+```
+
+queue=0 상태에서:
+
+```text
+current_status=OK
+checker_exit_code=0
+arg_rc=0
+```
+
+을 확인했다.
+
+잘못된 threshold:
+
+```text
+warn=0.9
+critical=0.8
+```
+
+전달 시 checker:
+
+```text
+checker_exit_code=3
+checker_stderr=UNKNOWN: warning ratio must be lower than critical ratio.
+```
+
+Evaluator:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=NONE
+current_status=UNKNOWN
+bad_rc=0
+```
+
+으로 동작했다.
+
+즉 checker configuration failure는 monitoring 상태 UNKNOWN으로 변환되고 evaluator 자체 evaluation은 정상 완료된다.
+
+### Production 설정과 테스트 설정 분리
+
+Production checker는 기존 값을 유지했다.
+
+```text
+WARNING=50%
+CRITICAL=80%
+```
+
+테스트에만 다음 runtime systemd drop-in을 사용했다.
+
+```text
+/run/systemd/system/
+aerotrace-collector-queue-alert.service.d/
+10-test-thresholds.conf
+```
+
+테스트 종료 후 파일과 directory를 제거하고:
+
+```text
+systemctl daemon-reload
+```
+
+를 실행했다.
+
+최종:
+
+```text
+production_execstart=PASS
+```
+
+로 production ExecStart에 `--checker-arg`가 남아 있지 않음을 확인했다.
+
+---
+
+### WARNING E2E 테스트
+
+초기 상태:
+
+```text
+current_status=OK
+queue_size=0
+backend=running
+backend=healthy
+timer=enabled
+timer=active
+```
+
+Test threshold:
+
+```text
+WARNING=0.5%
+CRITICAL=2%
+```
+
+Backend를 pause했다.
+
+```text
+running=true
+paused=true
+status=paused
+```
+
+실제 telemetry 2,000 spans를 전송했다.
+
+Sender 결과:
+
+```text
+Requested spans: 2000
+Accepted spans: 2000
+Requested requests: 40
+Accepted requests: 40
+Failed requests: 0
+
+Actual elapsed sec: 2.000266
+Target spans/sec: 1000
+Observed accepted spans/sec: 999.87
+Rate error pct: 0.013
+
+Backpressure wait total ms: 0.000
+Producer backpressure events: 0
+
+Delivery success: PASS
+Sustained-rate validity: PASS
+```
+
+Collector queue:
+
+```text
+status=OK
+queue_size=2000
+queue_capacity=200000
+queue_utilization_pct=1.00
+queue_remaining_items=198000
+full_outage_headroom_sec=60.92
+in_flight=2
+accepted_spans=2000
+refused_spans=0
+```
+
+Production checker는 50%/80% default를 사용하므로:
+
+```text
+status=OK
+```
+
+이었다.
+
+Systemd evaluator는 runtime threshold를 사용해 자동으로 다음 이벤트를 생성했다.
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=WARNING
+checker_exit_code=1
+queue_size=2000
+queue_utilization_pct=1.00
+```
+
+동일 WARNING 상태의 반복 평가 후:
+
+```text
+warning_alert_count=1
+```
+
+로 alert storm이 발생하지 않았다.
+
+Backend를 unpause한 뒤 health는 다음 순서로 회복했다.
+
+```text
+unhealthy
+unhealthy
+unhealthy
+healthy
+```
+
+Collector queue는 복구 후 첫 확인에서:
+
+```text
+queue=0
+```
+
+으로 drain 완료됐다.
+
+Systemd evaluator는 자동으로 다음 recovery를 생성했다.
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=WARNING
+current_status=OK
+checker_exit_code=0
+```
+
+DB 저장 결과:
+
+```text
+2000/2000
+```
+
+테스트 runtime override 제거 후 최종 상태:
+
+```text
+current_status=OK
+queue_size=0
+timer_enabled=enabled
+timer_active=active
+db=2000/2000
+```
+
+---
+
+### WARNING → CRITICAL E2E 테스트
+
+두 번째 실험에서도 동일한 실제 backlog 크기를 사용했다.
+
+초기 test threshold:
+
+```text
+WARNING=0.5%
+CRITICAL=2%
+```
+
+Backend를 pause한 뒤 실제 2,000 spans를 전송했다.
+
+Sender:
+
+```text
+Requested spans: 2000
+Accepted spans: 2000
+Requested requests: 40
+Accepted requests: 40
+Failed requests: 0
+
+Actual elapsed sec: 2.000172
+Observed accepted spans/sec: 999.91
+Rate error pct: 0.009
+
+Backpressure wait total ms: 0.000
+Producer backpressure events: 0
+
+Delivery success: PASS
+Sustained-rate validity: PASS
+```
+
+Collector:
+
+```text
+queue_size=2000
+queue_capacity=200000
+queue_utilization_pct=1.00
+queue_remaining_items=198000
+in_flight=2
+```
+
+Systemd가 자동 WARNING을 생성했다.
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=WARNING
+checker_exit_code=1
+queue_size=2000
+queue_utilization_pct=1.00
+```
+
+Backend를 pause 상태로 유지해 queue를 2,000으로 유지한 뒤 runtime threshold만 다음 값으로 변경했다.
+
+```text
+WARNING=0.1%
+CRITICAL=0.5%
+```
+
+동일한 실제 queue metric에 대해 systemd evaluator가 다음 severity escalation을 자동 생성했다.
+
+```text
+event=STATUS_CHANGE
+alert_required=true
+previous_status=WARNING
+current_status=CRITICAL
+checker_exit_code=2
+queue_size=2000
+queue_utilization_pct=1.00
+```
+
+이벤트 count:
+
+```text
+alert_count=1
+status_change_count=1
+```
+
+따라서 동일 상태의 반복 ALERT가 아니라 실제 severity 변화에 대해 별도의 STATUS_CHANGE가 발생함을 확인했다.
+
+### CRITICAL Recovery
+
+Backend를 unpause했다.
+
+Backend health:
+
+```text
+unhealthy
+unhealthy
+unhealthy
+healthy
+```
+
+Collector queue drain 과정:
+
+```text
+1000
+1000
+0
+```
+
+Systemd evaluator는 queue가 정상화된 뒤 자동으로 다음 이벤트를 생성했다.
+
+```text
+event=RECOVERY
+alert_required=true
+previous_status=CRITICAL
+current_status=OK
+checker_exit_code=0
+```
+
+Recovery count:
+
+```text
+recovery_count=1
+```
+
+DB 저장 결과:
+
+```text
+2000/2000
+```
+
+### 최종 운영 상태
+
+Runtime test override 제거 후:
+
+```text
+production_execstart=PASS
+```
+
+최종 Collector 상태:
+
+```text
+status=OK
+queue_size=0
+queue_capacity=200000
+queue_utilization_pct=0.00
+queue_remaining_items=200000
+full_outage_headroom_sec=61.54
+in_flight=0
+```
+
+Collector process lifecycle 누적 metric:
+
+```text
+sent_spans=4000
+accepted_spans=4000
+refused_spans=0
+```
+
+이번 WARNING/CRITICAL 실험 두 번에서 각각 2,000 spans를 전송한 결과와 일치한다.
+
+Alert state:
+
+```text
+current_status=OK
+```
+
+Scheduler:
+
+```text
+timer_enabled=enabled
+timer_active=active
+```
+
+### 검증된 자동 상태 머신
+
+실제 Collector queue metric 기준:
+
+```text
+OK
+    ↓ queue threshold 초과
+WARNING
+    ↓ severity 상승
+CRITICAL
+    ↓ queue drain
+OK
+```
+
+Evaluator event:
+
+```text
+OK → WARNING
+ALERT
+
+WARNING → CRITICAL
+STATUS_CHANGE
+
+CRITICAL → OK
+RECOVERY
+```
+
+각 event:
+
+```text
+ALERT=1
+STATUS_CHANGE=1
+RECOVERY=1
+```
+
+로 검증됐다.
+
+### 실무적 교훈
+
+- Alert state machine 테스트와 production threshold 설정 변경은 분리해야 한다.
+- `/run/systemd/system` drop-in을 사용하면 reboot-persistent production configuration을 오염시키지 않고 실제 scheduler 경로를 테스트할 수 있다.
+- systemd `ExecStart`를 override할 때 기존 명령을 먼저 빈 `ExecStart=`로 초기화해야 한다.
+- Unit override 테스트 후 production configuration 복원 여부까지 검증해야 실험이 완료된 것이다.
+- 동일 metric에서도 threshold 변화에 따라 severity가 상승할 수 있으므로 단순 non-OK boolean보다 WARNING과 CRITICAL 상태를 구분할 가치가 있다.
+- WARNING 반복과 WARNING → CRITICAL 승격은 서로 다른 운영 의미를 가지므로 `ALERT`와 `STATUS_CHANGE`를 분리하는 것이 유용하다.
+- Recovery 시 직전 상태를 보존하면 WARNING 장애였는지 CRITICAL 장애였는지 전체 lifecycle을 설명할 수 있다.
+- Sender 성공, queue metric, alert event, DB 최종 저장량을 함께 확인해야 monitoring 테스트 과정에서 telemetry data loss가 발생하지 않았음을 검증할 수 있다.
+
+### 남은 범위
+
+현재 alert event는 systemd journal까지 자동 생성된다.
+
+아직 실제 운영자에게 전달되는 외부 notification channel은 연결하지 않았다.
+
+다음 단계에서는:
+
+```text
+alert_required=true
+```
+
+인 이벤트를 notification adapter가 받아 외부 채널로 전달하도록 한다.
+
+Evaluator의 상태 판단 로직과 notification transport는 분리한다.
+
+Notification 실패가 Collector queue monitoring 자체를 방해하지 않도록 timeout, retry, duplicate notification 정책도 별도로 설계한다.
+
+---
+
+## Durable Notification Outbox 및 systemd Failure Isolation 검증
+
+### 목표
+
+Collector queue alert의 상태 판단과 외부 notification transport를 분리하고 notification provider 장애가 monitoring 자체를 중단시키지 않는 구조를 구현·검증했다.
+
+기존:
+
+```text
+Collector metrics
+→ checker
+→ evaluator
+→ journal
+```
+
+변경 후:
+
+```text
+Collector metrics
+→ checker
+→ evaluator
+→ notification JSON outbox
+→ independent notification adapter
+→ transport
+```
+
+### 변경 파일
+
+```text
+scripts/evaluate-collector-queue-alert.py
+scripts/process-notification-outbox.py
+```
+
+### Evaluator JSON Event Contract
+
+Evaluator에:
+
+```text
+--output-format text|json
+```
+
+을 추가했다.
+
+기본값은:
+
+```text
+text
+```
+
+이므로 기존 production systemd 실행과 호환된다.
+
+JSON mode:
+
+```text
+--output-format json
+```
+
+에서는 한 이벤트당 JSON 한 줄만 출력한다.
+
+NONE event 검증:
+
+```text
+json_rc=0
+json_lines=1
+json_contract=PASS
+```
+
+주요 값:
+
+```text
+schema_version=1
+event=NONE
+alert_required=false
+previous_status=null
+current_status=OK
+checker_exit_code=0
+```
+
+`--quiet-no-event`와 JSON을 같이 사용한 경우:
+
+```text
+quiet_json_rc=0
+quiet_json_bytes=0
+```
+
+을 확인했다.
+
+잘못된 checker threshold를 이용한 ALERT JSON:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=null
+current_status=UNKNOWN
+checker_exit_code=3
+```
+
+검증:
+
+```text
+alert_json_contract=PASS
+```
+
+### Event Outbox
+
+Evaluator에:
+
+```text
+--event-outbox-dir
+```
+
+을 추가했다.
+
+Notification event에는:
+
+```text
+event_id
+```
+
+가 추가됐다.
+
+최초 ALERT:
+
+```text
+outbox_alert_rc=0
+outbox JSON file=1
+stdout_outbox_match=PASS
+outbox_contract=PASS
+```
+
+동일 UNKNOWN 상태를 다시 평가하면:
+
+```text
+repeat_rc=0
+repeat_output_bytes=0
+outbox_file_count=1
+```
+
+로 새로운 notification event가 추가되지 않았다.
+
+### Outbox Failure Ordering
+
+Outbox path가 directory가 될 수 없도록 의도적으로 실패시켰다.
+
+결과:
+
+```text
+evaluator_error=event outbox write failed: [Errno 20] Not a directory
+outbox_failure_rc=4
+state_after_outbox_failure=PASS_not_written
+```
+
+Outbox 문제를 해결한 뒤 재실행:
+
+```text
+retry_rc=0
+event=ALERT
+current_status=UNKNOWN
+retry_outbox_count=1
+```
+
+Evaluator state도 이후 정상 생성됐다.
+
+따라서 outbox 저장 실패 때문에 최초 notification event가 사라지는 것을 방지했다.
+
+### Notification Adapter
+
+새 스크립트:
+
+```text
+scripts/process-notification-outbox.py
+```
+
+기능:
+
+```text
+pending JSON 조회
+schema_version 검증
+event_id 검증
+event/status contract 검증
+순서대로 event 처리
+delivery 성공 시 pending 제거
+delivery 실패 시 pending 유지
+event_id duplicate ACK
+```
+
+정상 local delivery:
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+processed_events=1
+remaining_events=0
+adapter_rc=0
+```
+
+파일 상태:
+
+```text
+pending_before=1
+pending_after=0
+delivered_after=1
+```
+
+### Duplicate ACK
+
+이미 delivered된 event를 pending에 다시 놓아 crash window를 재현했다.
+
+Adapter:
+
+```text
+delivery_result=ACK_EXISTING
+```
+
+결과:
+
+```text
+pending_after_ack_existing=0
+delivered_after_ack_existing=1
+```
+
+로 동일 event가 이중 저장되지 않았다.
+
+### Adapter Delivery Failure
+
+Delivered path를 일반 파일로 만들어 delivery를 실패시켰다.
+
+결과:
+
+```text
+adapter_error=delivery failed: [Errno 17] File exists: ...
+delivery_failure_rc=2
+pending_after_delivery_failure=1
+```
+
+Evaluator state:
+
+```text
+current_status=UNKNOWN
+```
+
+은 그대로 유지됐다.
+
+Delivery path 복구 후:
+
+```text
+delivery_result=DELIVERED
+delivery_retry_rc=0
+pending_after_retry=0
+delivered_after_retry=1
+```
+
+로 재처리됐다.
+
+### IDLE Log Suppression
+
+5초 systemd timer의 정상 상태 로그를 억제하기 위해 adapter에:
+
+```text
+--quiet-idle
+```
+
+을 추가했다.
+
+기존 기본 동작:
+
+```text
+adapter_status=IDLE
+processed_events=0
+remaining_events=0
+normal_idle_rc=0
+```
+
+`--quiet-idle`:
+
+```text
+quiet_idle_rc=0
+quiet_idle_bytes=0
+```
+
+Outbox directory 자체가 없는 경우에도:
+
+```text
+missing_outbox_rc=0
+missing_outbox_bytes=0
+```
+
+실제 event가 존재하면 quiet 옵션과 관계없이 delivery 로그는 출력됐다.
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+processed_events=1
+remaining_events=0
+event_delivery_rc=0
+```
+
+### systemd Normal Pipeline
+
+Runtime-only systemd 설정으로 다음 두 독립 timer를 구성했다.
+
+```text
+aerotrace-collector-queue-alert.timer
+aerotrace-notification-outbox.timer
+```
+
+Evaluator에는 runtime-only:
+
+```text
+--event-outbox-dir /var/lib/aerotrace-monitoring/notification-outbox
+```
+
+을 추가했다.
+
+Production checker threshold argument는 추가하지 않았다.
+
+검증:
+
+```text
+evaluator_outbox=PASS
+production_threshold=PASS_default
+```
+
+Notification timer:
+
+```text
+notification_timer_active=active
+```
+
+Evaluator 반복 실행:
+
+```text
+before_evaluated=2026-08-18T06:35:57+00:00
+after_evaluated=2026-08-18T06:36:14+00:00
+evaluator_still_running=PASS
+```
+
+정상 상태:
+
+```text
+pending_events=0
+delivered_events=0
+```
+
+Notification service:
+
+```text
+Result=success
+ExecMainStatus=0
+```
+
+Journal에는 Python IDLE/OK metric spam 없이 systemd lifecycle log만 남았다.
+
+### systemd ALERT / RECOVERY E2E
+
+초기:
+
+```text
+current_status=OK
+Collector running
+pending=0
+delivered=0
+```
+
+Collector를 실제 중단했다.
+
+```text
+running=false
+status=exited
+exit=0
+```
+
+Evaluator 자동 상태 전이:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+checker_stderr=UNKNOWN: <urlopen error [Errno 111] Connection refused>
+```
+
+Notification adapter timer 자동 처리:
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+processed_events=1
+remaining_events=0
+```
+
+결과:
+
+```text
+pending_after_alert=0
+delivered_after_alert=1
+automatic_alert_delivery=PASS
+```
+
+Collector를 다시 시작하고 metrics endpoint 준비를 확인했다.
+
+Evaluator가 자동으로:
+
+```text
+UNKNOWN → OK
+RECOVERY
+```
+
+를 생성했고 notification adapter가 자동 전달했다.
+
+최종 sequence:
+
+```text
+1: event=ALERT previous=OK current=UNKNOWN
+2: event=RECOVERY previous=UNKNOWN current=OK
+```
+
+검증:
+
+```text
+automatic_recovery_delivery=PASS
+delivered_event_sequence=PASS
+
+final_pending=0
+final_delivered=2
+```
+
+Delivered JSON 파일 권한:
+
+```text
+owner=huning
+group=huning
+mode=640
+```
+
+으로 systemd service의 `UMask=0027`이 적용됨을 확인했다.
+
+### systemd Notification Failure Isolation
+
+Baseline:
+
+```text
+delivered_baseline=2
+pending_baseline=0
+before_failure_evaluated=2026-08-18T06:44:47+00:00
+```
+
+Notification service의 delivered-dir만 runtime override로 고장냈다.
+
+Collector 중단 후:
+
+```text
+attempt=03
+state=UNKNOWN
+pending=1
+
+pending_alert_after_delivery_failure=PASS
+```
+
+Notification journal:
+
+```text
+adapter_error=delivery failed: [Errno 17] File exists: '/var/lib/aerotrace-monitoring/notification-delivery-blocker'
+failed_event_id=1787035511951348652-1520983
+remaining_events=1
+```
+
+Notification failure를 유지한 채 14초 후 evaluator:
+
+```text
+before_failure_evaluated=2026-08-18T06:44:47+00:00
+after_failure_evaluated=2026-08-18T06:45:29+00:00
+
+evaluator_independent_from_notification=PASS
+```
+
+동시에:
+
+```text
+pending_during_failure=1
+evaluator_timer=active
+notification_timer=active
+
+Evaluator:
+Result=success
+ExecMainStatus=0
+```
+
+이었다.
+
+따라서 notification delivery 실패가 Collector 상태 평가 주기를 중단시키지 않았다.
+
+### 자동 Pending Retry
+
+Notification failure override만 제거하고 adapter를 수동 실행하지 않았다.
+
+첫 확인에서:
+
+```text
+pending=0
+delivered=3
+
+automatic_pending_retry=PASS
+```
+
+가 됐다.
+
+Retry된 event:
+
+```text
+latest_event=ALERT
+previous=OK
+current=UNKNOWN
+event_id=1787035511951348652-1520983
+
+retried_alert_contract=PASS
+```
+
+원래 pending event_id가 그대로 전달됐다.
+
+Collector를 복구한 뒤:
+
+```text
+state=OK
+delivered=4
+
+automatic_recovery_after_notification_failure=PASS
+```
+
+마지막 두 event:
+
+```text
+1: ALERT
+   OK → UNKNOWN
+
+2: RECOVERY
+   UNKNOWN → OK
+
+failure_recovery_sequence=PASS
+```
+
+### Runtime Cleanup
+
+Notification test timer 중단 후 다음을 제거했다.
+
+```text
+runtime evaluator outbox override
+runtime notification service
+runtime notification timer
+notification failure override
+test outbox
+test delivered sink
+```
+
+최종:
+
+```text
+production_evaluator=PASS
+notification_runtime_cleanup=PASS
+
+evaluator_timer_enabled=enabled
+evaluator_timer_active=active
+
+Collector:
+running=true
+status=running
+
+queue:
+status=OK
+queue_size=0
+
+state:
+current_status=OK
+```
+
+Collector restart 이후 일부 metric:
+
+```text
+in_flight=N/A
+sent_spans=N/A
+accepted_spans=N/A
+refused_spans=N/A
+```
+
+은 새로운 Collector process에서 아직 해당 metric series가 생성되지 않은 상태로 해석한다.
+
+Checker는 missing metric을 0으로 변환하지 않고 `N/A`로 표시하도록 설계되어 있으므로 정상 동작이다.
+
+### 확인된 운영 특성
+
+이번 실험으로 다음을 실제 검증했다.
+
+```text
+notification failure가 evaluator를 중단시키지 않음
+pending event가 notification 실패 중 유지됨
+동일 UNKNOWN 반복으로 pending ALERT가 증가하지 않음
+transport 복구 후 timer가 pending event를 자동 retry
+ALERT 전달 후 RECOVERY가 순서대로 전달됨
+normal state log spam 억제
+runtime-only systemd 테스트 후 production configuration 복구
+```
+
+### 남은 기술 부채
+
+Evaluator outbox writer는 현재:
+
+```text
+file fsync
+→ rename
+```
+
+까지 수행하지만 rename 이후 outbox directory fsync는 수행하지 않는다.
+
+따라서 다음 경계는 아직 검증되지 않았다.
+
+```text
+호스트 abrupt power loss
+rename 직후 filesystem metadata durability
+disk full
+filesystem corruption
+```
+
+또한 evaluator state의:
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+는 실제 transport delivery 완료 시간이 아니라 alert-required event를 생성하고 handoff한 시간에 가깝다.
+
+실제 외부 notification transport를 production에 연결하기 전에 이 의미를 명확하게 분리해야 한다.
+
+---
+
+## Evaluator Notification State 의미 정리 및 Production Migration
+
+### 목표
+
+외부 notification transport를 연결하기 전에 evaluator state의 `last_notification_*` 필드가 실제 delivery 완료 시각처럼 오해될 수 있는 문제를 수정했다.
+
+기존:
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+변경:
+
+```text
+last_alert_event_at
+last_alert_event_epoch
+```
+
+### Migration 전략
+
+Python 내부 identifier와 persisted JSON key migration을 분리했다.
+
+새 persisted key를 우선 읽고 값이 없으면 기존 legacy key를 fallback한다.
+
+```text
+last_alert_event_epoch
+→ 없으면 last_notification_epoch
+
+last_alert_event_at
+→ 없으면 last_notification_at
+```
+
+State를 다시 저장할 때 legacy key를 제거하고 새 key로 보존한다.
+
+### 첫 Patch 실패
+
+최초 자동 patch는:
+
+```text
+legacy migration insertion point was not found
+```
+
+에서 종료됐다.
+
+`path.write_text()` 전에 종료됐기 때문에 실제 source file과 production state에는 부분 변경이 남지 않았다.
+
+확인:
+
+```text
+git diff 없음
+production state legacy key 유지
+evaluator 정상 실행
+```
+
+따라서 rollback이나 state 복구 없이 patch를 다시 적용할 수 있었다.
+
+### Legacy State Migration
+
+Legacy fixture에:
+
+```text
+last_notification_at
+last_notification_epoch
+```
+
+를 저장한 뒤 evaluator를 실행했다.
+
+결과:
+
+```text
+migration_rc=0
+legacy_state_migration=PASS
+```
+
+변환된 state:
+
+```text
+last_alert_event_at 존재
+last_alert_event_epoch 존재
+last_notification_at 없음
+last_notification_epoch 없음
+```
+
+### Reminder Suppression 회귀 테스트
+
+Fake checker:
+
+```text
+status=WARNING
+exit=1
+```
+
+Legacy WARNING state에 현재 시각의:
+
+```text
+last_notification_epoch
+```
+
+를 저장하고 repeat interval을 300초로 실행했다.
+
+결과:
+
+```text
+event=NONE
+alert_required=false
+previous_status=WARNING
+current_status=WARNING
+
+legacy_repeat_suppression=PASS
+reminder_state_migration=PASS
+```
+
+따라서 migration 때문에 동일 WARNING에 대한 REMINDER가 즉시 재발생하지 않았다.
+
+### Production Migration
+
+Migration 전 production state:
+
+```text
+current_status=OK
+
+last_notification_at
+= 2026-08-18T06:45:59+00:00
+
+last_notification_epoch
+= 1787035559.0960143
+```
+
+Collector 상태:
+
+```text
+status=OK
+queue_size=0
+```
+
+Production evaluator를 한 번 실행해 state를 migration했다.
+
+결과:
+
+```text
+production_migration_rc=0
+production_state_migration=PASS
+```
+
+Migration 후:
+
+```text
+last_alert_event_at
+= 2026-08-18T06:45:59+00:00
+
+last_alert_event_epoch
+= 1787035559.0960143
+```
+
+으로 기존 timestamp가 그대로 유지됐다.
+
+Legacy key는 제거됐다.
+
+### Runtime 검증
+
+Evaluator timer를 다시 시작했다.
+
+```text
+evaluator_timer_enabled=enabled
+evaluator_timer_active=active
+```
+
+반복 실행 후 state:
+
+```text
+current_status=OK
+last_alert_event_at 존재
+last_alert_event_epoch 존재
+last_notification_* 없음
+```
+
+Collector:
+
+```text
+status=OK
+queue_size=0
+```
+
+으로 정상 상태를 유지했다.
+
+### 결과
+
+Evaluator의 상태 의미가 다음과 같이 명확해졌다.
+
+```text
+last_alert_event_*
+= evaluator가 notification-required event를 발생시킨 시각
+```
+
+실제 외부 transport delivery 성공 시각은 이후 notification adapter의 별도 receipt state로 관리한다.
+
+---
+
+## Notification Delivery Receipt 구현 및 Crash-window 검증
+
+### 변경 파일
+
+```text
+scripts/process-notification-outbox.py
+```
+
+### 목표
+
+Notification event 발생 시각과 실제 transport 성공 시각을 별도의 데이터로 관리한다.
+
+기존 event:
+
+```text
+evaluated_at
+```
+
+에 더해 adapter 성공 시점에:
+
+```text
+delivered_at
+```
+
+을 가진 receipt를 생성한다.
+
+### Receipt Contract
+
+Receipt schema:
+
+```text
+receipt_schema_version=1
+event_id
+transport
+delivered_at
+event
+```
+
+현재 테스트 transport:
+
+```text
+transport=local-file
+```
+
+실제 검증:
+
+```text
+event_id=1787037470416077807-1565940
+evaluated_at=2026-08-18T07:17:50+00:00
+delivered_at=2026-08-18T07:17:57+00:00
+
+delivery_receipt_contract=PASS
+```
+
+`receipt.event_id`와 원본 `event.event_id`가 동일함을 확인했다.
+
+### Receipt Directory CLI
+
+새 canonical option:
+
+```text
+--receipt-dir
+```
+
+기존 option:
+
+```text
+--delivered-dir
+```
+
+은 compatibility alias로 유지한다.
+
+검증:
+
+```text
+legacy_alias_rc=0
+legacy_alias_bytes=0
+```
+
+### ACK_EXISTING
+
+Receipt가 이미 존재하는 동일 event를 pending에 다시 생성해 delivery 성공 후 ACK 전에 process가 종료된 crash window를 재현했다.
+
+재처리 결과:
+
+```text
+delivery_result=ACK_EXISTING
+event_id=1787037470416077807-1565940
+event=ALERT
+
+adapter_status=OK
+processed_events=1
+remaining_events=0
+
+ack_existing_rc=0
+```
+
+파일 상태:
+
+```text
+pending_before_ack_existing=1
+pending_after_ack_existing=0
+receipt_after_ack_existing=1
+```
+
+### Delivery Timestamp 보존
+
+기존 receipt:
+
+```text
+delivered_at_before
+= 2026-08-18T07:17:57+00:00
+```
+
+ACK_EXISTING 이후:
+
+```text
+delivered_at_after
+= 2026-08-18T07:17:57+00:00
+```
+
+검증:
+
+```text
+delivery_timestamp_preserved=PASS
+```
+
+따라서 동일 event retry가 최초 delivery 성공 시각을 변경하지 않는다.
+
+### Receipt Identity
+
+최종 receipt:
+
+```text
+receipt_schema_version=1
+transport=local-file
+event=ALERT
+event_id=1787037470416077807-1565940
+evaluated_at=2026-08-18T07:17:50+00:00
+delivered_at=2026-08-18T07:17:57+00:00
+```
+
+검증:
+
+```text
+receipt_identity=PASS
+```
+
+### Receipt 저장 실패
+
+Receipt directory 위치를 일반 파일로 막아 저장 실패를 재현했다.
+
+결과:
+
+```text
+adapter_error=delivery failed: [Errno 17] File exists: ...
+receipt_failure_rc=2
+pending_after_receipt_failure=1
+```
+
+즉 receipt가 영속화되지 않은 notification event는 pending outbox에서 제거하지 않는다.
+
+### 현재 보장 범위
+
+현재 구현은 local-file transport에서 다음을 검증했다.
+
+```text
+event 발생 시각과 delivery 성공 시각 분리
+receipt identity 보존
+receipt 저장 후 pending ACK
+crash window의 ACK_EXISTING
+최초 delivered_at 보존
+receipt 실패 시 pending 유지
+기존 --delivered-dir CLI 호환
+```
+
+아직 HTTP transport의 다음 특성은 검증하지 않았다.
+
+```text
+2xx 성공 기준
+4xx 처리 정책
+5xx retry
+connection refused
+timeout
+response body 제한
+ambiguous timeout
+외부 provider duplicate delivery
+```
+
+다음 단계에서 Generic Webhook transport를 local fake HTTP server로 검증한다.
+
+---
+
+## Generic Webhook Transport 구현 및 HTTP Failure Semantics 검증
+
+### 변경 파일
+
+```text
+scripts/process-notification-outbox.py
+```
+
+### Transport 경계
+
+Notification adapter에:
+
+```text
+--transport local-file|webhook
+```
+
+을 추가했다.
+
+기본 transport:
+
+```text
+local-file
+```
+
+로 기존 동작을 유지했다.
+
+Webhook configuration:
+
+```text
+--webhook-url
+AEROTRACE_WEBHOOK_URL
+--webhook-timeout-sec
+```
+
+을 지원한다.
+
+초기 timeout default:
+
+```text
+5 seconds
+```
+
+이며 실제 운영 최적값으로 확정한 수치는 아니다.
+
+### Configuration Validation
+
+다음 오류를 실제 검증했다.
+
+```text
+local-file + --webhook-url
+→ rc=4
+
+webhook + URL 없음
+→ rc=4
+
+ftp scheme
+→ rc=4
+
+URL userinfo credential
+→ rc=4
+
+webhook timeout <= 0
+→ rc=4
+```
+
+기존:
+
+```text
+--delivered-dir
+```
+
+은 `--receipt-dir` alias로 계속 동작한다.
+
+```text
+legacy_alias_rc=0
+legacy_alias_bytes=0
+```
+
+### 기존 Local-file 회귀
+
+Transport dispatch 추가 후 기존 기본 실행을 다시 검증했다.
+
+```text
+delivery_result=DELIVERED
+local_default_rc=0
+default_local_transport=PASS
+```
+
+Webhook 구현 이후에도 다시:
+
+```text
+local_regression_rc=0
+local_transport_regression=PASS
+```
+
+를 확인했다.
+
+### Webhook 2xx Success Path
+
+Local fake HTTP server를 임의 localhost port에서 실행하고 실제 POST를 전송했다.
+
+Server 응답:
+
+```text
+HTTP 204
+```
+
+Adapter 결과:
+
+```text
+delivery_result=DELIVERED
+event=ALERT
+adapter_status=OK
+processed_events=1
+remaining_events=0
+
+webhook_204_rc=0
+```
+
+Outbox:
+
+```text
+pending_before_webhook=1
+pending_after_webhook=0
+```
+
+Receipt:
+
+```text
+webhook_receipt_count=1
+transport=webhook
+```
+
+### 실제 Request Contract
+
+Fake HTTP server에서 실제 request를 capture했다.
+
+```text
+method=POST
+path=/aerotrace
+content_type=application/json
+accept=application/json
+user_agent=AeroTrace-Notification/1
+```
+
+Header:
+
+```text
+X-AeroTrace-Event-Id
+= 1787039514075281594-1612606
+```
+
+Body:
+
+```text
+event_id
+= 1787039514075281594-1612606
+
+event=ALERT
+current_status=WARNING
+alert_required=true
+```
+
+검증:
+
+```text
+webhook_request_contract=PASS
+```
+
+### Webhook Receipt
+
+실제 값:
+
+```text
+evaluated_at=2026-08-18T07:51:54+00:00
+delivered_at=2026-08-18T07:52:02+00:00
+```
+
+검증:
+
+```text
+webhook_receipt_contract=PASS
+```
+
+### Failure Class
+
+추가한 실패 타입:
+
+```text
+WebhookRetryableError
+WebhookPermanentError
+```
+
+Status classification:
+
+```text
+408
+429
+500~599
+→ WebhookRetryableError
+
+3xx
+기타 4xx
+→ WebhookPermanentError
+```
+
+Exit code:
+
+```text
+retryable = 2
+permanent = 5
+```
+
+두 경우 모두 pending event를 삭제하지 않는다.
+
+### HTTP 400
+
+결과:
+
+```text
+prepared_case=400 pending=1
+
+adapter_error=permanent delivery failure:
+webhook returned permanent HTTP 400
+
+http_400_rc=5
+http_400_pending=1
+http_400_receipts=0
+```
+
+### HTTP 408
+
+결과:
+
+```text
+http_408_pending_before=1
+
+adapter_error=retryable delivery failure:
+webhook returned retryable HTTP 408
+
+http_408_rc=2
+http_408_pending_after=1
+http_408_receipts=0
+
+http_408_server_stopped=PASS
+```
+
+### HTTP 429
+
+결과:
+
+```text
+prepared_case=429 pending=1
+
+adapter_error=retryable delivery failure:
+webhook returned retryable HTTP 429
+
+http_429_rc=2
+http_429_pending=1
+```
+
+### HTTP 500
+
+결과:
+
+```text
+prepared_case=500 pending=1
+
+adapter_error=retryable delivery failure:
+webhook returned retryable HTTP 500
+
+http_500_rc=2
+http_500_pending=1
+```
+
+### Redirect
+
+Fake server:
+
+```text
+/redirect
+→ HTTP 302
+→ Location: /redirect-target
+```
+
+결과:
+
+```text
+adapter_error=permanent delivery failure:
+webhook returned permanent HTTP 302
+
+redirect_rc=5
+redirect_requests_added=1
+redirect_target_requests_added=0
+redirect_pending=1
+```
+
+따라서 urllib의 기본 redirect 동작을 사용하지 않고 redirect를 실제로 차단했다.
+
+### Connection Refused
+
+사용하지 않는 localhost port에 POST했다.
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+connection_refused_rc=2
+connection_refused_pending=1
+```
+
+### Ambiguous Timeout
+
+Fake server 동작:
+
+```text
+request body 수신 및 기록
+→ 1초 sleep
+→ HTTP 204
+```
+
+Adapter timeout:
+
+```text
+0.2 seconds
+```
+
+첫 시도:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request timed out
+
+timeout_rc=2
+timeout_server_received=1
+timeout_pending=1
+timeout_receipts=0
+```
+
+Receiver는 request를 수신했지만 AeroTrace에는 성공 receipt가 없다.
+
+같은 pending을 다시 처리했다.
+
+```text
+timeout_retry_rc=2
+timeout_second_request_received=1
+```
+
+두 request의 event ID:
+
+```text
+1787039776322030495-1618606
+```
+
+으로 동일했다.
+
+검증:
+
+```text
+timeout_duplicate_identity=PASS
+```
+
+### 확인된 Delivery 특성
+
+이번 실험으로 다음을 실제 확인했다.
+
+```text
+HTTP 성공 시에만 receipt 생성
+HTTP 성공 후에만 pending ACK
+
+permanent failure에서도 pending 보존
+retryable failure에서도 pending 보존
+
+redirect 자동 추적 안 함
+connection failure retry 가능
+
+timeout 후 receiver 수신 여부가 ambiguous할 수 있음
+동일 event_id로 retry되어 duplicate delivery가 발생할 수 있음
+```
+
+따라서 Generic Webhook notification을 exactly-once라고 표현하지 않는다.
+
+### 현재 운영 위험
+
+현재 retry 자체는 systemd timer의 반복 실행에 의존한다.
+
+아직:
+
+```text
+per-event exponential backoff
+Retry-After 지원
+retry 횟수
+first failure timestamp
+outbox oldest age
+dead-letter queue
+outbox growth limit
+```
+
+을 구현하지 않았다.
+
+Webhook endpoint가 장기간 실패하면 pending outbox가 증가할 수 있으므로 실제 production webhook 활성화 전에 이 부분을 운영 관점에서 추가 검토해야 한다.
+
+---
+
+### Portfolio Checkpoint — Generic Webhook Delivery와 Ambiguous Timeout 검증
+
+Collector queue alert를 실제 HTTP webhook으로 전달할 수 있는 notification transport를 구현하고, 성공뿐 아니라 HTTP 및 network failure semantics를 local fake server로 직접 검증했다.
+
+### 구현한 구조
+
+```text
+Collector queue state
+→ evaluator
+→ JSON outbox
+→ notification adapter
+→ HTTP POST
+→ webhook receiver
+→ delivery receipt
+→ pending ACK
+```
+
+### HTTP Success Path
+
+HTTP 204 응답에서:
+
+```text
+pending 1 → 0
+webhook receipt 0 → 1
+adapter rc=0
+```
+
+을 확인했다.
+
+실제 request:
+
+```text
+POST /aerotrace
+Content-Type: application/json
+X-AeroTrace-Event-Id: <event_id>
+```
+
+Header event ID와 body event ID가 동일함을 검증했다.
+
+```text
+webhook_request_contract=PASS
+webhook_receipt_contract=PASS
+```
+
+### Failure Classification
+
+실제 HTTP server를 이용해 다음 결과를 검증했다.
+
+```text
+400 → permanent → rc=5
+408 → retryable → rc=2
+429 → retryable → rc=2
+500 → retryable → rc=2
+302 → permanent → rc=5
+connection refused → retryable → rc=2
+timeout → retryable → rc=2
+```
+
+모든 failure에서 pending event가 유지됐다.
+
+### Redirect Security
+
+HTTP 302에 Location header를 설정했다.
+
+검증:
+
+```text
+redirect_requests_added=1
+redirect_target_requests_added=0
+```
+
+으로 redirect target에 payload가 전달되지 않았음을 확인했다.
+
+### Ambiguous Timeout 실험
+
+Receiver가 request를 기록한 후 응답을 늦게 보내도록 만들고 AeroTrace timeout을 더 짧게 설정했다.
+
+결과:
+
+```text
+timeout_server_received=1
+timeout_rc=2
+timeout_pending=1
+timeout_receipts=0
+```
+
+즉 receiver는 request를 실제로 받았지만 sender는 성공 여부를 확인할 수 없는 상태를 재현했다.
+
+같은 pending을 재시도하자:
+
+```text
+timeout_second_request_received=1
+```
+
+이 추가됐고 두 request의 event ID가 동일했다.
+
+```text
+timeout_duplicate_identity=PASS
+```
+
+이를 통해 HTTP notification에서 exactly-once delivery를 단순히 구현할 수 없고, receiver-side idempotency가 왜 필요한지 실제 코드와 네트워크 실험으로 확인했다.
+
+### 직접 얻은 실무 경험
+
+이번 단계에서 다음 운영 개념을 실제로 다뤘다.
+
+```text
+HTTP transport failure classification
+retryable vs permanent failure
+at-least-once 성격의 retry
+ambiguous timeout
+idempotency key
+receiver deduplication
+delivery receipt
+redirect security
+outbox ordering
+failure 시 event 보존
+```
+
+### 보존할 로그와 증거
+
+```text
+webhook_204_rc=0
+webhook_request_contract=PASS
+webhook_receipt_contract=PASS
+
+http_400_rc=5
+http_400_pending=1
+http_400_receipts=0
+
+http_408_rc=2
+http_408_pending_after=1
+http_408_receipts=0
+
+http_429_rc=2
+http_429_pending=1
+
+http_500_rc=2
+http_500_pending=1
+
+redirect_rc=5
+redirect_requests_added=1
+redirect_target_requests_added=0
+redirect_pending=1
+
+connection_refused_rc=2
+connection_refused_pending=1
+
+timeout_rc=2
+timeout_server_received=1
+timeout_pending=1
+timeout_receipts=0
+
+timeout_retry_rc=2
+timeout_second_request_received=1
+timeout_duplicate_identity=PASS
+```
+
+특히 timeout experiment의 log와 event ID 비교 결과는 포트폴리오와 기술 블로그에 보존할 가치가 높다.
+
+### 이력서 성과 문장 초안
+
+- Collector 장애 알림을 JSON outbox 기반 Generic Webhook으로 전달하는 경로를 구현하고 HTTP `2xx/400/408/429/5xx`, redirect, connection failure, timeout 시나리오를 실제 local HTTP server로 검증하여 실패 유형별 pending 보존 및 retry semantics를 설계
+- HTTP timeout에서 receiver가 요청을 수신했지만 sender가 성공 여부를 확인하지 못하는 ambiguous delivery를 재현하고 동일 `event_id` 기반 재전송을 검증해 exactly-once 한계를 확인하고 receiver-side idempotency를 고려한 notification 구조를 구축
+
+실제 외부 provider 또는 production systemd 배포까지 완료된 것처럼 표현하지 않는다.
+
+### 예상 면접 질문
+
+```text
+왜 HTTP 400과 500의 exit code를 다르게 했는가?
+
+왜 permanent error에서도 pending을 삭제하지 않는가?
+
+왜 HTTP 302 redirect를 따라가지 않는가?
+
+timeout인데 receiver가 실제 request를 받은 것을 어떻게 증명했는가?
+
+동일 notification이 두 번 전달될 수 있는데 어떻게 대응할 것인가?
+
+event_id를 HTTP header에도 넣은 이유는 무엇인가?
+
+delivery receipt는 어떤 시점에 만들어야 하는가?
+
+receipt를 먼저 만들고 pending을 삭제하는 이유는 무엇인가?
+
+왜 exactly-once라고 표현하면 안 되는가?
+
+429 Retry-After는 현재 어떻게 처리하며 이후 어떻게 개선할 것인가?
+```
+
+### 블로그 주제
+
+**제목**
+
+```text
+Webhook 알림은 왜 Exactly-Once가 아닌가:
+Timeout과 중복 전송을 직접 재현해 본 과정
+```
+
+**핵심 흐름**
+
+```text
+1. 단순 POST 구현
+2. Outbox와 receipt 설계
+3. 2xx 성공 기준
+4. 400 / 429 / 500 분류
+5. redirect 차단
+6. timeout 실험
+7. receiver는 받았지만 sender는 모르는 상태
+8. 동일 event_id retry
+9. receiver-side idempotency 필요성
+10. 실제 운영에서 남은 retry/backoff 문제
+```
+
+### 다음 한 단계 높은 과제
+
+Webhook 전송 자체보다 다음 운영 문제를 해결하는 것이 중요하다.
+
+```text
+notification endpoint 장기 장애
+→ pending outbox 증가
+→ 얼마나 오래 실패 중인지 알 수 없음
+→ systemd가 계속 동일 event를 retry
+```
+
+따라서 다음 단계에서는 retry/backoff를 바로 복잡하게 구현하기 전에 먼저:
+
+```text
+pending event 수
+oldest pending age
+실패 지속 시간
+최근 failure type
+```
+
+을 운영자가 관찰할 수 있도록 만들고, 그 측정 결과를 바탕으로 backoff / retry budget / dead-letter 정책 도입 여부를 결정한다.
+
+---
+
+## Notification Outbox 적체 관측 및 실제 Age 상태 전이 검증
+
+### 구현 파일
+
+```text
+scripts/check-notification-outbox.py
+```
+
+### 목표
+
+Webhook notification 전달 실패가 장기화될 때 단순히 pending 파일이 존재하는지 확인하는 것을 넘어 다음 상태를 운영자가 직접 확인할 수 있도록 했다.
+
+```text
+pending event 수
+pending 전체 bytes
+가장 오래된 pending event age
+가장 오래된 event ID
+가장 오래된 event evaluated_at
+```
+
+### 제공하는 관측값
+
+Checker는 다음 값을 출력한다.
+
+```text
+status
+pending_events
+pending_bytes
+oldest_pending_age_sec
+oldest_event_id
+oldest_evaluated_at
+count_threshold_status
+age_threshold_status
+```
+
+상태별 exit code:
+
+```text
+OK       = 0
+WARNING  = 1
+CRITICAL = 2
+UNKNOWN  = 3
+```
+
+### Empty Outbox 검증
+
+존재하지 않는 outbox directory는 pending event가 없는 정상 상태로 처리했다.
+
+결과:
+
+```text
+status=OK
+pending_events=0
+pending_bytes=0
+oldest_pending_age_sec=N/A
+oldest_event_id=N/A
+oldest_evaluated_at=N/A
+missing_outbox_rc=0
+```
+
+### 실제 Pending 파일 관측
+
+테스트 event 두 개를 생성해 관측값을 검증했다.
+
+실제 결과:
+
+```text
+pending_events=2
+pending_bytes=585
+oldest_pending_age_sec=94.694
+oldest_event_id=v7b41-oldest
+```
+
+자동 검증:
+
+```text
+outbox_observability=PASS
+```
+
+### Pending Age 계산 기준
+
+파일의 mtime 대신 event JSON의 `evaluated_at`을 사용한다.
+
+계산:
+
+```text
+현재 시각 - evaluated_at
+```
+
+파일이 이동되거나 복구되면서 mtime이 변경되더라도 실제 notification event가 발생한 시각을 유지하기 위한 선택이다.
+
+### Corruption Detection
+
+손상된 pending JSON을 추가했다.
+
+```text
+{broken json
+```
+
+결과:
+
+```text
+status=UNKNOWN
+pending_events=3
+checker_error=invalid pending event: ...
+broken_event_rc=3
+```
+
+따라서 notification outbox 내부 데이터가 손상된 상태를 정상으로 숨기지 않는다.
+
+### 잘못된 Outbox Path
+
+Outbox path에 directory 대신 일반 파일을 배치했다.
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=outbox path is not a directory: ...
+outbox_path_error_rc=3
+```
+
+### Configurable Threshold 구현
+
+추가한 옵션:
+
+```text
+--warn-count
+--critical-count
+--warn-age-sec
+--critical-age-sec
+```
+
+Threshold가 없을 경우 관측 전용 동작을 유지한다.
+
+실제 pending 두 개가 있어도:
+
+```text
+status=OK
+count_threshold_status=OK
+age_threshold_status=OK
+default_threshold_rc=0
+```
+
+으로 동작했다.
+
+### Count WARNING 검증
+
+조건:
+
+```text
+pending_events=2
+warn-count=2
+critical-count=3
+```
+
+결과:
+
+```text
+status=WARNING
+count_threshold_status=WARNING
+age_threshold_status=OK
+count_warning_rc=1
+```
+
+### Count CRITICAL 검증
+
+조건:
+
+```text
+pending_events=2
+warn-count=1
+critical-count=2
+```
+
+결과:
+
+```text
+status=CRITICAL
+count_threshold_status=CRITICAL
+age_threshold_status=OK
+count_critical_rc=2
+```
+
+### Age WARNING 검증
+
+약 120초 된 test event 하나를 사용했다.
+
+조건:
+
+```text
+warn-age-sec=60
+critical-age-sec=3600
+```
+
+결과:
+
+```text
+status=WARNING
+pending_events=1
+count_threshold_status=OK
+age_threshold_status=WARNING
+age_warning_rc=1
+```
+
+### Age CRITICAL 검증
+
+동일 event에서 다음 threshold를 사용했다.
+
+```text
+warn-age-sec=60
+critical-age-sec=90
+```
+
+결과:
+
+```text
+status=CRITICAL
+count_threshold_status=OK
+age_threshold_status=CRITICAL
+age_critical_rc=2
+```
+
+### Combined Severity 검증
+
+Count와 age가 서로 다른 상태일 때 더 높은 severity를 전체 상태로 사용한다.
+
+실제 조건:
+
+```text
+count_threshold_status=WARNING
+age_threshold_status=CRITICAL
+```
+
+결과:
+
+```text
+status=CRITICAL
+combined_status_rc=2
+```
+
+### Threshold Configuration Error 검증
+
+다음 잘못된 설정을 테스트했다.
+
+```text
+warn-count >= critical-count
+warn-age-sec >= critical-age-sec
+threshold <= 0
+```
+
+결과는 모두:
+
+```text
+status=UNKNOWN
+exit code=3
+```
+
+이었다.
+
+실제 결과 예:
+
+```text
+checker_error=--warn-count must be lower than --critical-count
+bad_count_threshold_rc=3
+```
+
+```text
+checker_error=--warn-age-sec must be lower than --critical-age-sec
+bad_age_threshold_rc=3
+```
+
+```text
+checker_error=--warn-age-sec must be > 0
+zero_threshold_rc=3
+```
+
+### Threshold 추가 후 Corruption Detection 회귀 검증
+
+Threshold 기능을 추가한 뒤에도 손상 JSON 검출이 유지되는지 다시 검증했다.
+
+결과:
+
+```text
+status=UNKNOWN
+pending_events=1
+checker_error=invalid pending event: ...
+broken_regression_rc=3
+```
+
+### 실제 Notification Failure 기반 상태 전이 검증
+
+Synthetic timestamp가 아니라 실제 webhook 전달 실패로 pending event를 생성했다.
+
+Fake checker 결과:
+
+```text
+status=WARNING
+queue_size=1000
+```
+
+Evaluator:
+
+```text
+event=ALERT
+alert_required=true
+previous_status=NONE
+current_status=WARNING
+checker_exit_code=1
+evaluator_rc=0
+```
+
+실제 사용하지 않는 localhost port에 webhook을 전송했다.
+
+```text
+http://127.0.0.1:1/aerotrace
+```
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+delivery_failure_rc=2
+pending_after_failure=1
+receipts_after_failure=0
+```
+
+생성된 실제 pending event:
+
+```text
+event_id=1787182663140772001-653546
+```
+
+### 첫 번째 상태 전이 테스트에서 발견한 테스트 설계 문제
+
+초기 실험에서는 baseline age가:
+
+```text
+23.407s
+```
+
+이었다.
+
+WARNING threshold를:
+
+```text
+33.407s
+```
+
+로 설정했다.
+
+하지만 사람이 다음 명령을 입력하는 동안 실제 시간이 흘렀고 최초 threshold 검사 시점에는:
+
+```text
+33.408s
+```
+
+가 됐다.
+
+따라서 결과는:
+
+```text
+status=WARNING
+```
+
+이었다.
+
+이는 checker 오류가 아니라 다음 비교가 정확하게 동작한 결과였다.
+
+```text
+33.408 >= 33.407
+```
+
+이후 WARNING 확인을 위해 추가 대기했을 때 age가:
+
+```text
+50.324s
+```
+
+까지 증가해 이미 critical threshold:
+
+```text
+43.407s
+```
+
+도 넘었기 때문에 CRITICAL로 전이했다.
+
+### 상태 전이 테스트 개선
+
+사람의 명령 입력 시간을 테스트 결과에서 제거하기 위해 fresh pending event를 다시 생성하고 하나의 연속 shell 실행 안에서 다음 과정을 수행했다.
+
+```text
+baseline 측정
+→ threshold 계산
+→ 즉시 최초 검사
+→ sleep
+→ WARNING 검사
+→ sleep
+→ CRITICAL 검사
+```
+
+테스트용 threshold:
+
+```text
+WARNING  = baseline + 10초
+CRITICAL = baseline + 25초
+```
+
+이 값은 production threshold가 아니다.
+
+### 실제 Age 상태 전이 결과
+
+Baseline:
+
+```text
+baseline_age=5.792
+warn_age=15.792
+critical_age=30.792
+```
+
+초기 검사:
+
+```text
+status=OK
+pending_events=1
+oldest_pending_age_sec=5.853
+oldest_event_id=1787182663140772001-653546
+age_threshold_status=OK
+initial_rc=0
+```
+
+시간 경과 후:
+
+```text
+status=WARNING
+pending_events=1
+oldest_pending_age_sec=17.889
+oldest_event_id=1787182663140772001-653546
+age_threshold_status=WARNING
+warning_rc=1
+```
+
+추가 시간 경과 후:
+
+```text
+status=CRITICAL
+pending_events=1
+oldest_pending_age_sec=31.927
+oldest_event_id=1787182663140772001-653546
+age_threshold_status=CRITICAL
+critical_rc=2
+```
+
+자동 검증:
+
+```text
+initial_age=5.853
+warning_age=17.889
+critical_age=31.927
+event_id=1787182663140772001-653546
+actual_pending_age_transition=PASS
+```
+
+세 시점 모두 동일 `event_id`가 유지됐다.
+
+최종:
+
+```text
+final_pending=1
+final_receipts=0
+pending_event_identity_preserved=PASS
+```
+
+### 확인된 동작
+
+이번 단계에서 다음을 실제로 확인했다.
+
+```text
+실제 webhook failure
+→ pending event 보존
+
+시간 경과
+→ 동일 event의 oldest age 증가
+
+age가 warning threshold 도달
+→ WARNING / rc=1
+
+age가 critical threshold 도달
+→ CRITICAL / rc=2
+
+delivery 성공 전까지
+→ receipt 없음
+→ 동일 pending event 유지
+```
+
+### 현재 한계
+
+현재 production WARNING/CRITICAL 숫자는 확정하지 않았다.
+
+테스트에서 사용한 다음 숫자는 상태 전이를 검증하기 위한 값일 뿐이다.
+
+```text
+count 1 / 2 / 3
+age 10초 / 25초 / 60초 / 90초
+```
+
+실제 운영 threshold는 notification 발생 빈도, systemd retry 주기, 허용 가능한 전달 지연, 장기 장애 시 outbox 증가량을 추가 측정한 뒤 결정해야 한다.
+
+또한 oldest pending age는 미전송 event의 나이를 보여주지만 transport 자체의 최초 실패 시각이나 연속 실패 횟수를 직접 나타내지는 않는다.
+
+다음 단계에서는 persistent transport failure state를 추가하는 방향을 검토한다.
+
+---
+
+## Webhook Persistent Failure State 및 성공 Finalization 복구 검증
+
+### 변경 파일
+
+```text
+scripts/process-notification-outbox.py
+```
+
+### 추가 기능
+
+Notification webhook adapter에 optional persistent failure state를 추가했다.
+
+CLI:
+
+```text
+--failure-state-file <path>
+```
+
+현재는:
+
+```text
+--transport webhook
+```
+
+에서만 사용할 수 있다.
+
+### Failure State 필드
+
+```text
+failure_state_schema_version
+transport
+failed_event_id
+failure_kind
+failure_reason
+first_failed_at
+last_failed_at
+failure_count
+```
+
+Schema:
+
+```text
+failure_state_schema_version=1
+```
+
+### Structured Exception
+
+기존:
+
+```text
+WebhookRetryableError
+WebhookPermanentError
+```
+
+에 공통 base를 추가했다.
+
+```text
+WebhookDeliveryError
+```
+
+각 delivery error는 구조화된:
+
+```text
+failure_kind
+failure_reason
+```
+
+을 가진다.
+
+따라서 persistent state가 exception message parsing에 의존하지 않는다.
+
+### Failure Reason 예
+
+```text
+connection_error
+timeout
+http_400
+http_408
+http_429
+http_500
+```
+
+### Local-file Configuration Validation
+
+다음 실행을 차단했다.
+
+```text
+--transport local-file
+--failure-state-file ...
+```
+
+결과:
+
+```text
+adapter_error=--failure-state-file requires --transport webhook
+local_failure_state_rc=4
+```
+
+### Retryable Failure 첫 시도
+
+Connection refused를 실제 발생시켰다.
+
+```text
+http://127.0.0.1:1/aerotrace
+```
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+failure_state_file=/tmp/aerotrace-v7b43-failure-state.json
+failure_count=1
+failure_kind=retryable
+failure_reason=connection_error
+failed_event_id=1787185530153348081-718365
+remaining_events=1
+failure1_rc=2
+```
+
+실제 state:
+
+```json
+{
+  "failure_state_schema_version": 1,
+  "transport": "webhook",
+  "failed_event_id": "1787185530153348081-718365",
+  "failure_kind": "retryable",
+  "failure_reason": "connection_error",
+  "first_failed_at": "2026-08-20T00:25:34+00:00",
+  "last_failed_at": "2026-08-20T00:25:34+00:00",
+  "failure_count": 1
+}
+```
+
+검증:
+
+```text
+failure_state_first_attempt=PASS
+```
+
+### Retryable Failure 두 번째 시도
+
+동일 pending event를 다시 전송했다.
+
+결과:
+
+```text
+failure_count=2
+failure_kind=retryable
+failure_reason=connection_error
+failure2_rc=2
+```
+
+State:
+
+```text
+first_failed_at=2026-08-20T00:25:34+00:00
+last_failed_at=2026-08-20T00:25:49+00:00
+failure_count=2
+```
+
+검증:
+
+```text
+failure_state_second_attempt=PASS
+```
+
+따라서:
+
+```text
+first_failed_at 유지
+last_failed_at 갱신
+failure_count 1 → 2
+```
+
+를 실제 확인했다.
+
+### 최초 Recovery 검증
+
+Local HTTP server가 204를 반환하도록 구성했다.
+
+동일 pending event를 실제 성공시켰다.
+
+결과:
+
+```text
+failure_state_cleared=true
+delivery_result=DELIVERED
+event_id=1787185530153348081-718365
+event=ALERT
+adapter_status=OK
+processed_events=1
+remaining_events=0
+recovery_rc=0
+```
+
+최종:
+
+```text
+failure_state_removed=PASS
+pending_after_recovery=0
+receipts_after_recovery=1
+```
+
+### 성공 Finalization 순서에서 발견한 문제
+
+초기 구현에서는 successful delivery 함수가:
+
+```text
+receipt 생성
+→ pending 삭제
+→ return
+```
+
+을 수행한 뒤 `main()`에서 failure state를 삭제했다.
+
+이 구조에서는:
+
+```text
+receipt 저장 성공
+pending 삭제 성공
+failure state 삭제 실패
+```
+
+시 stale failure state만 남고 pending event가 없어 다음 run에서 자동 복구가 불가능할 수 있었다.
+
+이 문제는 recovery test 이후 코드 검토에서 발견했다.
+
+### Finalization 순서 수정
+
+Webhook 성공 경로를 다음 순서로 변경했다.
+
+```text
+HTTP 성공
+→ receipt durable 저장
+→ failure state clear
+→ pending unlink
+→ outbox directory fsync
+```
+
+`ACK_EXISTING` 경로도 동일하게:
+
+```text
+기존 receipt 검증
+→ failure state clear
+→ pending unlink
+```
+
+순서로 변경했다.
+
+### Failure State Clear Failure 실험
+
+Fresh retryable failure state를 만든 뒤 state directory permission을:
+
+```text
+dr-x------
+```
+
+로 변경했다.
+
+실제:
+
+```text
+chmod 500 /tmp/aerotrace-v7b43c-state
+```
+
+HTTP server는 204를 반환했다.
+
+Failure state 삭제 단계에서 실제 permission error가 발생했다.
+
+결과:
+
+```text
+adapter_error=failure state clear failed before pending ACK:
+[Errno 13] Permission denied:
+'/tmp/aerotrace-v7b43c-state/failure.json'
+
+failed_event_id=1787185690763474192-722007
+remaining_events=1
+clear_failure_rc=4
+```
+
+중요한 filesystem 상태:
+
+```text
+pending_after_clear_failure=1
+receipts_after_clear_failure=1
+failure_state_after_clear_failure=1
+```
+
+즉 external delivery는 성공했으므로 receipt가 존재하지만 internal finalization이 끝나지 않아 pending을 유지했다.
+
+### ACK_EXISTING Recovery
+
+204 server를 완전히 종료한 뒤 state directory permission을 정상화했다.
+
+이 상태에서 adapter를 다시 실행했다.
+
+서버가 종료됐기 때문에 HTTP POST를 다시 실행했다면 connection refused가 발생해야 했다.
+
+실제 결과:
+
+```text
+failure_state_cleared=true
+delivery_result=ACK_EXISTING
+event_id=1787185690763474192-722007
+event=ALERT
+adapter_status=OK
+processed_events=1
+remaining_events=0
+ack_existing_rc=0
+```
+
+Connection refused는 발생하지 않았다.
+
+최종:
+
+```text
+final_pending=0
+final_receipts=1
+final_failure_state=0
+```
+
+따라서 receipt를 이용해 duplicate network delivery 없이 incomplete finalization을 복구할 수 있음을 확인했다.
+
+### HTTP 400 Persistent State
+
+Local HTTP server가 400을 반환하도록 구성했다.
+
+결과:
+
+```text
+adapter_error=permanent delivery failure:
+webhook returned permanent HTTP 400
+
+failure_state_file=/tmp/aerotrace-v7b43d-failure.json
+failure_count=1
+failure_kind=permanent
+failure_reason=http_400
+failed_event_id=1787207361956265193-1211675
+remaining_events=1
+http_400_failure_rc=5
+```
+
+실제 state:
+
+```json
+{
+  "failure_state_schema_version": 1,
+  "transport": "webhook",
+  "failed_event_id": "1787207361956265193-1211675",
+  "failure_kind": "permanent",
+  "failure_reason": "http_400",
+  "first_failed_at": "2026-08-20T06:29:32+00:00",
+  "last_failed_at": "2026-08-20T06:29:32+00:00",
+  "failure_count": 1
+}
+```
+
+자동 검증:
+
+```text
+permanent_failure_state=PASS
+```
+
+### 손상 Failure State 검증
+
+다음 파일을 생성했다.
+
+```text
+{broken json
+```
+
+실행 전 hash:
+
+```text
+c3e7d1b00a65589b59f816c0b0b668d795a3c28123697d5ab9555bdb8aa04604
+```
+
+Adapter 실행:
+
+```text
+adapter_error=invalid failure state:
+Expecting property name enclosed in double quotes:
+line 1 column 2 (char 1)
+
+corrupt_failure_state_rc=4
+```
+
+Connection refused URL을 지정했지만 failure state validation이 먼저 실패했으므로 network delivery는 수행되지 않았다.
+
+실행 후 hash:
+
+```text
+c3e7d1b00a65589b59f816c0b0b668d795a3c28123697d5ab9555bdb8aa04604
+```
+
+검증:
+
+```text
+corrupt_state_preserved=PASS
+```
+
+최종:
+
+```text
+corrupt_pending_after=1
+corrupt_receipts_after=0
+```
+
+손상된 state를 자동 초기화하거나 덮어쓰지 않고 운영 오류로 노출한다.
+
+### 검증된 Failure State Semantics
+
+```text
+Retryable failure
+→ state 기록
+→ pending 유지
+
+Repeated failure
+→ failure_count 증가
+→ first_failed_at 유지
+→ last_failed_at 갱신
+
+Permanent failure
+→ permanent/http_xxx state 기록
+→ pending 유지
+
+Success
+→ receipt 저장
+→ failure state clear
+→ pending ACK
+
+State clear failure
+→ receipt 유지
+→ pending 유지
+→ state 유지
+
+다음 실행
+→ receipt 확인
+→ HTTP 재전송 없음
+→ ACK_EXISTING
+→ state clear
+→ pending ACK
+
+Corrupted state
+→ network 전에 중단
+→ state 보존
+→ pending 보존
+```
+
+### 현재 기술 부채
+
+현재 failure state는 최신 연속 장애 한 건만 나타낸다.
+
+아직 다음은 없다.
+
+```text
+failure history
+duration 계산 checker
+failure count threshold
+systemd 운영 경로
+failure state metrics
+retry backoff
+Retry-After
+dead-letter
+```
+
+이들은 실제 운영 요구와 장애 데이터를 기준으로 후속 적용한다.
+
+---
+
+## Persistent Failure Checker 및 반복 장애 지표 비교 검증
+
+### 구현 파일
+
+```text
+scripts/check-notification-failure-state.py
+```
+
+### Checker 관측값
+
+Persistent webhook failure state에서 다음 값을 출력하도록 구현했다.
+
+```text
+status
+active_failure
+failure_kind_status
+count_threshold_status
+duration_threshold_status
+transport
+failed_event_id
+failure_kind
+failure_reason
+failure_count
+failure_duration_sec
+last_failure_age_sec
+first_failed_at
+last_failed_at
+```
+
+### Failure State 없음
+
+State 파일이 존재하지 않을 경우 현재 transport 장애가 없는 것으로 처리했다.
+
+```text
+status=OK
+active_failure=false
+failure_count=0
+failure_duration_sec=N/A
+last_failure_age_sec=N/A
+missing_failure_state_rc=0
+```
+
+### 실제 Connection Failure 관측
+
+실제 connection refused를 발생시킨 뒤 state를 읽었다.
+
+```text
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=1
+
+failure_duration_sec=6.718
+last_failure_age_sec=6.718
+```
+
+검증:
+
+```text
+persistent_failure_observability=PASS
+```
+
+### 동일 Event 두 번째 Failure
+
+동일 pending event를 다시 전송해 실패시켰다.
+
+```text
+failure_count=2
+failure_duration_sec=17.820
+last_failure_age_sec=1.820
+```
+
+`first_failed_at`은 유지됐고 `last_failed_at`은 갱신됐다.
+
+검증:
+
+```text
+persistent_failure_retry_observability=PASS
+```
+
+이를 통해 다음 두 값을 실제로 분리해 확인했다.
+
+```text
+failure_duration_sec
+→ 최초 failure부터의 전체 장애 지속시간
+
+last_failure_age_sec
+→ 최근 failure 이후 경과시간
+```
+
+### Severity Threshold
+
+Retryable failure에 optional threshold를 추가했다.
+
+```text
+--warn-count
+--critical-count
+--warn-duration-sec
+--critical-duration-sec
+```
+
+Threshold가 없을 때:
+
+```text
+active_failure=true
+failure_kind=retryable
+failure_count=2
+
+status=OK
+default_retryable_rc=0
+```
+
+을 유지했다.
+
+### Count Threshold 검증
+
+```text
+failure_count=2
+warn-count=2
+critical-count=3
+
+→ WARNING
+→ rc=1
+```
+
+```text
+failure_count=2
+warn-count=1
+critical-count=2
+
+→ CRITICAL
+→ rc=2
+```
+
+### Duration Threshold 검증
+
+실제 failure duration을 기준으로 테스트 threshold를 동적으로 계산했다.
+
+WARNING:
+
+```text
+status=WARNING
+duration_threshold_status=WARNING
+failure_duration_warning_rc=1
+```
+
+CRITICAL:
+
+```text
+status=CRITICAL
+duration_threshold_status=CRITICAL
+failure_duration_critical_rc=2
+```
+
+테스트에 사용한 숫자는 production policy가 아니다.
+
+### Permanent Failure 정책 검증
+
+Valid permanent state fixture:
+
+```text
+failure_kind=permanent
+failure_reason=http_400
+failure_count=1
+```
+
+결과:
+
+```text
+status=CRITICAL
+failure_kind_status=CRITICAL
+count_threshold_status=OK
+duration_threshold_status=OK
+permanent_failure_checker_rc=2
+```
+
+따라서 permanent failure는 count와 duration에 관계없이 즉시 CRITICAL이 됐다.
+
+### 잘못된 Threshold 검증
+
+다음 설정은 모두 UNKNOWN으로 처리했다.
+
+```text
+warn-count >= critical-count
+warn-duration-sec >= critical-duration-sec
+threshold <= 0
+```
+
+exit code:
+
+```text
+3
+```
+
+State 파일이 존재하지 않는 경우에도 configuration validation을 먼저 수행했다.
+
+```text
+status=UNKNOWN
+checker_error=--warn-count must be lower than --critical-count
+bad_config_without_state_rc=3
+```
+
+따라서 state 부재가 잘못된 checker configuration을 숨기지 않는다.
+
+### 손상 State 회귀 검증
+
+손상 JSON에서:
+
+```text
+status=UNKNOWN
+corrupt_threshold_regression_rc=3
+```
+
+을 유지했다.
+
+### 실제 반복 Retryable Failure 측정
+
+Fresh notification event를 생성하고 동일 event에 connection refused를 네 차례 발생시켰다.
+
+Event:
+
+```text
+1787210007147775125-1271557
+```
+
+실제 측정:
+
+```text
+attempt  adapter_rc  failure_count  failure_duration_sec  last_failure_age_sec  oldest_pending_age_sec  pending_events
+1        2           1              0.136                 0.136                 5.168                   1
+2        2           2              4.285                 0.285                 9.318                   1
+3        2           3              8.434                 0.434                13.467                   1
+4        2           4             12.586                 0.586                17.618                   1
+```
+
+네 번 모두:
+
+```text
+failed_event_id
+=
+oldest_event_id
+=
+1787210007147775125-1271557
+```
+
+이었다.
+
+검증:
+
+```text
+repeated_failure_measurement=PASS
+```
+
+Outbox age와 failure duration의 차이:
+
+```text
+backlog_minus_failure_min_sec=5.032
+backlog_minus_failure_max_sec=5.033
+```
+
+### 반복 장애 종료 시점 최종 상태
+
+추가 시간이 지난 뒤:
+
+```text
+active_failure=true
+failure_count=4
+failure_duration_sec=30.185
+last_failure_age_sec=18.185
+```
+
+Outbox:
+
+```text
+pending_events=1
+pending_bytes=341
+oldest_pending_age_sec=35.218
+```
+
+최종:
+
+```text
+final_pending=1
+final_receipts=0
+```
+
+아직 실제 notification delivery가 성공하지 않았으므로 정상적인 상태다.
+
+### 측정으로 확인한 지표 특성
+
+`failure_count`는 retry cadence에 종속된다.
+
+이번 실험에서는 약 4초마다 retry했기 때문에 다음과 같이 증가했다.
+
+```text
+1 → 2 → 3 → 4
+```
+
+반면 `failure_duration_sec`는 retry 횟수와 관계없이 실제 최초 transport failure 이후 시간을 표현한다.
+
+따라서 retryable failure의 production severity 주 기준 후보는 `failure_duration_sec`로 판단했다.
+
+`failure_count`는 retry storm, retry budget, retry 동작 확인을 위한 보조 지표로 유지한다.
+
+`last_failure_age_sec`는 retry 직후 다시 낮아지므로 현재 severity의 주 기준에는 사용하지 않는다.
+
+향후 active failure 상태인데 `last_failure_age_sec`가 비정상적으로 증가하면 retry scheduler/worker 정지를 탐지하는 용도로 검토할 수 있다.
+
+### 현재 남은 과제
+
+아직 production duration threshold 숫자는 확정하지 않았다.
+
+다음 근거가 필요하다.
+
+```text
+실제 systemd notification retry cadence
+허용 가능한 alert 전달 지연
+실제 webhook provider 장애 특성
+운영자가 원하는 notification SLA
+장기 장애 시 Outbox 증가량
+```
+
+실제 운영 근거를 확보하기 전에는 테스트 threshold를 production 값으로 사용하지 않는다.
+
+---
+
+## Persistent Failure State Checker 및 반복 Transport 장애 측정
+
+### 구현 파일
+
+```text
+scripts/check-notification-failure-state.py
+```
+
+### 목표
+
+Persistent webhook failure state를 사람이 JSON 파일을 직접 열지 않아도 운영 상태로 조회할 수 있도록 checker를 추가했다.
+
+관측 항목:
+
+```text
+active_failure
+failure_kind
+failure_reason
+failure_count
+failure_duration_sec
+last_failure_age_sec
+first_failed_at
+last_failed_at
+```
+
+이후 retryable failure에 count/duration threshold를 선택적으로 적용하고 permanent failure는 즉시 CRITICAL로 평가하도록 확장했다.
+
+### State 없음
+
+Failure state 파일이 없는 경우:
+
+```text
+status=OK
+active_failure=false
+transport=N/A
+failed_event_id=N/A
+failure_kind=N/A
+failure_reason=N/A
+failure_count=0
+failure_duration_sec=N/A
+last_failure_age_sec=N/A
+first_failed_at=N/A
+last_failed_at=N/A
+missing_failure_state_rc=0
+```
+
+을 확인했다.
+
+### 실제 Connection Failure 관측
+
+Adapter를 실제 사용하지 않는 localhost port에 연결했다.
+
+```text
+http://127.0.0.1:1/aerotrace
+```
+
+결과:
+
+```text
+adapter_error=retryable delivery failure:
+webhook request failed: [Errno 111] Connection refused
+
+failure_count=1
+failure_kind=retryable
+failure_reason=connection_error
+transport_failure_rc=2
+```
+
+2초 이상 경과 후 checker 결과:
+
+```text
+status=OK
+active_failure=true
+transport=webhook
+failed_event_id=1787209586391601425-1262022
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=1
+failure_duration_sec=6.718
+last_failure_age_sec=6.718
+first_failed_at=2026-08-20T07:06:26+00:00
+last_failed_at=2026-08-20T07:06:26+00:00
+failure_checker_rc=0
+```
+
+자동 검증:
+
+```text
+persistent_failure_observability=PASS
+```
+
+### 두 번째 실제 Failure
+
+동일 pending event를 다시 connection refused 상태로 전송했다.
+
+결과:
+
+```text
+failure_count=2
+failure_duration_sec=17.820
+last_failure_age_sec=1.820
+first_failed_at=2026-08-20T07:06:26+00:00
+last_failed_at=2026-08-20T07:06:42+00:00
+second_transport_failure_rc=2
+```
+
+자동 검증:
+
+```text
+persistent_failure_retry_observability=PASS
+```
+
+확인한 관계:
+
+```text
+first_failed_at
+→ 유지
+
+last_failed_at
+→ 갱신
+
+failure_count
+→ 1 → 2
+
+failure_duration
+→ 증가
+
+last_failure_age
+→ 최근 실패 직후 다시 작아짐
+```
+
+### 손상 State Checker
+
+손상 JSON:
+
+```text
+{broken json
+```
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=invalid failure state: ...
+corrupt_failure_checker_rc=3
+```
+
+### Directory Path 오류
+
+Failure state path로 directory를 전달했다.
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=failure state path is not a file: ...
+failure_state_path_rc=3
+```
+
+### Severity Threshold 구현
+
+추가한 CLI:
+
+```text
+--warn-count
+--critical-count
+--warn-duration-sec
+--critical-duration-sec
+```
+
+Threshold를 설정하지 않으면 retryable active failure가 있어도 관측 전용 상태를 유지한다.
+
+실제 값:
+
+```text
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=2
+failure_duration_sec=201.062
+last_failure_age_sec=185.062
+```
+
+결과:
+
+```text
+failure_kind_status=OK
+count_threshold_status=OK
+duration_threshold_status=OK
+status=OK
+default_retryable_rc=0
+```
+
+### Count WARNING
+
+조건:
+
+```text
+failure_count=2
+warn-count=2
+critical-count=3
+```
+
+결과:
+
+```text
+status=WARNING
+count_threshold_status=WARNING
+failure_count_warning_rc=1
+```
+
+### Count CRITICAL
+
+조건:
+
+```text
+failure_count=2
+warn-count=1
+critical-count=2
+```
+
+결과:
+
+```text
+status=CRITICAL
+count_threshold_status=CRITICAL
+failure_count_critical_rc=2
+```
+
+### Duration WARNING
+
+Baseline:
+
+```text
+current_failure_duration=213.903
+```
+
+현재 duration보다 낮은 warning threshold와 충분히 높은 critical threshold를 동적으로 설정했다.
+
+실제 검사 시:
+
+```text
+failure_duration_sec=220.768
+duration_threshold_status=WARNING
+failure_duration_warning_rc=1
+```
+
+### Duration CRITICAL
+
+현재 duration보다 낮은 critical threshold를 설정했다.
+
+실제 검사 시:
+
+```text
+failure_duration_sec=229.207
+duration_threshold_status=CRITICAL
+failure_duration_critical_rc=2
+```
+
+### Permanent Failure 즉시 CRITICAL
+
+Valid permanent failure fixture:
+
+```text
+failure_kind=permanent
+failure_reason=http_400
+failure_count=1
+```
+
+실제 검사:
+
+```text
+status=CRITICAL
+failure_kind_status=CRITICAL
+count_threshold_status=OK
+duration_threshold_status=OK
+failure_duration_sec=9.958
+last_failure_age_sec=6.958
+permanent_failure_checker_rc=2
+```
+
+Threshold가 없어도 permanent 자체로 CRITICAL이 됨을 확인했다.
+
+### 잘못된 Threshold
+
+Count:
+
+```text
+warn-count=10
+critical-count=5
+```
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=--warn-count must be lower than --critical-count
+bad_failure_count_threshold_rc=3
+```
+
+Duration:
+
+```text
+warn-duration-sec=30
+critical-duration-sec=10
+```
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=--warn-duration-sec must be lower than --critical-duration-sec
+bad_failure_duration_threshold_rc=3
+```
+
+0 threshold:
+
+```text
+warn-count=0
+```
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=--warn-count must be > 0
+zero_failure_threshold_rc=3
+```
+
+### State 없음 + 잘못된 Checker 설정
+
+Failure state 파일이 없는 상태에서도 configuration 검증을 먼저 수행했다.
+
+조건:
+
+```text
+warn-count=10
+critical-count=5
+```
+
+결과:
+
+```text
+status=UNKNOWN
+checker_error=--warn-count must be lower than --critical-count
+bad_config_without_state_rc=3
+```
+
+따라서 state 없음이 checker configuration 오류를 숨기지 않는다.
+
+### Corrupt State 회귀 검증
+
+Threshold 추가 후에도 손상 state 검출이 유지됐다.
+
+```text
+status=UNKNOWN
+corrupt_threshold_regression_rc=3
+```
+
+### 실제 반복 장애 측정
+
+Fresh ALERT event를 생성한 뒤 실제 connection refused를 네 번 반복했다.
+
+동일 event:
+
+```text
+1787210007147775125-1271557
+```
+
+측정 결과:
+
+```text
+attempt  adapter_rc  failure_count  failure_duration_sec  last_failure_age_sec  oldest_pending_age_sec  pending_events
+1        2           1              0.136                 0.136                 5.168                   1
+2        2           2              4.285                 0.285                 9.318                   1
+3        2           3              8.434                 0.434                 13.467                  1
+4        2           4              12.586                0.586                 17.618                  1
+```
+
+모든 시도에서:
+
+```text
+failure_kind=retryable
+failure_reason=connection_error
+pending_events=1
+```
+
+을 유지했다.
+
+자동 검증:
+
+```text
+repeated_failure_measurement=PASS
+```
+
+### Event Identity
+
+네 번의 실패 모두:
+
+```text
+failed_event_id
+=
+oldest_event_id
+=
+1787210007147775125-1271557
+```
+
+이었다.
+
+따라서 새로운 notification을 계속 생성한 것이 아니라 동일 미전송 event를 반복 retry했음을 확인했다.
+
+### Backlog Age와 Transport Failure Duration 차이
+
+각 측정에서:
+
+```text
+oldest_pending_age_sec >= failure_duration_sec
+```
+
+관계가 유지됐다.
+
+측정된 차이:
+
+```text
+backlog_minus_failure_min_sec=5.032
+backlog_minus_failure_max_sec=5.033
+```
+
+이는 notification event 생성 시점부터 첫 실제 webhook 실패 시점까지 약 5초가 있었기 때문이다.
+
+따라서:
+
+```text
+oldest_pending_age
+→ event 자체의 전체 대기시간
+
+failure_duration
+→ 최초 실제 transport failure 이후 시간
+```
+
+으로 의미를 분리했다.
+
+### Last Failure Age 동작
+
+각 retry 직후 측정:
+
+```text
+attempt1=0.136
+attempt2=0.285
+attempt3=0.434
+attempt4=0.586
+```
+
+으로 작게 유지됐다.
+
+Retry를 더 수행하지 않은 뒤 최종 확인:
+
+```text
+failure_count=4
+failure_duration_sec=30.185
+last_failure_age_sec=18.185
+```
+
+이었다.
+
+따라서 `last_failure_age`는 전체 장애 지속시간보다 최근 retry 실행 여부를 나타내는 값으로 해석하는 것이 적절함을 확인했다.
+
+### 최종 Outbox 상태
+
+실험 종료 시 notification은 아직 전달되지 않았다.
+
+Failure checker:
+
+```text
+status=OK
+active_failure=true
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=4
+failure_duration_sec=30.185
+last_failure_age_sec=18.185
+```
+
+Outbox checker:
+
+```text
+status=OK
+pending_events=1
+pending_bytes=341
+oldest_pending_age_sec=35.218
+oldest_event_id=1787210007147775125-1271557
+```
+
+파일 상태:
+
+```text
+final_pending=1
+final_receipts=0
+```
+
+이는 실제 delivery가 성공하지 않았으므로 정상이다.
+
+### 지표 역할 결론
+
+실제 측정 결과를 바탕으로 다음과 같이 구분했다.
+
+```text
+failure_duration_sec
+→ retryable 장애 severity의 주 시간 기준
+
+failure_count
+→ retry cadence에 의존하는 보조 진단 지표
+
+last_failure_age_sec
+→ retry worker/timer liveness 후보
+
+oldest_pending_age_sec
+→ notification backlog와 사용자 영향
+
+pending_events
+→ backlog 수량
+
+failure_kind=permanent
+→ 즉시 CRITICAL
+```
+
+### Production Threshold
+
+이번 단계에서는 production threshold 값을 확정하지 않았다.
+
+실험에 사용한 count와 duration 숫자는 코드 동작 검증용이다.
+
+Production 값은 실제 retry cadence와 운영 요구가 확정된 뒤 측정 근거와 함께 결정한다.
+
+---
+
+## Production systemd Notification Outbox E2E 검증
+
+### 변경 파일
+
+```text
+deploy/systemd/aerotrace-collector-queue-alert.service
+deploy/systemd/aerotrace-notification-outbox.service
+deploy/systemd/aerotrace-notification-outbox.timer
+```
+
+### 기존 상태
+
+Production에는 다음 두 unit만 존재했다.
+
+```text
+aerotrace-collector-queue-alert.service
+aerotrace-collector-queue-alert.timer
+```
+
+Evaluator:
+
+```text
+StateDirectory=aerotrace-monitoring
+```
+
+Timer:
+
+```text
+OnUnitInactiveSec=5s
+```
+
+상태는 정상:
+
+```text
+service=inactive/dead
+last exit=0/SUCCESS
+
+timer=active/waiting
+```
+
+oneshot service이므로 service의 inactive/dead 상태는 정상이다.
+
+기존 evaluator에는 notification Outbox 설정이 없었다.
+
+### 변경 내용
+
+Evaluator에 추가:
+
+```text
+--event-outbox-dir
+/var/lib/aerotrace-monitoring/notification-outbox
+```
+
+Notification processor 추가:
+
+```text
+aerotrace-notification-outbox.service
+```
+
+실행:
+
+```text
+process-notification-outbox.py
+--outbox-dir /var/lib/aerotrace-monitoring/notification-outbox
+--receipt-dir /var/lib/aerotrace-monitoring/notification-receipts
+--transport local-file
+--max-events 100
+--quiet-idle
+```
+
+Notification timer:
+
+```text
+OnUnitInactiveSec=5s
+AccuracySec=1s
+```
+
+### systemd 검증
+
+`systemd-analyze verify` 실행 시 AeroTrace unit 자체에는 오류가 없었다.
+
+출력된 netplan/snapd 관련 경고는 AeroTrace unit과 무관했다.
+
+실제 설치 후:
+
+```text
+aerotrace-notification-outbox.service
+→ status=0/SUCCESS
+
+aerotrace-notification-outbox.timer
+→ active/waiting
+```
+
+을 확인했다.
+
+### State Directory
+
+실제 생성:
+
+```text
+/var/lib/aerotrace-monitoring/notification-outbox
+/var/lib/aerotrace-monitoring/notification-receipts
+```
+
+권한/소유:
+
+```text
+drwxr-x---
+huning:huning
+```
+
+기존 evaluator state:
+
+```text
+/var/lib/aerotrace-monitoring/collector-queue-alert.json
+```
+
+과 동일 StateDirectory 경계에서 관리한다.
+
+### 실제 ALERT 테스트
+
+테스트 전:
+
+```text
+Collector=Up
+pending_events=0
+receipts_baseline=0
+```
+
+실제 Collector:
+
+```text
+otel-collector
+```
+
+를 중지했다.
+
+Evaluator 결과:
+
+```text
+2026-08-20T16:41:43+0900
+event=ALERT
+previous_status=OK
+current_status=UNKNOWN
+checker_exit_code=3
+```
+
+Notification processor:
+
+```text
+2026-08-20T16:41:49+0900
+delivery_result=DELIVERED
+event_id=1787211703960728995-1310439
+event=ALERT
+adapter_status=OK
+remaining_events=0
+```
+
+Receipt contract 검증:
+
+```text
+transport=local-file
+event=ALERT
+current_status=UNKNOWN
+checker_exit_code=3
+```
+
+결과:
+
+```text
+systemd_alert_receipt=PASS
+```
+
+Outbox:
+
+```text
+pending_events=0
+```
+
+Evaluator event 생성부터 delivery까지 이번 실행에서는 약 6초가 걸렸다.
+
+### 실제 RECOVERY 테스트
+
+Collector를 다시 시작했다.
+
+Evaluator:
+
+```text
+2026-08-20T16:42:13+0900
+event=RECOVERY
+previous_status=UNKNOWN
+current_status=OK
+checker_exit_code=0
+```
+
+Notification processor:
+
+```text
+2026-08-20T16:42:19+0900
+delivery_result=DELIVERED
+event_id=1787211733960954909-1311457
+event=RECOVERY
+adapter_status=OK
+remaining_events=0
+```
+
+Receipt contract:
+
+```text
+transport=local-file
+event=RECOVERY
+previous_status=UNKNOWN
+current_status=OK
+checker_exit_code=0
+```
+
+결과:
+
+```text
+systemd_recovery_receipt=PASS
+```
+
+Evaluator event 생성부터 delivery까지 이번 실행에서도 약 6초가 걸렸다.
+
+### 테스트 종료 상태
+
+```text
+production_receipts=2
+
+pending_events=0
+pending_bytes=0
+```
+
+Timer:
+
+```text
+aerotrace-collector-queue-alert.timer
+→ active/waiting
+
+aerotrace-notification-outbox.timer
+→ active/waiting
+```
+
+Collector도 다시 정상 실행 상태로 복구했다.
+
+### 현재 의미
+
+실제 production systemd에서 다음 경로가 검증됐다.
+
+```text
+Collector 장애
+→ checker UNKNOWN
+→ evaluator ALERT
+→ durable Outbox
+→ notification timer
+→ adapter
+→ receipt
+→ pending ACK
+
+Collector 복구
+→ checker OK
+→ evaluator RECOVERY
+→ durable Outbox
+→ notification timer
+→ adapter
+→ receipt
+→ pending ACK
+```
+
+### 남은 작업
+
+현재 transport는 systemd wiring 검증용 local-file이다.
+
+다음 단계:
+
+```text
+Webhook URL을 별도 environment file로 관리
+Webhook transport 활성화
+persistent failure-state production 경로 연결
+실제 Webhook failure/recovery 테스트
+```
+
+이후 failure-state checker systemd 연결과 production threshold는 별도 단계에서 진행한다.
+
+---
+
+## Production systemd Webhook 장애·재시도·자동 복구 E2E 실험
+
+### 변경 파일
+
+```text
+deploy/systemd/aerotrace-notification-outbox.service
+```
+
+### Webhook systemd 구성
+
+추가:
+
+```text
+EnvironmentFile=/etc/aerotrace/notification.env
+```
+
+Adapter:
+
+```text
+--transport webhook
+--webhook-timeout-sec 5
+--failure-state-file /var/lib/aerotrace-monitoring/notification-failure.json
+```
+
+Network sandbox:
+
+```text
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+```
+
+### Runtime Environment File 검증
+
+테스트 환경파일:
+
+```text
+/etc/aerotrace/notification.env
+```
+
+권한:
+
+```text
+600 root:root
+```
+
+실제 systemd oneshot 실행:
+
+```text
+notification_service_result=success
+notification_service_exec_status=0
+```
+
+을 확인했다.
+
+따라서 systemd가 root-owned environment file을 읽고 `User=huning` service 실행 환경에 전달하는 경로가 실제로 동작했다.
+
+### 빈 Outbox 회귀
+
+빈 Outbox에서:
+
+```text
+receiver_requests_after_idle=0
+failure_state_after_idle=0
+```
+
+을 확인했다.
+
+즉 idle 상태에서 불필요한 HTTP request나 failure state를 생성하지 않는다.
+
+### Webhook ALERT 성공
+
+실제 Collector stop:
+
+```text
+16:52:54
+event=ALERT
+OK → UNKNOWN
+```
+
+Webhook delivery:
+
+```text
+16:53:00
+delivery_result=DELIVERED
+event=ALERT
+remaining_events=0
+```
+
+검증:
+
+```text
+systemd_webhook_alert=PASS
+```
+
+Event ID:
+
+```text
+1787212374958106638-1326724
+```
+
+HTTP header/body와 receipt identity가 일치했다.
+
+### Webhook RECOVERY 성공
+
+Collector start 후:
+
+```text
+systemd_webhook_recovery=PASS
+```
+
+Event:
+
+```text
+1787212410955694121-1327916
+```
+
+성공 경로 최종:
+
+```text
+pending_events=0
+active_failure=false
+final_webhook_receipts=2
+final_receiver_requests=2
+```
+
+### Transport Failure Injection
+
+Webhook receiver를 종료했다.
+
+```text
+receiver_stopped=PASS
+```
+
+Collector를 중지해 실제 ALERT를 생성했다.
+
+Persistent failure state:
+
+```text
+failed_event_id=1787212535955638444-1330962
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=1
+failure_duration_sec=2.599
+```
+
+Outbox:
+
+```text
+pending_events=1
+pending_bytes=385
+oldest_pending_age_sec=8.632
+oldest_event_id=1787212535955638444-1330962
+```
+
+Receipt count:
+
+```text
+2
+```
+
+로 증가하지 않았다.
+
+### Retry 확인
+
+측정 시작:
+
+```text
+failure_count_before_wait=2
+```
+
+12초 후:
+
+```text
+failure_count_after_wait=4
+```
+
+검증:
+
+```text
+systemd_retry_count=2->4
+systemd_webhook_retry=PASS
+```
+
+Journal에서는 이후:
+
+```text
+16:56:05 failure_count=5
+16:56:11 failure_count=6
+```
+
+까지 실제 retry가 이어졌다.
+
+### 실제 Retry 간격
+
+Journal timestamps:
+
+```text
+16:55:47
+16:55:53
+16:55:59
+16:56:05
+16:56:11
+```
+
+약 6초 간격이었다.
+
+Timer configuration:
+
+```text
+OnUnitInactiveSec=5s
+```
+
+와 실제 실행 cadence가 정확히 같지 않음을 확인했다.
+
+### Pending Identity
+
+Failure state:
+
+```text
+failed_event_id=1787212535955638444-1330962
+```
+
+Outbox:
+
+```text
+pending_event_id=1787212535955638444-1330962
+```
+
+검증:
+
+```text
+failure_pending_identity=PASS
+```
+
+동일 notification event가 실패 상태와 Outbox에서 보존됐다.
+
+### Receiver 복구
+
+Collector는 DOWN 상태를 유지하고 receiver만 재시작했다.
+
+```text
+receiver_recovered=1
+```
+
+수동 adapter 실행 없이 systemd timer만 기다렸다.
+
+결과:
+
+```text
+automatic_webhook_recovery=1
+```
+
+복구된 receiver request:
+
+```text
+event=ALERT
+event_id=1787212535955638444-1330962
+```
+
+검증:
+
+```text
+systemd_failure_recovery_identity=PASS
+```
+
+성공 후:
+
+```text
+active_failure=false
+failure_count=0
+pending_events=0
+```
+
+Webhook receipts:
+
+```text
+3
+```
+
+으로 증가했다.
+
+### 최종 RECOVERY
+
+Transport 복구 후 Collector를 시작했다.
+
+```text
+final_recovery_delivered=1
+```
+
+최종 receiver 기록 마지막 두 건:
+
+```text
+2026-08-20 16:56:17 KST
+ALERT
+1787212535955638444-1330962
+
+2026-08-20 16:56:47 KST
+RECOVERY
+1787212601963824599-1332855
+```
+
+최종:
+
+```text
+pending_events=0
+active_failure=false
+두 timer active/waiting
+```
+
+### Runtime 정리
+
+테스트 Webhook receiver와 localhost environment 설정은 실제 production endpoint가 아니므로 테스트 종료 후 제거한다.
+
+현재 서버 runtime은 검증된 local-file transport로 복원하고 repository에는 Webhook-capable systemd unit 변경을 유지한다.
+
+실제 외부 endpoint를 선택할 때 다시 environment file을 생성하여 Webhook runtime을 활성화한다.
+
+### 남은 위험
+
+현재 permanent HTTP failure도 timer에 의해 반복 실행될 수 있다.
+
+예:
+
+```text
+HTTP 400
+→ adapter rc=5
+→ pending 유지
+→ 다음 timer에서 다시 실행
+```
+
+따라서 향후:
+
+```text
+permanent failure retry 정책
+dead-letter
+retry budget
+backoff
+```
+
+을 별도로 설계해야 한다.
+
+Timeout 같은 ambiguous delivery에서는 외부 receiver가 이미 처리했어도 sender가 재전송할 수 있으므로 exactly-once는 보장하지 않는다.
+
+---
+
+## V-7B-4-6 Permanent Webhook Failure 무한 재전송 방지 검증
+
+### 기준점
+
+```text
+commit=9df7cbd
+runtime transport=local-file
+production pending_events=0
+production active_failure=false
+```
+
+기존 분석용 untracked 스크립트 세 개는 변경하지 않았다.
+
+### 구현
+
+변경 파일:
+
+```text
+scripts/process-notification-outbox.py
+```
+
+추가한 동작:
+
+- `PermanentFailureLatchedError`
+- 현재 event와 일치하는 permanent state 조회
+- receipt 확인 뒤, 실제 HTTP 요청 전 latch 차단
+- `delivery_result=BLOCKED_PERMANENT_FAILURE`
+- `failure_latched=true`
+- `--retry-permanent-failure`
+- local-file 및 failure-state 미설정 조합의 configuration validation
+
+Failure-state schema version은 변경하지 않았다. 기존 `failure_kind=permanent`와 `failed_event_id`를 latch의 durable 근거로 사용한다.
+
+### 최초 permanent failure와 자동 실행 차단
+
+HTTP 400 fixture에서 같은 pending event로 adapter를 두 번 실행했다.
+
+첫 실행:
+
+```text
+first_rc=5
+requests_after_first=1
+failure_kind=permanent
+failure_reason=http_400
+failure_count=1
+pending_events=1
+receipts=0
+```
+
+두 번째 일반 실행:
+
+```text
+delivery_result=BLOCKED_PERMANENT_FAILURE
+failure_latched=true
+second_rc=5
+requests_after_second=1
+failure_count=1
+```
+
+두 번째 실행 전후 failure-state SHA-256도 동일했다.
+
+결과:
+
+```text
+permanent_latch_no_resend=PASS
+actual_webhook_requests=1
+assertion_rc=0
+```
+
+Adapter는 다시 실행됐지만 HTTP 요청과 state 재작성은 발생하지 않았다.
+
+### 명시적 재시도와 복구
+
+기존 latch에 `--retry-permanent-failure`를 사용하여 HTTP 400을 한 번 더 호출했다.
+
+```text
+explicit_retry_400_rc=5
+requests_after_explicit_retry=2
+failure_count=2
+```
+
+그다음 일반 실행에서는 다시 latch가 적용됐다.
+
+```text
+blocked_after_retry_rc=5
+requests_after_blocked_run=2
+```
+
+Webhook을 HTTP 204로 수정한 뒤 명시적으로 재시도했다.
+
+```text
+explicit_retry_204_rc=0
+requests_after_recovery=3
+delivery_result=DELIVERED
+failure_state_cleared=true
+pending_events=0
+receipts=1
+failure_state_exists=False
+```
+
+결과:
+
+```text
+explicit_retry_and_recovery=PASS
+assertion_rc=0
+```
+
+### ACK_EXISTING crash-window 회귀 검증
+
+다음 상태를 별도 fixture로 재현했다.
+
+```text
+valid webhook receipt 있음
+동일 pending event 있음
+동일 event permanent failure-state 있음
+Webhook endpoint는 connection refused 상태
+```
+
+결과:
+
+```text
+failure_state_cleared=true
+delivery_result=ACK_EXISTING
+adapter_rc=0
+actual_webhook_requests=0
+pending_events=0
+receipts=1
+failure_state_exists=False
+ack_existing_precedes_latch=PASS
+```
+
+따라서 latch가 기존 receipt 기반 crash-window 복구보다 먼저 실행되지 않음을 확인했다.
+
+### Retryable 회귀 검증
+
+Connection refused를 같은 event에 두 번 발생시켰다.
+
+```text
+attempt 1
+exit code=2
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=1
+
+attempt 2
+exit code=2
+failure_kind=retryable
+failure_reason=connection_error
+failure_count=2
+```
+
+`first_failed_at`은 유지됐고 `last_failed_at`은 두 번째 실제 실패 시각으로 증가했다.
+
+HTTP 204 endpoint를 시작한 뒤 명시적 permanent 재시도 옵션 없이 실행했다.
+
+```text
+delivery_result=DELIVERED
+failure_state_cleared=true
+pending_events=0
+receipts=1
+```
+
+결과:
+
+```text
+retryable_automatic_retry=PASS
+retryable_automatic_recovery=PASS
+retryable_failure_count=1->2
+recovery_webhook_requests=1
+assertion_rc=0
+```
+
+Permanent 전용 latch가 retryable 자동 재시도와 복구를 막지 않음을 확인했다.
+
+### Configuration 및 local-file 회귀 검증
+
+```text
+local-file + --retry-permanent-failure
+→ exit code 4
+
+webhook + --retry-permanent-failure
++ failure-state-file 없음
+→ exit code 4
+
+기존 local-file idle 실행
+→ adapter_status=IDLE
+→ exit code 0
+```
+
+결과:
+
+```text
+permanent_retry_configuration=PASS
+local_file_regression=PASS
+```
+
+### Production 안전 상태
+
+검증 종료 시 installed runtime은 계속 local-file 기준선이었다.
+
+```text
+transport=local-file
+RestrictAddressFamilies=AF_UNIX
+notification timer=active (waiting)
+pending_events=0
+active_failure=false
+```
+
+따라서 임시 Webhook fixture와 permanent latch 테스트가 production notification state에 남지 않았다.
+
+### 남은 위험과 기술 부채
+
+- Permanent pending event의 dead-letter/quarantine 정책은 아직 없다.
+- Latched timer 실행의 journal 반복량은 별도로 측정하지 않았다.
+- 후속 작업에서 Python adapter tracked `unittest` suite를 추가했고, 이후 커밋 `00b421d`에서 CI job 연결까지 완료했다.
+- HTTP timeout의 ambiguous success로 인한 중복 POST 가능성은 해결 범위 밖이다.
+- Production systemd Webhook unit에서 실제 HTTP 400 요청 수가 1회로 고정되는 검증은 아직 수행하지 않았다.
+
+---
+
+## V-7B-4-7 Retryable Webhook Failure Bounded Backoff 구현 및 검증
+
+### 기준점
+
+```text
+commit=720b838
+commit message=Webhook 영구 실패 무한 재전송 방지
+runtime transport=local-file
+production pending_events=0
+production active_failure=false
+```
+
+기존 분석용 untracked 스크립트 세 개는 변경하지 않았다.
+
+```text
+scripts/sample-collector-exporter.py
+scripts/sample-postgres-waits.py
+scripts/summarize-postgres-waits.py
+```
+
+### 해결하려는 문제
+
+Permanent failure의 자동 무한 재전송은 latch로 차단했지만 retryable failure는 notification timer 실행마다 실제 HTTP 요청을 다시 수행했다.
+
+Endpoint 장애가 길어지면 connection failure, timeout, HTTP 408, HTTP 429, HTTP 5xx가 실제 복구 가능성보다 높은 빈도로 반복될 수 있었다.
+
+목표는 retryable 자동 복구를 유지하면서 실제 실패 횟수에 따라 재시도 간격을 늘리고 최대 지연을 제한하는 것이었다.
+
+### 변경 파일
+
+```text
+scripts/process-notification-outbox.py
+deploy/systemd/aerotrace-notification-outbox.service
+deploy/systemd/aerotrace-notification-outbox-retry-permanent.service
+```
+
+### Adapter 변경 내용
+
+추가 옵션:
+
+```text
+--retryable-backoff-initial-sec
+--retryable-backoff-max-sec
+```
+
+기본값:
+
+```text
+initial=5초
+max=300초
+```
+
+`calculate_retryable_backoff_sec()`는 `failure_count` 1부터 initial 값을 적용하고 failure마다 두 배로 증가시키며 maximum에서 제한한다.
+
+```text
+5 → 10 → 20 → 40 → 80 → 160 → 300 → 300
+```
+
+`load_retryable_failure_defer()`는 다음 조건에서만 backoff를 적용한다.
+
+```text
+failure-state 파일 존재
+transport=webhook
+failed_event_id=현재 pending event_id
+failure_kind=retryable
+last_failed_at + 계산된 delay가 아직 지나지 않음
+```
+
+Failure-state schema version은 변경하지 않았다. 기존 `failure_count`와 `last_failed_at`을 사용하며 별도 next-attempt field는 저장하지 않는다.
+
+Backoff가 남아 있으면 `RetryableFailureDeferredError`를 통해 HTTP 요청 전에 main flow로 반환한다.
+
+출력:
+
+```text
+delivery_result=DEFERRED_RETRYABLE_FAILURE
+adapter_status=DEFERRED
+failure_deferred=true
+failure_count=<existing count>
+failure_kind=retryable
+failure_reason=<existing reason>
+failed_event_id=<event id>
+retry_after_sec=<remaining seconds>
+remaining_events=<pending count>
+```
+
+Exit code는 0이다.
+
+이 경로에서는 HTTP 요청, failure-state 변경, `failure_count` 증가, receipt 생성, pending ACK가 발생하지 않는다.
+
+### Webhook 처리 순서
+
+`deliver_to_webhook()`의 처리 순서를 다음과 같이 유지했다.
+
+```text
+ACK_EXISTING
+→ permanent latch
+→ retryable backoff
+→ 실제 HTTP request
+```
+
+Receipt가 이미 있으면 failure-state 종류와 backoff 잔여 시간에 관계없이 기존 crash-window 복구가 먼저 수행된다.
+
+Permanent latch는 계속 일반 자동 실행을 막는다. `--retry-permanent-failure`는 permanent latch를 명시적으로 우회하고 permanent state는 retryable defer 조건과 일치하지 않으므로 실제 요청을 한 번 수행한다.
+
+### Retryable HTTP 503 Backoff 검증
+
+Local fake HTTP receiver가 HTTP 503을 반환하도록 구성하고 하나의 pending event를 처리했다.
+
+첫 실제 실패:
+
+```text
+exit code=2
+actual requests=1
+failure_kind=retryable
+failure_reason=http_503
+failure_count=1
+pending_events=1
+receipts=0
+```
+
+첫 실패 직후 같은 event를 다시 실행했다.
+
+```text
+delivery_result=DEFERRED_RETRYABLE_FAILURE
+adapter_status=DEFERRED
+exit code=0
+actual requests=1
+failure_count=1
+pending_events=1
+receipts=0
+```
+
+따라서 deferred invocation이 HTTP 요청이나 failure-state 증가를 만들지 않음을 확인했다.
+
+첫 5초 backoff가 지난 뒤 다시 실행했다.
+
+```text
+exit code=2
+actual requests=2
+failure_count=2
+failure_kind=retryable
+failure_reason=http_503
+```
+
+두 번째 실패 직후 실행은 다시 deferred됐다.
+
+```text
+delivery_result=DEFERRED_RETRYABLE_FAILURE
+exit code=0
+actual requests=2
+failure_count=2
+```
+
+두 번째 실패에 적용되는 10초 backoff가 실제 요청을 차단했다.
+
+결과:
+
+```text
+retryable_immediate_defer=PASS
+retryable_second_failure_backoff=PASS
+deferred_request_count_unchanged=PASS
+deferred_failure_state_unchanged=PASS
+```
+
+### HTTP 204 자동 복구
+
+두 번째 backoff가 지난 뒤 receiver를 HTTP 204로 변경하고 명시적 permanent retry 옵션 없이 adapter를 실행했다.
+
+```text
+exit code=0
+delivery_result=DELIVERED
+actual requests=3
+pending_events=0
+receipts=1
+failure_state_exists=False
+```
+
+성공 finalization 순서에 따라 receipt가 생성되고 retryable failure-state와 pending event가 제거됐다.
+
+결과:
+
+```text
+retryable_automatic_recovery=PASS
+failure_state_cleared_after_success=PASS
+```
+
+### Backoff 계산 검증
+
+`failure_count`별 기본 계산 결과를 직접 검증했다.
+
+```text
+1=5
+2=10
+3=20
+4=40
+5=80
+6=160
+7=300
+8=300
+```
+
+Maximum에 도달한 뒤 큰 `failure_count`에서도 300초 상한을 유지했다.
+
+결과:
+
+```text
+bounded_backoff_sequence=PASS
+bounded_backoff_maximum=PASS
+```
+
+### Configuration Validation
+
+다음 잘못된 값을 각각 실행했다.
+
+```text
+--retryable-backoff-initial-sec 0
+--retryable-backoff-initial-sec NaN
+--retryable-backoff-initial-sec 10 --retryable-backoff-max-sec 5
+```
+
+각 실행은 HTTP 요청 전에 configuration error와 exit code 4를 반환했다.
+
+```text
+invalid_zero_initial=PASS
+invalid_nan=PASS
+invalid_max_less_than_initial=PASS
+```
+
+### ACK_EXISTING 우선순위 회귀
+
+다음 fixture를 구성했다.
+
+```text
+valid webhook receipt 있음
+동일 pending event 있음
+동일 event retryable failure-state 있음
+backoff 시간은 아직 남아 있음
+```
+
+결과:
+
+```text
+delivery_result=ACK_EXISTING
+exit code=0
+actual webhook requests=0
+pending_events=0
+failure_state_exists=False
+ack_existing_precedes_backoff=PASS
+```
+
+따라서 retryable defer가 receipt 기반 crash-window 복구를 막지 않음을 확인했다.
+
+### Permanent Failure 회귀
+
+기존 permanent latch와 explicit retry 동작을 다시 확인했다.
+
+```text
+첫 permanent failure
+→ 실제 HTTP 요청 1회
+→ failure_count=1
+→ pending 유지
+
+일반 재실행
+→ BLOCKED_PERMANENT_FAILURE
+→ 실제 요청 수 유지
+→ failure_count 유지
+
+--retry-permanent-failure
+→ 실제 요청 1회 수행
+→ 성공 시 receipt 저장, failure-state 삭제, pending ACK
+```
+
+결과:
+
+```text
+permanent_latch_regression=PASS
+explicit_permanent_retry_regression=PASS
+```
+
+### Local-file 회귀
+
+기존 local-file transport smoke를 실행했다.
+
+```text
+local_file_smoke=PASS
+```
+
+Backoff 옵션 추가가 installed production transport의 기존 처리 경로를 변경하지 않음을 확인했다.
+
+### systemd Unit 변경 및 검증
+
+Repository Webhook unit의 `ExecStart`에 정책값을 명시했다.
+
+```text
+--retryable-backoff-initial-sec 5
+--retryable-backoff-max-sec 300
+```
+
+Permanent failure는 자동 retry하면 안 되므로 timer가 없는 수동 oneshot unit을 추가했다.
+
+```text
+deploy/systemd/aerotrace-notification-outbox-retry-permanent.service
+ConditionPathExists=/var/lib/aerotrace-monitoring/notification-failure.json
+--retry-permanent-failure
+--max-events 1
+```
+
+`systemd-analyze verify` 결과 AeroTrace unit 오류는 없었다.
+
+```text
+systemd_unit_verify=PASS
+```
+
+### Production 안전 상태
+
+Repository Webhook unit과 permanent retry unit은 `/etc/systemd/system`에 설치하지 않았다.
+
+검증 종료 시 installed runtime은 계속 local-file 기준선이었다.
+
+```text
+transport=local-file
+RestrictAddressFamilies=AF_UNIX
+notification timer=active (waiting)
+pending_events=0
+active_failure=false
+/etc/aerotrace/notification.env 없음
+```
+
+따라서 fake receiver, retryable failure-state, Webhook URL이 production notification state에 남지 않았다.
+
+### 최종 결과
+
+```text
+retryable first failure                 PASS
+immediate deferred execution            PASS
+second failure after backoff            PASS
+second immediate deferred execution     PASS
+HTTP 204 automatic recovery             PASS
+5→10→20→40→80→160→300 calculation       PASS
+invalid configuration exit code 4       PASS
+local-file regression                   PASS
+ACK_EXISTING precedence                 PASS
+permanent latch regression              PASS
+explicit permanent retry regression     PASS
+systemd unit verification               PASS
+production local-file safety            PASS
+```
+
+### 남은 위험과 기술 부채
+
+- HTTP timeout ambiguous delivery의 중복 가능성은 남아 있다.
+- Deferred invocation도 journal output을 남긴다.
+- Head event backoff 중 뒤 event를 처리하지 않는다.
+- Wall clock의 큰 변경은 계산된 retry 시각에 영향을 줄 수 있다.
+- 실제 외부 endpoint의 rate limit과 notification SLA는 아직 정해지지 않았다.
+- Python adapter black-box 검증을 tracked `unittest` suite로 전환했고, 이후 커밋 `00b421d`에서 CI job 연결까지 완료했다.
+- Repository Webhook unit과 permanent retry unit은 실제 endpoint 준비 전까지 production에 설치하지 않는다.
+
+---
+
 ## 2026-08-14 — PostgreSQL WAL checkpoint로 인한 Collector queue overflow와 Telemetry 유실 분석
 
 ### 문제 발견
@@ -6794,3 +14633,656 @@ Docker Named Volume을 유지한 컨테이너 재생성에서 DB 데이터가 �
 - Benchmark 도구 자체의 판정 오류도 실제 데이터 유실처럼 보일 수 있으므로 측정 도구도 검증해야 한다.
 - PostgreSQL checkpoint, Backend latency, Collector retry/queue, 최종 DB row를 하나의 end-to-end 장애 경로로 함께 관찰해야 한다.
 - 설정을 여러 개 동시에 변경하지 않고 단일 변수 A/B를 수행해야 원인에 대한 신뢰도를 높일 수 있다.
+
+---
+
+## V-7B-4-8 Webhook Receiver Contract, Notification SLO 초안 및 Tracked 회귀 테스트
+
+### 기준점
+
+```text
+Webhook backoff/runbook commit=c558902
+installed transport=local-file
+production pending_events=0
+production active_failure=false
+```
+
+### 목표
+
+Webhook sender 구현과 수동 검증은 완료됐지만 실제 receiver가 지켜야 할 idempotency contract, notification SLI/SLO 결정 틀과 반복 실행 가능한 tracked 자동 테스트가 없었다.
+
+이번 단계의 목표:
+
+- Sender와 receiver 사이의 HTTP contract 고정
+- Timeout duplicate를 receiver가 처리해야 하는 이유 명시
+- Endpoint가 없는 상태에서 SLO 값을 추측하지 않고 측정 기준만 정의
+- 기존 수동 black-box 핵심 시나리오를 tracked `unittest`로 전환
+
+### 추가 및 변경 문서
+
+```text
+WEBHOOK_RECEIVER_CONTRACT.md
+NOTIFICATION_SLO.md
+OPERATIONS_RUNBOOK.md
+AEROTRACE_CONTEXT.md
+DECISIONS.md
+CAREER_LOG.md
+ENGINEERING_LOG.md
+```
+
+### Receiver Contract
+
+`WEBHOOK_RECEIVER_CONTRACT.md`에 다음을 정의했다.
+
+```text
+POST + UTF-8 JSON
+Content-Type=application/json
+Accept=application/json
+User-Agent=AeroTrace-Notification/1
+X-AeroTrace-Event-Id=body.event_id
+schema_version=1
+```
+
+Receiver의 성공 2xx는 sender가 더 이상 retry하지 않아도 되는 durable acceptance를 의미해야 한다.
+
+동일 `event_id` duplicate는 사용자-visible side effect를 다시 만들지 않고 2xx를 반환한다. 같은 ID에 다른 payload가 오면 conflict로 기록하고 permanent 4xx로 거부한다.
+
+Timeout은 receiver가 처리했지만 sender가 response를 받지 못한 ambiguous delivery일 수 있으므로 receiver-side durable deduplication이 production activation의 필수 조건이다.
+
+현재 adapter에는 사용자 정의 `Authorization` 또는 signature header가 없고 `Retry-After`를 해석하지 않는다는 제약도 명시했다.
+
+### Notification SLO Draft
+
+`NOTIFICATION_SLO.md`에 다음 SLI를 정의했다.
+
+```text
+end-to-end durable delivery latency
+delivery-within-objective ratio
+oldest pending age
+active transport failure duration
+retry progress
+receiver duplicate side effects
+pipeline liveness
+```
+
+현재 실제 external endpoint, provider rate limit, user notification latency requirement와 incident owner가 없다.
+
+따라서 다음 수치는 모두 `TBD/미채택`으로 유지했다.
+
+```text
+ALERT/RECOVERY delivery objective
+monthly success ratio
+outbox/failure WARNING·CRITICAL threshold
+permanent failure response/restore time
+retry budget
+incident ownership
+```
+
+Current timer, Webhook timeout, `5 → 10 → 20 → 40 → 80 → 160 → 300` backoff에서 가능한 earliest retry timeline을 SLO가 아닌 현재 algorithm 특성으로 분리했다.
+
+### Tracked Test Suite
+
+추가 파일:
+
+```text
+tests/test_notification_outbox.py
+```
+
+External dependency 없이 Python standard library `unittest`, temporary directory, local `ThreadingHTTPServer`를 사용한다.
+
+표준 실행:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+검증 항목:
+
+```text
+bounded backoff sequence와 maximum
+invalid 0, NaN, maximum < initial
+HTTP status retryable/permanent 분류
+local-file delivery smoke
+Webhook payload/header contract
+HTTP 503 immediate defer와 state 무변경
+backoff 만료 후 두 번째 failure_count 증가
+HTTP 204 자동 복구와 finalization
+ACK_EXISTING precedes retryable backoff
+permanent latch no-resend
+explicit permanent retry와 복구
+retry-permanent configuration validation
+```
+
+최종 결과:
+
+```text
+tests=8
+passed=8
+failed=0
+errors=0
+result=PASS
+```
+
+Sandbox 내부 최초 실행에서는 loopback socket 생성이 `PermissionError`로 차단됐고 network를 사용하지 않는 테스트는 통과했다. 동일 suite를 loopback이 허용된 host 실행 환경에서 다시 실행해 8개 전체 통과를 확인했다.
+
+### Production 안전 상태
+
+Test suite는 `TemporaryDirectory`와 local fake receiver만 사용했다.
+
+다음 production 경로를 사용하거나 변경하지 않았다.
+
+```text
+/var/lib/aerotrace-monitoring/notification-outbox
+/var/lib/aerotrace-monitoring/notification-receipts
+/var/lib/aerotrace-monitoring/notification-failure.json
+/etc/aerotrace/notification.env
+/etc/systemd/system
+```
+
+Repository Webhook unit과 permanent retry unit도 production에 설치하지 않았다.
+
+### 남은 작업
+
+- 실제 receiver/provider와 authentication 방식을 선택한다.
+- Receiver durable deduplication acceptance test를 수행한다.
+- Notification SLO의 `TBD` 값과 incident owner를 확정한다.
+- Checker threshold를 실행할 독립 monitoring 경로를 구현한다.
+- 실제 endpoint의 `Retry-After` 또는 rate limit이 현재 backoff와 맞는지 검증한다.
+
+---
+
+## V-7B-4-9 Notification Outbox 회귀 테스트 CI 연결
+
+### 기준점
+
+```text
+branch=feature/notification-contract-slo-tests
+test suite=tests/test_notification_outbox.py
+local result=8/8 PASS
+production transport=local-file
+```
+
+### 구현
+
+`.github/workflows/notification-outbox-tests.yml`을 추가했다.
+
+```text
+trigger=every pull_request update, related main push, workflow_dispatch
+runner=ubuntu-latest
+python=3.10
+permissions=contents:read
+timeout=5 minutes
+command=PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+Pull request에서는 최신 HEAD를 항상 검증하고, `main` push만 sender 구현, 회귀 suite, workflow 자체 변경으로 제한했다. Checkout credential은 job 종료 전뿐 아니라 테스트 실행 중에도 불필요하므로 `persist-credentials: false`를 사용했다.
+
+### 검증
+
+로컬에서 YAML 파싱과 `git diff --check`를 통과했고, loopback socket을 허용한 환경에서 회귀 suite 8개 전체 통과를 다시 확인했다.
+
+Draft PR #1 생성 후 GitHub Actions run `32441836314`를 확인했다.
+
+```text
+workflow=Notification Outbox Tests
+job=notification-outbox
+run_number=1
+status=completed
+conclusion=success
+regression test step=success
+```
+
+PR은 `main` 기준 충돌 없이 merge 가능한 상태로 확인했다.
+
+이후 문서-only 커밋을 push했을 때 기존 path filter 때문에 최신 HEAD에 run이 생성되지 않는 것을 확인했다. Pull request의 `paths` filter를 제거해 모든 synchronize 이벤트에서 suite를 실행하도록 수정했다. `main` push의 path filter는 유지했다.
+
+수정 커밋 `79dd9e9`의 GitHub Actions run `32442220666`에서 job과 모든 step이 다시 성공했다.
+
+### Production 안전 상태
+
+이 단계는 repository workflow와 문서만 변경했다. `/etc/systemd/system`, `/etc/aerotrace`, production outbox·receipt·failure-state에는 쓰기를 수행하지 않았다. 실제 runtime은 계속 local-file 기준선이다.
+
+### 남은 작업
+
+- 실제 receiver/provider와 authentication 방식을 선택한다.
+- Receiver의 durable `event_id` deduplication을 acceptance test로 검증한다.
+- Notification SLO 수치와 incident ownership을 확정한다.
+- 격리된 Webhook E2E와 rollback rehearsal 후 production 전환 승인을 받는다.
+
+---
+
+## V-7B-4-10 Slack + Cloudflare Durable Notification Receiver 구현
+
+### 기준점
+
+```text
+branch=feature/notification-contract-slo-tests
+upstream HEAD=a9187fe
+draft PR=#1
+installed production transport=local-file
+pending_events=0
+active_failure=false
+```
+
+### Channel과 architecture 결정
+
+Notification channel은 Slack으로 선택했다. Sender가 Slack URL을 직접 호출하지 않고 다음 경계를 사용한다.
+
+```text
+filesystem outbox sender
+-> exact-body HMAC HTTPS
+-> Cloudflare Worker
+-> D1 durable event_id claim
+-> Cloudflare Queue
+-> Slack Incoming Webhook
+```
+
+구현 디렉터리:
+
+```text
+receiver/cloudflare-slack/
+```
+
+### Sender HMAC
+
+`scripts/process-notification-outbox.py`에 다음을 추가했다.
+
+```text
+env=AEROTRACE_WEBHOOK_SIGNING_SECRET
+minimum=32 UTF-8 bytes
+signed_content=v1.<unix-seconds>.<exact request body>
+algorithm=HMAC-SHA256
+headers=X-AeroTrace-Timestamp, X-AeroTrace-Signature
+```
+
+Webhook transport는 signing secret이 없거나 짧거나 앞뒤 공백이 있으면 HTTP 요청 전에 exit code 4로 종료한다. Local-file transport는 이 secret을 요구하지 않는다.
+
+### Durable receiver
+
+Worker HTTP handler는 다음 순서를 사용한다.
+
+```text
+64 KiB body 제한
+-> ±300초 timestamp와 HMAC 검증
+-> fatal UTF-8 decode와 JSON/schema validation
+-> canonical payload SHA-256
+-> D1 INSERT OR IGNORE
+-> Queue disk-confirmed send
+-> new 202 / duplicate 204 / conflict 409
+```
+
+Queue send가 실패하면 D1 `accepted` row를 유지하고 503을 반환한다. Sender retry 또는 5분 scheduled reconciliation이 재publish할 수 있다.
+
+D1 state:
+
+```text
+accepted -> queued -> delivering
+delivering -> delivered | queued | failed_permanent
+DLQ -> failed_exhausted
+```
+
+Slack 408/429/5xx와 network/timeout은 retryable이고 5, 10, 20, 40, 80, 160, 300초 상한 delay를 사용한다. Numeric `Retry-After`는 최대 86400초까지 우선한다. Consumer `max_retries=10` 후 DLQ가 final failure를 기록한다.
+
+Slack 성공 후에는 D1 `payload_json`을 `{}`로 redaction하고 `payload_redacted_at`을 기록한다. Dedup hash와 event/delivery metadata는 유지한다.
+
+### Health fallback
+
+Primary Slack 경로 내부의 failure가 sender에는 보이지 않는 문제를 보완하기 위해 `GET /health`가 다음 D1 aggregate를 확인한다.
+
+```text
+failed_permanent
+failed_exhausted
+stale_in_flight >= 600초
+```
+
+하나라도 있으면 event ID와 payload 없이 HTTP 503을 반환한다. Production activation 전 UptimeRobot Free HTTP(S) monitor를 5분 간격과 operator email contact로 연결해야 한다.
+
+### 구현 중 발견하고 수정한 문제
+
+1. Node test memory repository에서 `Array.map(structuredClone)`이 index를 options 인자로 전달해 실패했다. Arrow callback으로 교정했다.
+2. DLQ duplicate가 이미 delivered event를 덮어쓸 수 있는 경계를 final-state read/ACK로 차단했다.
+3. 기본 `TextDecoder`가 invalid UTF-8을 대체할 수 있어 `{ fatal: true }`로 변경했다.
+4. D1 insert 후 Queue publish failure가 durable row를 유지하고 duplicate retry로 복구되는 테스트를 추가했다.
+5. Slack 성공 row의 diagnostic payload 장기 보존을 제거했다.
+6. Receiver async permanent failure가 sender state에 나타나지 않는 관측 공백을 `/health` 503으로 노출했다.
+
+### 자동 검증
+
+Sender:
+
+```text
+tests=10
+passed=10
+failed=0
+errors=0
+result=PASS
+```
+
+Receiver:
+
+```text
+tests=14
+passed=14
+failed=0
+result=PASS
+```
+
+Receiver test 범위:
+
+```text
+HMAC exact body, tamper, stale timestamp
+canonical payload hash
+durable accept, duplicate, conflict
+invalid signature before D1
+invalid UTF-8 before D1
+Queue failure durable recovery
+Slack 2xx, 429 Retry-After, permanent 400, network failure
+DLQ exhaustion and delivered-state preservation
+scheduled reconciliation
+/health degradation
+```
+
+Wrangler validation:
+
+```text
+version=4.125.0
+npm audit vulnerabilities=0
+bundle dry-run=PASS
+upload size=28.68 KiB
+gzip size=7.22 KiB
+fresh local D1 migration=3 commands PASS
+```
+
+GitHub Actions에 Node.js 22 receiver job을 추가했다. Locked dependency install, Node tests, syntax check와 Worker dry-run을 실행한다.
+
+### SLO와 운영 정책
+
+초기 provisional 목표:
+
+```text
+receiver acceptance=99% within 60초
+Slack delivered=99% within additional 300초
+sender outbox warning/critical=60/300초
+sender failure warning/critical=60/300초
+receiver stale health=600초
+```
+
+Sender retry는 pending을 무기한 보존하고, receiver Slack retry는 10회 후 D1 final failure로 분리했다. Owner는 현재 단일 `AeroTrace service operator` 역할이고 secondary가 없다는 위험을 기록했다.
+
+### Production 안전 상태
+
+다음 작업은 수행하지 않았다.
+
+```text
+Cloudflare login/deploy
+remote D1 migration
+Slack app/Webhook 생성
+/etc/aerotrace/notification.env 생성
+/etc/systemd/system unit 설치
+production timer/service 변경
+```
+
+Installed runtime은 계속 local-file 기준선이다.
+
+### 다음 단계
+
+- 운영자가 Slack private channel과 Incoming Webhook을 생성한다.
+- Cloudflare Worker를 secrets file과 함께 deploy하고 remote migration을 적용한다.
+- Synthetic 202, Slack 1회, duplicate와 `/health`를 검증한다.
+- UptimeRobot `/health` DOWN/UP email, HMAC rotation과 local-file rollback을 rehearsal한다.
+- 결과를 문서에 반영하고 전체 문서 review 후 commit/push한다.
+
+### GitHub Actions와 PR
+
+Implementation commit:
+
+```text
+063b7b2 Slack용 영속 Webhook 리시버 추가
+```
+
+기존 draft PR #1을 새로 만들지 않고 재사용했다. PR 제목과 body에서 과거 `8 tests`, provider/auth/SLO `TBD` 문구를 제거하고 현재 Slack/Cloudflare/HMAC/24 tests와 production 미활성 상태로 갱신했다.
+
+GitHub Actions:
+
+```text
+workflow=Notification Pipeline Tests
+run_id=32445952757
+run_number=5
+conclusion=success
+
+job=notification-outbox
+conclusion=success
+
+job=cloudflare-slack-receiver
+conclusion=success
+locked install=success
+Node tests=success
+syntax=success
+Worker dry-run=success
+fresh D1 migration=success
+```
+
+PR은 open/draft, mergeable 상태를 유지했다.
+
+### 문서 전면 review
+
+현재 상태 문서:
+
+```text
+WEBHOOK_RECEIVER_CONTRACT.md
+NOTIFICATION_SLO.md
+OPERATIONS_RUNBOOK.md
+receiver/cloudflare-slack/README.md
+AEROTRACE_CONTEXT.md의 최상단 current context
+```
+
+검토 기준:
+
+```text
+현재값 상호 모순
+명령과 실제 package/systemd option 일치
+sender 2xx와 Slack delivered 의미 분리
+secret 이름과 저장 위치
+retry 횟수, delay, threshold, owner
+duplicate/timeout/DLQ/requeue/rollback 경계
+local link와 Markdown heading 구조
+실제 credential 포함 여부
+과거 기록과 current truth 구분
+```
+
+Review에서 수정한 항목:
+
+1. Provider/auth/SLO 미확정 문구를 current 문서에서 제거했다.
+2. Slack 3xx가 fetch exception으로 retryable이 되지 않도록 manual redirect 분류와 테스트를 추가했다.
+3. Invalid UTF-8을 replacement decode하지 않도록 변경했다.
+4. DLQ duplicate가 delivered final state를 덮어쓰지 않도록 했다.
+5. D1 `event_id`에 explicit NOT NULL/length와 hash/attempt constraint를 추가했다.
+6. 성공 payload redaction과 receiver final failure health를 문서·코드에 일치시켰다.
+7. `/health` SQL이 delivered row를 full scan하지 않고 covering reconciliation index를 사용함을 query plan으로 확인했다.
+8. Generic email fallback을 UptimeRobot Free 5분 HTTP(S) + operator email로 확정했다.
+9. Root runbook과 receiver README의 중복은 각각 host incident/rollback과 Cloudflare deploy라는 독자 범위로 분리했다.
+10. Test count를 sender 10, receiver 14, total 24로 모든 current 문서에서 일치시켰다.
+
+Historical engineering/decision section의 `8 tests`, `TBD`, `signature 없음` 문장은 당시 상태를 설명하는 기록이므로 현재 사실처럼 고치지 않았다. Current truth는 각 문서 header와 context 최상단을 기준으로 한다.
+
+### 추가 문서 제안 review
+
+현재 production activation 전 필수 문서는 contract, SLO, operations runbook과 receiver README로 충분하다. 같은 내용을 반복하는 별도 deployment/test 문서는 만들지 않는다.
+
+다음 문서는 조건이 생길 때 추가한다.
+
+```text
+SECURITY.md
+  trigger=외부 contributor 또는 public vulnerability report 접수 경로가 필요할 때
+  scope=notification secret뿐 아니라 AeroTrace repository 전체 disclosure policy
+
+DATA_RETENTION_POLICY.md
+  trigger=remote D1 30일 사용량과 event volume을 측정한 뒤
+  scope=delivered metadata retention, failed payload maximum retention, purge evidence
+
+NOTIFICATION_INCIDENT_TEMPLATE.md
+  trigger=첫 실제 notification incident 또는 secondary on-call 도입 전
+  scope=timeline, event_id, sender/receiver state, duplicate, requeue, SLO impact
+```
+
+지금 이 문서들을 미리 만들면 owner, 실제 D1 volume, 첫 incident workflow가 없는 placeholder와 runbook 중복이 된다. Trigger 시점에 실측 근거로 작성한다.
+
+---
+
+## V-7B-4-11 Slack Notification Production 활성화와 Rollback Rehearsal
+
+### 목적
+
+Repository에서 검증한 HMAC sender와 Cloudflare durable receiver를 실제 private Slack channel에 연결하고, production filesystem outbox부터 Slack까지 한 건을 검증한다. 동시에 local-file 기준선으로 복원한 뒤 Webhook을 다시 활성화할 수 있는지 확인한다.
+
+### Remote receiver bootstrap
+
+Wrangler 4.125.0 device authorization으로 Cloudflare에 로그인했다. Secret 값은 `.dev.vars`에 mode 0600으로 보관하고 출력 없이 형식과 sender 값 일치 여부만 확인했다.
+
+첫 deploy에서 config가 참조한 `aerotrace-notification-delivery-dlq`가 없어 중단됐다. Queue와 D1 목록을 먼저 확인한 뒤 DLQ를 한 번 생성했다. 다음 deploy가 D1과 primary delivery Queue를 자동 provision하고 Worker, scheduled reconciliation, primary Queue consumer와 DLQ consumer를 배포했다. 생성된 D1 binding ID는 Wrangler가 `wrangler.jsonc`에 기록했으며 credential이 아닌 deployment metadata로 검토했다.
+
+Remote migration 후 health 결과:
+
+```text
+HTTP status=200
+status=ok
+failed_permanent=0
+failed_exhausted=0
+stale_in_flight=0
+```
+
+Repository root에서 Wrangler D1 command를 실행하면 `DB` binding을 찾지 못했다. `receiver/cloudflare-slack`의 config directory에서 실행해야 한다는 운영 조건을 확인했다.
+
+### Slack과 isolated acceptance
+
+Private notification channel에 Slack Incoming Webhook app을 설치하고 direct Webhook test의 `ok`와 메시지 수신을 확인했다. HMAC-signed isolated synthetic은 다음 결과를 냈다.
+
+```text
+receiver_status=202
+synthetic_result=DURABLY_ACCEPTED
+same synthetic event_id in Slack=1
+```
+
+Exact same signed request를 다시 replay한 live duplicate test는 하지 않았다. Duplicate와 conflict는 tracked receiver test가 검증한다.
+
+### Independent health fallback
+
+UptimeRobot Free HTTP(S) monitor를 5분 주기, operator email only로 구성했다. 최초 URL에서 `/health`를 빠뜨려 Worker root 404가 DOWN으로 감지됐고, 정확한 `GET /health`로 수정한 뒤 recovery UP email을 받았다. Built-in Test Notification의 DOWN/UP email도 수신했다.
+
+이 결과는 email contact와 non-2xx recovery 경로의 live evidence다. D1에 final failure를 넣어 `/health` 503을 발생시킨 rehearsal은 아니며 그 동작은 Node regression test로 검증한다.
+
+### Production sender 전환
+
+전환 전 notification timer를 중지하고 installed local-file unit을 덮어쓰지 않는 backup으로 보존했다. Backup에서 다음 기준선을 확인했다.
+
+```text
+--transport local-file
+RestrictAddressFamilies=AF_UNIX
+```
+
+`/etc/aerotrace/notification.env`는 root:root mode 0600으로 설치했다. Endpoint 형식과 Cloudflare/sender HMAC secret exact match는 실제 값을 표시하지 않고 확인했다. Repository Webhook service와 permanent retry oneshot unit을 설치한 뒤 idle manual start가 성공했다.
+
+Installed Webhook 기준선:
+
+```text
+EnvironmentFile=/etc/aerotrace/notification.env
+--transport webhook
+--webhook-timeout-sec 5
+--retryable-backoff-initial-sec 5
+--retryable-backoff-max-sec 300
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+```
+
+### Controlled production outbox smoke
+
+Notification timer를 멈춘 상태에서 explicit smoke label의 controlled WARNING event 한 건을 production outbox에 만들고 service를 한 번 실행했다.
+
+```text
+service Result=success
+ExecMainStatus=0
+pending_events=0
+active_failure=false
+receipt count for smoke event=1
+receipt transport=webhook
+Slack message count for smoke event=1
+D1 final state=delivered
+```
+
+Temporary checker와 state는 제거했다. Receipt와 D1 delivered row는 activation evidence로 보존했다. ALERT→RECOVERY pair는 만들지 않았다.
+
+Remote D1 acceptance 종료 상태:
+
+```text
+delivery_state=delivered, events=2
+delivered rows with payload_json other than {}=0
+```
+
+두 row는 isolated synthetic과 controlled production smoke다. Synthetic과 smoke는 production SLO compliance 분모에서 분리한다.
+
+### Rollback round trip
+
+Timer를 중지하고 보존한 local-file unit으로 복원한 뒤 daemon reload와 idle service 성공을 확인했다. 이어 repository Webhook unit을 다시 설치하고 idle service 성공 후 timer를 재시작했다.
+
+최종 기준선:
+
+```text
+activation timestamp=2026-08-21 16:18 KST
+notification timer=active
+collector alert timer=active
+latest notification service Result=success, ExecMainStatus=0
+installed service matches repository Webhook unit
+local-file backup remains preserved
+pending_events=0
+active_failure=false
+receiver /health=HTTP 200
+```
+
+### 의도적으로 수행하지 않은 live drill
+
+다음은 정상 production에 credential mismatch나 실패 row를 만들 수 있어 activation 중 강제하지 않았다.
+
+```text
+HMAC secret rotation
+receiver failed_permanent/failed_exhausted injection and requeue
+Slack 429/permanent/DLQ exhaustion
+exact duplicate signed replay
+ALERT -> RECOVERY pair
+```
+
+Contract와 runbook에 operator procedure를 유지하고 automated tests로 state transition을 검증한다. 실제 rotation/requeue는 승인된 maintenance window 또는 incident에서 실행하고 결과를 별도 log에 남긴다.
+
+### 문서 갱신 원칙
+
+Current-state 문서의 local-file/production 미활성 문구를 Webhook 기준선으로 바꿨다. 과거 ADR과 engineering log의 당시 local-file 상태는 historical evidence이므로 소급 수정하지 않고, 이 항목과 새 ADR로 상태 전이를 기록한다.
+
+전면 review에서 다음을 추가로 확인했다.
+
+```text
+current runtime, SLO activation timestamp and acceptance evidence consistency
+actual live checks versus automated-only and deferred drills
+UptimeRobot root 404 incident versus unexecuted /health 503 drill
+receiver 202 durability versus asynchronous Slack delivery
+systemd install, rollback and receiver requeue command scope
+Cloudflare Free quota and 24-hour Queue retention caveat
+Markdown code fence balance, local links and secret leakage
+historical record versus current truth separation
+```
+
+새 deployment/test 설명서는 runbook, receiver README와 tracked suite를 중복하므로 만들지 않는다. Production 활성 이후 우선순위가 높아진 추가 문서는 `NOTIFICATION_INCIDENT_TEMPLATE.md`이며 첫 실제 incident 전에 작성하는 것을 권장한다. `DATA_RETENTION_POLICY.md`는 D1 30일 volume 측정 뒤, `SECURITY.md`는 외부 contributor 또는 공개 vulnerability report 경로가 필요할 때 작성한다.
+
+### 최종 repository 검증
+
+```text
+Python sender regression=10/10 PASS
+Node receiver regression=14/14 PASS
+Node syntax check=PASS
+Wrangler version=4.125.0
+Worker dry-run upload=28.76 KiB, gzip=7.26 KiB, PASS
+fresh local D1 migration=3 commands PASS
+repository AeroTrace systemd unit errors=0
+git diff --check=PASS
+Markdown code fences/local links=PASS
+diff credential scan=PASS
+```
+
+Local fake HTTP server와 Miniflare local D1은 loopback socket이 필요하므로 제한된 sandbox 밖에서 동일 test command를 다시 실행해 최종 PASS를 확인했다. Remote deploy나 production D1 mutation은 이 최종 repository 검증에서 수행하지 않았다.

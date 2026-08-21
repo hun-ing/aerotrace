@@ -1,0 +1,11 @@
+[Unit]
+Description=Process AeroTrace notification outbox every 5 seconds
+
+[Timer]
+OnBootSec=35s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Unit=aerotrace-notification-outbox.service
+
+[Install]
+WantedBy=timers.target

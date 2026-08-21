@@ -1,0 +1,32 @@
+[Unit]
+Description=AeroTrace notification outbox processor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+User=huning
+Group=huning
+
+WorkingDirectory=/home/huning/aerotrace
+
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/aerotrace/notification.env
+
+StateDirectory=aerotrace-monitoring
+StateDirectoryMode=0750
+
+ExecStartPre=/usr/bin/mkdir -p /var/lib/aerotrace-monitoring/notification-outbox /var/lib/aerotrace-monitoring/notification-receipts
+
+ExecStart=/usr/bin/python3 /home/huning/aerotrace/scripts/process-notification-outbox.py --outbox-dir /var/lib/aerotrace-monitoring/notification-outbox --receipt-dir /var/lib/aerotrace-monitoring/notification-receipts --transport webhook --webhook-timeout-sec 5 --failure-state-file /var/lib/aerotrace-monitoring/notification-failure.json --retryable-backoff-initial-sec 5 --retryable-backoff-max-sec 300 --max-events 100 --quiet-idle
+
+TimeoutStartSec=15s
+
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

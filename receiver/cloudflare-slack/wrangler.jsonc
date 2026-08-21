@@ -1,0 +1,58 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "aerotrace-slack-receiver",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-21",
+  "secrets": {
+    "required": [
+      "AEROTRACE_SIGNING_SECRET",
+      "SLACK_WEBHOOK_URL"
+    ]
+  },
+  "vars": {
+    "SIGNATURE_MAX_AGE_SEC": "300",
+    "DELIVERY_LEASE_SEC": "30",
+    "SLACK_TIMEOUT_MS": "5000",
+    "RECONCILE_STALE_SEC": "600",
+    "RECONCILE_BATCH_SIZE": "100",
+    "HEALTH_STALE_SEC": "600"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "aerotrace-notification-receiver",
+      "migrations_dir": "migrations",
+      "database_id": "fafe1203-81a7-4b07-8b3a-6b0e61944c4b"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "DELIVERY_QUEUE",
+        "queue": "aerotrace-notification-delivery"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "aerotrace-notification-delivery",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 10,
+        "dead_letter_queue": "aerotrace-notification-delivery-dlq",
+        "max_concurrency": 1
+      },
+      {
+        "queue": "aerotrace-notification-delivery-dlq",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "max_concurrency": 1
+      }
+    ]
+  },
+  "triggers": {
+    "crons": [
+      "*/5 * * * *"
+    ]
+  }
+}
