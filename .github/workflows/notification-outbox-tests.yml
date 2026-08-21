@@ -2,10 +2,6 @@ name: Notification Outbox Tests
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/notification-outbox-tests.yml"
-      - "scripts/process-notification-outbox.py"
-      - "tests/test_notification_outbox.py"
   push:
     branches:
       - main

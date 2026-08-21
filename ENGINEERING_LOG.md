@@ -14805,7 +14805,7 @@ production transport=local-file
 `.github/workflows/notification-outbox-tests.yml`을 추가했다.
 
 ```text
-trigger=pull_request, related main push, workflow_dispatch
+trigger=every pull_request update, related main push, workflow_dispatch
 runner=ubuntu-latest
 python=3.10
 permissions=contents:read
@@ -14813,7 +14813,7 @@ timeout=5 minutes
 command=PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-자동 실행 경로는 sender 구현, 회귀 suite, workflow 자체 변경으로 제한했다. Checkout credential은 job 종료 전뿐 아니라 테스트 실행 중에도 불필요하므로 `persist-credentials: false`를 사용했다.
+Pull request에서는 최신 HEAD를 항상 검증하고, `main` push만 sender 구현, 회귀 suite, workflow 자체 변경으로 제한했다. Checkout credential은 job 종료 전뿐 아니라 테스트 실행 중에도 불필요하므로 `persist-credentials: false`를 사용했다.
 
 ### 검증
 
@@ -14831,6 +14831,8 @@ regression test step=success
 ```
 
 PR은 `main` 기준 충돌 없이 merge 가능한 상태로 확인했다.
+
+이후 문서-only 커밋을 push했을 때 기존 path filter 때문에 최신 HEAD에 run이 생성되지 않는 것을 확인했다. Pull request의 `paths` filter를 제거해 모든 synchronize 이벤트에서 suite를 실행하도록 수정했다. `main` push의 path filter는 유지했다.
 
 ### Production 안전 상태
 

@@ -7947,13 +7947,11 @@ Webhook sender의 backoff, failure latch, receipt 우선순위와 복구 semanti
 
 ### 결정
 
-`.github/workflows/notification-outbox-tests.yml`에서 다음 변경에 대해 표준 suite를 Python 3.10으로 실행한다.
+`.github/workflows/notification-outbox-tests.yml`에서 표준 suite를 Python 3.10으로 실행한다.
 
 ```text
 pull_request:
-  workflow 자체
-  scripts/process-notification-outbox.py
-  tests/test_notification_outbox.py
+  모든 open/reopen/synchronize 변경
 
 push:
   main의 동일 경로 변경
@@ -7967,8 +7965,8 @@ Workflow 권한은 `contents: read`만 허용하고 checkout credential은 유�
 ### 선택 이유
 
 - Production interpreter와 같은 Python 3.10 계열에서 실행한다.
-- Sender semantics에 영향을 주는 변경은 pull request에서 자동 검증한다.
-- 관련 없는 문서나 인프라 변경마다 loopback HTTP suite를 실행하지 않는다.
+- Pull request의 최신 HEAD는 변경 파일 종류와 관계없이 자동 검증한다.
+- `main` 직접 push는 sender, test, workflow 경로가 바뀔 때만 실행한다.
 - Dependency download와 cache가 없어 공급망 및 재현성 범위가 작다.
 - 5분 timeout과 concurrency cancellation으로 멈춘 run과 오래된 branch run을 제한한다.
 
@@ -7978,7 +7976,7 @@ Draft PR #1의 최초 GitHub Actions run `32441836314`에서 `notification-outbo
 
 ### Trade-off
 
-- Path filter 밖의 변경이 Python sender에 간접 영향을 주면 자동 실행되지 않을 수 있다.
+- Pull request마다 suite를 실행하므로 문서-only 후속 커밋도 짧은 CI 비용을 사용한다.
 - Fake local receiver는 실제 provider의 TLS, rate limit, authentication, durable deduplication을 검증하지 않는다.
 - Workflow 성공은 production Webhook 활성화 승인을 의미하지 않는다.
 - Branch protection required check 지정 여부는 repository 정책으로 별도 관리해야 한다.
