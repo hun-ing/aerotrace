@@ -1,14 +1,15 @@
 # AeroTrace Notification Operations Runbook
 
 > 마지막 업데이트: 2026-08-21
-> 범위: Collector queue alert outbox, local-file/Webhook delivery, persistent failure-state, retryable backoff, permanent failure 수동 재시도
+> 범위: Collector queue alert outbox, HMAC Webhook, Cloudflare receiver, Slack delivery, retry와 rollback
 
 ---
 
 관련 문서:
 
 - [Webhook Receiver Contract](WEBHOOK_RECEIVER_CONTRACT.md)
-- [Notification SLO Draft](NOTIFICATION_SLO.md)
+- [Notification SLO](NOTIFICATION_SLO.md)
+- [Cloudflare Slack Receiver](receiver/cloudflare-slack/README.md)
 
 ## 1. 현재 Production 기준선
 
@@ -30,7 +31,7 @@ deploy/systemd/aerotrace-notification-outbox.service
 deploy/systemd/aerotrace-notification-outbox-retry-permanent.service
 ```
 
-실제 Webhook endpoint, receiver-side `event_id` deduplication, secret 관리, rollback 준비가 끝나기 전에는 installed local-file service를 repository Webhook service로 교체하지 않는다.
+외부 채널은 Slack, receiver 구현은 Cloudflare Worker + D1 + Queue, fallback은 UptimeRobot email로 확정했다. 그러나 remote deploy, Slack synthetic, `/health` monitor와 rollback rehearsal이 끝나지 않았으므로 installed local-file service를 repository Webhook service로 교체하지 않는다.
 
 ## 2. 운영 불변 조건
 
@@ -41,6 +42,10 @@ deploy/systemd/aerotrace-notification-outbox-retry-permanent.service
 - Permanent failure 재시도는 원인 수정 후 운영자가 명시적으로 한 번만 수행한다.
 - Failure-state나 pending event를 정상 처리로 오인해 수동 삭제하지 않는다.
 - Webhook delivery는 exactly-once가 아니다. Receiver는 동일 `event_id` 중복을 처리할 수 있어야 한다.
+- Webhook request는 timestamp와 exact body HMAC을 검증한 뒤에만 D1에 기록한다.
+- Receiver HTTP 2xx는 D1과 Queue durable acceptance이며 Slack 표시 완료가 아니다.
+- Sender 2xx 이후 Slack 실패는 sender retry가 아니라 receiver D1 state에서 복구한다.
+- 성공한 receiver payload는 redaction하지만 hash와 delivery metadata는 dedup 근거로 보존한다.
 - Repository unit과 installed unit은 다를 수 있으므로 운영 판단에는 installed unit을 기준으로 사용한다.
 
 ## 3. 주요 경로와 Unit
@@ -71,6 +76,12 @@ aerotrace-notification-outbox.timer
 
 Permanent failure manual retry service
 aerotrace-notification-outbox-retry-permanent.service
+
+Cloudflare receiver source
+/home/huning/aerotrace/receiver/cloudflare-slack
+
+Receiver health
+https://<worker-host>/health
 ```
 
 ## 4. 읽기 전용 상태 점검
@@ -130,7 +141,16 @@ pending_bytes=0
 oldest_pending_age_sec=N/A
 ```
 
-Threshold 옵션을 지정하지 않은 이 명령은 pending 존재 여부와 구조를 확인하는 용도다. Pending event가 있어도 유효한 파일이면 `status=OK`일 수 있다. 운영 WARNING/CRITICAL 기준은 notification SLA가 정해진 뒤 별도로 설정한다.
+Threshold 옵션을 지정하지 않은 이 명령은 pending 존재 여부와 구조를 확인하는 용도다. 운영 판정에는 채택한 초기 threshold를 명시한다.
+
+```bash
+python3 scripts/check-notification-outbox.py \
+  --outbox-dir /var/lib/aerotrace-monitoring/notification-outbox \
+  --warn-count 5 \
+  --critical-count 20 \
+  --warn-age-sec 60 \
+  --critical-age-sec 300
+```
 
 ### Persistent failure-state 확인
 
@@ -153,6 +173,41 @@ failure_count=0
 - Permanent failure는 threshold 없이도 `status=CRITICAL`이다.
 - Retryable failure는 threshold를 지정하지 않으면 `active_failure=true`여도 `status=OK`일 수 있다.
 - 운영 경보에는 `status`만 보지 말고 `active_failure`, `failure_kind`, `failure_count`, `failure_duration_sec`, `last_failure_age_sec`를 함께 확인한다.
+
+운영 판정 명령:
+
+```bash
+python3 scripts/check-notification-failure-state.py \
+  --failure-state-file /var/lib/aerotrace-monitoring/notification-failure.json \
+  --warn-count 4 \
+  --critical-count 7 \
+  --warn-duration-sec 60 \
+  --critical-duration-sec 300
+```
+
+### Cloudflare receiver health
+
+Remote receiver가 준비된 뒤 secret이나 event ID를 출력하지 않고 확인한다.
+
+```bash
+curl --fail-with-body --silent --show-error \
+  https://<worker-host>/health
+```
+
+정상은 HTTP 200과 모든 count 0이다. `failed_permanent`, `failed_exhausted`, `stale_in_flight` 중 하나라도 양수거나 D1 query가 실패하면 HTTP 503이다.
+
+Production 전환 전에 UptimeRobot Free에서 다음 monitor를 만든다.
+
+```text
+type=HTTP(s)
+name=AeroTrace Slack Receiver Health
+URL=https://<worker-host>/health
+interval=5 minutes
+alert contact=verified operator email
+Slack contact=사용하지 않음
+```
+
+Monitor 생성 직후 정상 UP email/contact 상태를 확인하고, controlled `/health` 503 rehearsal에서 DOWN email을 받은 뒤 복구 UP도 확인한다.
 
 ### 최근 실행 결과와 journal
 
@@ -404,22 +459,23 @@ Malformed pending event를 무조건 삭제하면 아직 전달되지 않은 not
 
 ## 10. Webhook 전환 전 점검표
 
-현재 local-file 기준선에서 Webhook으로 전환하려면 다음 조건이 모두 필요하다.
+현재 local-file 기준선에서 Slack Webhook으로 전환하려면 다음 조건이 모두 필요하다.
 
-- 실제 endpoint와 소유자가 정해졌다.
-- Receiver가 HTTPS를 지원한다.
-- Endpoint 인증이 현재 adapter의 지원 범위와 맞는다.
-- Receiver가 `event_id` 기반 중복 억제를 지원하거나 중복을 안전하게 처리한다.
-- HTTP 2xx 성공 contract와 3xx/4xx/5xx 정책을 receiver 측과 합의했다.
+- Slack private channel과 Incoming Webhook app owner가 정해졌다.
+- Cloudflare Worker, D1 migration, Queue와 DLQ가 remote에 준비됐다.
+- Receiver HTTPS endpoint의 isolated synthetic test가 통과했다.
+- HMAC secret이 sender와 receiver에 동일하게 안전하게 저장됐다.
+- 동일 `event_id` duplicate에서 Slack side effect가 1회임을 확인했다.
 - Timeout 후 ambiguous delivery 대응 절차가 있다.
-- Notification 지연 SLA와 outbox/failure 경보 threshold가 정해졌다.
+- Notification SLO와 outbox/failure threshold가 검토됐다.
+- UptimeRobot `/health` email monitor의 DOWN/UP 검증이 통과했다.
 - Backoff `initial=5`, `maximum=300`이 endpoint rate limit과 SLA에 적합하다.
 - `/etc/aerotrace/notification.env`의 소유권과 권한 정책이 정해졌다.
 - 전환 직전 `pending_events=0`, `active_failure=false`를 확인했다.
 - Installed local-file unit의 rollback 사본을 만들었다.
 - 성공 ALERT/RECOVERY와 retryable/permanent failure를 change window에서 검증할 계획이 있다.
 
-현재 adapter가 보내는 header는 `Content-Type`, `Accept`, `User-Agent`, `X-AeroTrace-Event-Id`로 고정돼 있으며 사용자 정의 `Authorization` header를 지원하지 않는다. URL userinfo도 validation에서 거부한다. Header 인증이 필요한 endpoint라면 Webhook 전환 전에 별도 구현과 검증이 필요하다.
+Adapter는 `X-AeroTrace-Timestamp`와 `X-AeroTrace-Signature: v1=...` HMAC header를 보낸다. Bearer token과 임의 사용자 header는 지원하지 않는다. URL userinfo도 validation에서 거부한다.
 
 ### Repository unit 사전 검증
 
@@ -450,6 +506,28 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 - Retryable immediate defer, 두 번째 실패, HTTP 204 복구
 - `ACK_EXISTING`이 retryable backoff보다 먼저 실행됨
 - Permanent latch와 explicit retry
+- Exact request body HMAC과 signing secret validation
+
+Receiver 회귀와 배포 설정 검증:
+
+```bash
+cd /home/huning/aerotrace/receiver/cloudflare-slack
+npm ci
+npm test
+npm run check
+npm run deploy:dry-run
+npm run db:migrate:local
+```
+
+검증 범위:
+
+- HMAC tamper와 replay window
+- D1 durable accept, duplicate와 payload conflict
+- Queue publication 실패 후 sender retry 복구
+- Slack success/retryable/permanent 상태 전이
+- DLQ exhaustion과 final state 보존
+- Scheduled reconciliation과 `/health` degradation
+- Worker binding bundle과 fresh D1 migration
 
 Local fake receiver가 loopback TCP port를 사용하므로 sandboxed 실행 환경에서는 socket permission이 필요할 수 있다.
 
@@ -490,10 +568,11 @@ sudo chmod 0600 /etc/aerotrace/notification.env
 파일 형식:
 
 ```text
-AEROTRACE_WEBHOOK_URL="https://<approved-endpoint>"
+AEROTRACE_WEBHOOK_URL="https://<worker-host>/v1/notifications"
+AEROTRACE_WEBHOOK_SIGNING_SECRET="<same-random-secret-as-cloudflare>"
 ```
 
-실제 URL이나 token을 terminal history, journal, Git diff, issue, 문서에 붙여 넣지 않는다. 환경 파일 전체를 상태 확인 목적으로 출력하지 않는다.
+HMAC secret은 32 UTF-8 bytes 이상의 random 값이고 Cloudflare `AEROTRACE_SIGNING_SECRET`과 정확히 같아야 한다. 실제 endpoint나 secret을 terminal history, journal, Git diff, issue, 문서에 붙여 넣지 않는다. 환경 파일 전체를 상태 확인 목적으로 출력하지 않는다.
 
 ### 11.3 Unit 설치와 활성화
 
@@ -540,7 +619,7 @@ Installed service에서 다음 값을 확인한다.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ```
 
-Environment file의 URL 값 자체는 출력하지 않는다.
+Environment file의 URL과 HMAC secret 값 자체는 출력하지 않는다.
 
 그다음 승인된 ALERT/RECOVERY test event로 다음을 검증한다.
 
@@ -601,7 +680,85 @@ Rollback 후 Webhook environment file과 retry unit은 원인 분석이 끝날 �
 
 Unit 파일 복원 자체는 pending event나 failure-state를 삭제하지 않는다. Webhook failure가 남아 있을 때는 외부 전달을 복구할지, 별도 수동 전달 후 ACK할지, local-file 기준선으로 의도적으로 전환할지를 결정하고 기록한 뒤 timer 재시작 여부를 승인한다.
 
-## 13. Incident 종료 조건
+## 13. Receiver-side Slack Failure 대응
+
+Sender가 Worker의 202/204를 받으면 local receipt를 만들고 pending을 ACK한다. 이후 Queue에서 발생한 Slack failure는 sender의 `notification-failure.json`이나 permanent retry unit으로 복구하지 않는다.
+
+### 상태 조회
+
+Cloudflare 계정에 영향을 주지 않는 read-only D1 query다.
+
+```bash
+cd /home/huning/aerotrace/receiver/cloudflare-slack
+npx wrangler d1 execute DB --remote --command \
+  "SELECT event_id, delivery_state, delivery_attempts, last_http_status, last_error, updated_at FROM notification_events WHERE delivery_state IN ('failed_permanent','failed_exhausted') ORDER BY updated_at"
+```
+
+확인 항목:
+
+- `failed_permanent`: Slack 408/429/5xx 이외 non-2xx
+- `failed_exhausted`: retryable Slack failure가 Queue budget을 소진
+- Slack app/channel 설치 상태
+- `SLACK_WEBHOOK_URL` rotation 또는 revocation 여부
+- Cloudflare Queue/DLQ와 Worker log
+- 동일 event가 이미 Slack에 표시됐을 가능성
+
+### Requeue 전 조건
+
+- Slack 원인이 수정됐다.
+- 정확한 event ID와 현재 final failure state를 확인했다.
+- Event의 `payload_json`이 `{}`로 redaction되지 않았다.
+- 같은 event가 이미 Slack에 표시됐을 가능성을 검토했다.
+- 재전송 결과를 즉시 확인할 운영자와 change record가 있다.
+
+### 명시적 receiver requeue
+
+다음 UPDATE는 remote D1 state를 변경하고 Slack 재전송을 유발할 수 있으므로 Codex가 자동 실행하지 않는다. 운영자가 exact event ID를 넣고 승인된 change window에서 실행한다.
+
+먼저 한 row만 다시 읽는다.
+
+```bash
+npx wrangler d1 execute DB --remote --command \
+  "SELECT event_id, delivery_state, delivery_attempts, payload_redacted_at, last_http_status, last_error, updated_at FROM notification_events WHERE event_id = '<exact-event-id>'"
+```
+
+그다음 final failure와 unredacted payload에만 compare-and-set한다.
+
+```bash
+npx wrangler d1 execute DB --remote --command \
+  "UPDATE notification_events SET delivery_state='accepted', delivery_attempts=0, enqueued_at=NULL, last_attempt_at=NULL, lease_expires_at=NULL, delivered_at=NULL, payload_redacted_at=NULL, last_http_status=NULL, last_error=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE event_id='<exact-event-id>' AND delivery_state IN ('failed_permanent','failed_exhausted') AND payload_json <> '{}'; SELECT changes() AS requeued;"
+```
+
+정상 결과는 `requeued=1`이다. `0`이면 조건이 달라진 것이므로 UPDATE를 완화하지 말고 상태를 다시 조회한다.
+
+Scheduled reconciliation은 최대 약 5분 안에 `accepted` event를 Queue에 publish한다. 다음을 확인한다.
+
+```text
+D1 state accepted -> queued -> delivering -> delivered
+Slack에 expected event_id 표시
+/health HTTP 200 복구
+payload_redacted_at 설정
+```
+
+### HMAC secret rotation
+
+현재 dual-secret overlap은 지원하지 않는다. Mismatch는 sender permanent latch를 만들 수 있으므로 다음 순서를 지킨다.
+
+```text
+1. production notification timer 중지
+2. pending_events=0, active_failure=false 확인
+3. Cloudflare AEROTRACE_SIGNING_SECRET 교체
+4. /etc/aerotrace/notification.env의 sender secret 교체
+5. receiver synthetic 202 + Slack 1회 확인
+6. production service configuration check
+7. timer 재시작
+```
+
+Cloudflare secret과 `/etc` 변경은 운영자가 직접 수행한다. Secret 값을 command argument에 넣지 않고 interactive prompt/editor를 사용한다.
+
+Slack Webhook URL rotation은 Cloudflare `SLACK_WEBHOOK_URL`을 먼저 바꾸고 synthetic을 확인한다. 기존 `failed_permanent` event는 자동 재시도되지 않는다.
+
+## 14. Incident 종료 조건
 
 Notification incident는 다음을 모두 확인한 뒤 종료한다.
 
@@ -612,6 +769,10 @@ pending_events=0 또는 원인이 설명된 승인된 pending만 존재
 active_failure=false
 expected receipt 존재
 Webhook incident이면 receiver의 expected event_id 확인
+receiver failed_permanent=0
+receiver failed_exhausted=0
+receiver stale_in_flight=0
+/health HTTP 200
 Webhook ALERT가 있었다면 필요한 RECOVERY 전달 확인
 ```
 
@@ -625,18 +786,24 @@ Webhook ALERT가 있었다면 필요한 RECOVERY 전달 확인
 - Deferred 횟수와 적용된 backoff
 - 수동 permanent retry 수행 여부와 승인자
 - Duplicate delivery 발생 여부
+- Receiver D1 최종 state와 Slack HTTP status
+- Receiver requeue 수행 여부와 `requeued` result
 - Pending/receipt/failure-state 최종 상태
 - 설정 또는 unit 변경과 rollback 여부
 
-## 14. 알려진 한계
+## 15. 알려진 한계
 
 - Webhook은 at-least-once 성격이며 exactly-once를 보장하지 않는다.
 - Timeout은 receiver 처리 여부를 알 수 없는 ambiguous failure다.
 - Head pending event가 backoff 또는 permanent latch 상태이면 뒤 event가 막힌다.
-- Dead-letter와 quarantine lifecycle이 없다.
+- Sender filesystem outbox에는 dead-letter/quarantine lifecycle이 없다.
+- Receiver Queue에는 DLQ가 있지만 final failure의 public admin retry endpoint는 없다.
 - Retryable deferred 실행도 journal output을 남긴다.
 - Backoff 계산은 server wall clock에 의존한다.
-- 현재 production outbox/failure WARNING·CRITICAL threshold와 notification SLA가 확정되지 않았다.
-- 실제 외부 Webhook provider와 credential은 아직 선택되지 않았다.
-- 사용자 정의 Webhook authentication header를 지원하지 않는다.
-- Tracked `unittest` suite는 local과 GitHub Actions에서 실행되지만 실제 external receiver의 durable acceptance와 deduplication까지 검증하지는 않는다.
+- Threshold와 초기 SLO는 정했지만 production SLI는 아직 `NO_DATA`다.
+- Slack과 Cloudflare는 선택했지만 remote resource와 credential은 아직 생성하지 않았다.
+- HMAC active secret 하나만 지원하며 dual-secret 무중단 rotation은 없다.
+- Slack 성공 후 D1 update 전 crash는 user-visible duplicate를 만들 수 있다.
+- Receiver 성공 row의 원문은 redaction하지만 D1 row 자동 retention/deletion은 없다.
+- Tracked tests는 local fake와 state machine을 검증하지만 실제 Cloudflare/Slack acceptance를 대신하지 않는다.
+- 단일 운영자 구조로 24x7 response와 secondary on-call을 보장하지 않는다.

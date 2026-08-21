@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import contextlib
+import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -22,6 +24,7 @@ ADAPTER_PATH = (
     / "scripts"
     / "process-notification-outbox.py"
 )
+TEST_SIGNING_SECRET = "test-signing-secret-32-bytes-minimum"
 
 
 def load_adapter_module() -> ModuleType:
@@ -192,6 +195,9 @@ class NotificationOutboxTest(
         webhook_url: str | None = None,
         use_failure_state: bool = True,
         transport: str = "webhook",
+        webhook_signing_secret: str | None = (
+            TEST_SIGNING_SECRET
+        ),
     ) -> subprocess.CompletedProcess[str]:
         command = [
             sys.executable,
@@ -240,6 +246,19 @@ class NotificationOutboxTest(
             "AEROTRACE_WEBHOOK_URL",
             None,
         )
+        environment.pop(
+            "AEROTRACE_WEBHOOK_SIGNING_SECRET",
+            None,
+        )
+
+        if (
+            transport == "webhook"
+            and webhook_signing_secret is not None
+        ):
+            environment[
+                "AEROTRACE_WEBHOOK_SIGNING_SECRET"
+            ] = webhook_signing_secret
+
         environment[
             "PYTHONDONTWRITEBYTECODE"
         ] = "1"
@@ -410,6 +429,80 @@ class NotificationOutboxTest(
                     f"http_{status}",
                 )
 
+    def test_webhook_signature_calculation(
+        self,
+    ) -> None:
+        request_body = "{\"message\":\"안녕\"}".encode(
+            "utf-8"
+        )
+        timestamp = 1787281200
+        signing_secret = TEST_SIGNING_SECRET.encode(
+            "utf-8"
+        )
+
+        headers = (
+            ADAPTER.build_webhook_signature_headers(
+                request_body=request_body,
+                signing_secret=signing_secret,
+                timestamp=timestamp,
+            )
+        )
+        expected_digest = hmac.new(
+            signing_secret,
+            b"v1.1787281200." + request_body,
+            hashlib.sha256,
+        ).hexdigest()
+
+        self.assertEqual(
+            headers["X-AeroTrace-Timestamp"],
+            str(timestamp),
+        )
+        self.assertEqual(
+            headers["X-AeroTrace-Signature"],
+            f"v1={expected_digest}",
+        )
+
+    def test_webhook_signing_secret_configuration(
+        self,
+    ) -> None:
+        self.write_event(
+            self.build_event()
+        )
+
+        cases = (
+            (
+                None,
+                "AEROTRACE_WEBHOOK_SIGNING_SECRET is required",
+            ),
+            (
+                "too-short",
+                "at least 32 UTF-8 bytes",
+            ),
+            (
+                TEST_SIGNING_SECRET + " ",
+                "surrounding whitespace",
+            ),
+        )
+
+        for signing_secret, expected_error in cases:
+            with self.subTest(
+                signing_secret=signing_secret
+            ):
+                result = self.run_adapter(
+                    webhook_url="http://127.0.0.1:1/test",
+                    webhook_signing_secret=signing_secret,
+                )
+
+                self.assertEqual(
+                    result.returncode,
+                    4,
+                    result,
+                )
+                self.assertIn(
+                    expected_error,
+                    result.stderr,
+                )
+
     def test_local_file_delivery_smoke(
         self,
     ) -> None:
@@ -513,6 +606,27 @@ class NotificationOutboxTest(
                     "User-Agent"
                 ],
                 "AeroTrace-Notification/1",
+            )
+            timestamp = request["headers"][
+                "X-Aerotrace-Timestamp"
+            ]
+            signature = request["headers"][
+                "X-Aerotrace-Signature"
+            ]
+            expected_signature = hmac.new(
+                TEST_SIGNING_SECRET.encode("utf-8"),
+                (
+                    b"v1."
+                    + timestamp.encode("ascii")
+                    + b"."
+                    + request["body"]
+                ),
+                hashlib.sha256,
+            ).hexdigest()
+
+            self.assertEqual(
+                signature,
+                f"v1={expected_signature}",
             )
 
             first_state = (

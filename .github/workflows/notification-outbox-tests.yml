@@ -1,4 +1,4 @@
-name: Notification Outbox Tests
+name: Notification Pipeline Tests
 
 on:
   pull_request:
@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - ".github/workflows/notification-outbox-tests.yml"
+      - "receiver/cloudflare-slack/**"
       - "scripts/process-notification-outbox.py"
       - "tests/test_notification_outbox.py"
   workflow_dispatch:
@@ -15,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: notification-outbox-${{ github.workflow }}-${{ github.ref }}
+  group: notification-pipeline-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -38,3 +39,38 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python3 -m unittest discover -s tests -v
+
+  cloudflare-slack-receiver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: receiver/cloudflare-slack
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Run receiver tests
+        run: npm test
+
+      - name: Check receiver source syntax
+        run: npm run check
+
+      - name: Validate Worker bundle and bindings
+        run: npm run deploy:dry-run
+
+      - name: Validate fresh local D1 migration
+        run: npm run db:migrate:local

@@ -1,0 +1,22 @@
+{
+  "name": "aerotrace-cloudflare-slack-receiver",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/protocol.js && node --check src/d1-repository.js && node --check scripts/send-synthetic.mjs && node --check test/receiver.test.js",
+    "dev": "wrangler dev --persist-to .wrangler/state",
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
+    "synthetic": "node --env-file=.dev.vars scripts/send-synthetic.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.125.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

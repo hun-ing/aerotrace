@@ -1,26 +1,31 @@
 # AeroTrace 프로젝트 컨텍스트
 
 > 마지막 업데이트: 2026-08-21
-> 현재 상태: Phase 9 production notification pipeline의 Webhook 실패 정책, receiver contract, SLO 초안과 tracked 회귀 테스트 구축
+> 현재 상태: Slack + Cloudflare Worker/D1/Queue receiver, HMAC sender, 초기 SLO와 tracked 회귀 테스트 구현
 > 현재 Phase: Phase 9 — 로컬 통합 실행 및 배포 준비
-> 다음 작업: 실제 Webhook endpoint, receiver-side deduplication, notification SLA와 경보 threshold를 확정한 뒤 승인된 change window의 전환 계획을 수립한다.
+> 다음 작업: Slack/Cloudflare 계정 설정, remote migration과 isolated synthetic 검증, UptimeRobot `/health` email monitor와 rollback rehearsal 후 production 전환 승인을 받는다.
 
 ---
 
 ## 현재 작업 컨텍스트 — 2026-08-21
 
-Webhook retryable backoff와 운영 runbook 기준 커밋:
+현재 feature branch 기준점:
 
 ```text
-c558902 Webhook 재시도 백오프와 운영 절차 추가
+branch=feature/notification-contract-slo-tests
+upstream HEAD before Slack receiver work=a9187fe
+draft PR=#1
 ```
 
-후속 문서와 자동 검증 범위:
+Slack receiver와 후속 문서·자동 검증 범위:
 
 ```text
 WEBHOOK_RECEIVER_CONTRACT.md
 NOTIFICATION_SLO.md
+OPERATIONS_RUNBOOK.md
 tests/test_notification_outbox.py
+receiver/cloudflare-slack/
+.github/workflows/notification-outbox-tests.yml
 ```
 
 다음 untracked 파일은 별도 성능 분석 작업이므로 이번 변경에서 수정하거나 커밋하지 않는다.
@@ -69,9 +74,23 @@ Backoff 설정 기본값:
 
 Repository에는 Webhook 자동 처리 unit과 permanent failure 수동 재시도용 oneshot unit이 있다. 수동 unit은 한 번에 최대 한 event만 처리한다.
 
-외부 receiver와의 HTTP payload, header, status, `event_id` deduplication, timeout과 authentication 경계는 `WEBHOOK_RECEIVER_CONTRACT.md`에 정의한다.
+외부 channel은 Slack, receiver는 Cloudflare Worker + D1 + Queue로 선택했다. Sender는 `v1.timestamp.exact_body` 형식의 HMAC-SHA256 header를 전송하고 receiver는 기본 ±300초 replay window에서 검증한다.
 
-Notification SLI 계산 기준, current retry timeline, 미확정 threshold와 incident ownership은 `NOTIFICATION_SLO.md`에 분리했다. 실제 endpoint와 운영 요구가 없으므로 수치 SLO는 아직 채택하지 않았다.
+Receiver는 D1 `event_id` primary key와 canonical payload hash로 new/duplicate/conflict를 구분한 뒤 Queue write까지 성공해야 202를 반환한다. Slack delivery는 비동기이며 retryable response와 network failure를 Queue가 최대 10회 재시도하고 최종 failure를 D1에 보존한다. `/health`는 permanent/exhausted/stale 상태를 HTTP 503으로 노출한다.
+
+초기 notification SLO와 threshold는 `NOTIFICATION_SLO.md`에 확정했다.
+
+```text
+receiver durable acceptance=99% within 60초, rolling 30 days
+Slack delivery=99% within additional 300초
+outbox warning/critical age=60/300초
+sender failure warning/critical duration=60/300초
+receiver stale health threshold=600초
+owner=AeroTrace service operator
+fallback=UptimeRobot Free /health email monitor, 5분
+```
+
+이 수치는 production activation 전 provisional이며 현재 compliance는 `NO_DATA`다.
 
 Tracked 회귀 테스트:
 
@@ -85,7 +104,19 @@ tests/test_notification_outbox.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-이 suite는 backoff 계산과 configuration, local-file smoke, request contract, retryable defer/복구, `ACK_EXISTING` 우선순위, permanent latch와 explicit retry를 local fake HTTP receiver로 검증한다. `.github/workflows/notification-outbox-tests.yml`이 pull request와 관련 `main` push에서 같은 명령을 Python 3.10으로 실행하며, 최초 PR run은 8개 테스트를 모두 통과했다.
+이 suite는 backoff 계산과 configuration, local-file smoke, HMAC request contract, retryable defer/복구, `ACK_EXISTING` 우선순위, permanent latch와 explicit retry를 local fake HTTP receiver로 검증한다. 현재 10개가 통과한다.
+
+Receiver suite:
+
+```bash
+cd receiver/cloudflare-slack
+npm test
+npm run check
+npm run deploy:dry-run
+npm run db:migrate:local
+```
+
+현재 Node test 14개, Wrangler 4.125.0 bundle dry-run과 fresh local D1 migration이 통과했다. GitHub Actions에는 Python 3.10 sender job과 Node.js 22 receiver job이 포함된다.
 
 현재 서버에 설치된 production runtime은 계속 local-file 안전 기준선이다.
 

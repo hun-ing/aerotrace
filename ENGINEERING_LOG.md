@@ -14846,3 +14846,186 @@ PR은 `main` 기준 충돌 없이 merge 가능한 상태로 확인했다.
 - Receiver의 durable `event_id` deduplication을 acceptance test로 검증한다.
 - Notification SLO 수치와 incident ownership을 확정한다.
 - 격리된 Webhook E2E와 rollback rehearsal 후 production 전환 승인을 받는다.
+
+---
+
+## V-7B-4-10 Slack + Cloudflare Durable Notification Receiver 구현
+
+### 기준점
+
+```text
+branch=feature/notification-contract-slo-tests
+upstream HEAD=a9187fe
+draft PR=#1
+installed production transport=local-file
+pending_events=0
+active_failure=false
+```
+
+### Channel과 architecture 결정
+
+Notification channel은 Slack으로 선택했다. Sender가 Slack URL을 직접 호출하지 않고 다음 경계를 사용한다.
+
+```text
+filesystem outbox sender
+-> exact-body HMAC HTTPS
+-> Cloudflare Worker
+-> D1 durable event_id claim
+-> Cloudflare Queue
+-> Slack Incoming Webhook
+```
+
+구현 디렉터리:
+
+```text
+receiver/cloudflare-slack/
+```
+
+### Sender HMAC
+
+`scripts/process-notification-outbox.py`에 다음을 추가했다.
+
+```text
+env=AEROTRACE_WEBHOOK_SIGNING_SECRET
+minimum=32 UTF-8 bytes
+signed_content=v1.<unix-seconds>.<exact request body>
+algorithm=HMAC-SHA256
+headers=X-AeroTrace-Timestamp, X-AeroTrace-Signature
+```
+
+Webhook transport는 signing secret이 없거나 짧거나 앞뒤 공백이 있으면 HTTP 요청 전에 exit code 4로 종료한다. Local-file transport는 이 secret을 요구하지 않는다.
+
+### Durable receiver
+
+Worker HTTP handler는 다음 순서를 사용한다.
+
+```text
+64 KiB body 제한
+-> ±300초 timestamp와 HMAC 검증
+-> fatal UTF-8 decode와 JSON/schema validation
+-> canonical payload SHA-256
+-> D1 INSERT OR IGNORE
+-> Queue disk-confirmed send
+-> new 202 / duplicate 204 / conflict 409
+```
+
+Queue send가 실패하면 D1 `accepted` row를 유지하고 503을 반환한다. Sender retry 또는 5분 scheduled reconciliation이 재publish할 수 있다.
+
+D1 state:
+
+```text
+accepted -> queued -> delivering
+delivering -> delivered | queued | failed_permanent
+DLQ -> failed_exhausted
+```
+
+Slack 408/429/5xx와 network/timeout은 retryable이고 5, 10, 20, 40, 80, 160, 300초 상한 delay를 사용한다. Numeric `Retry-After`는 최대 86400초까지 우선한다. Consumer `max_retries=10` 후 DLQ가 final failure를 기록한다.
+
+Slack 성공 후에는 D1 `payload_json`을 `{}`로 redaction하고 `payload_redacted_at`을 기록한다. Dedup hash와 event/delivery metadata는 유지한다.
+
+### Health fallback
+
+Primary Slack 경로 내부의 failure가 sender에는 보이지 않는 문제를 보완하기 위해 `GET /health`가 다음 D1 aggregate를 확인한다.
+
+```text
+failed_permanent
+failed_exhausted
+stale_in_flight >= 600초
+```
+
+하나라도 있으면 event ID와 payload 없이 HTTP 503을 반환한다. Production activation 전 UptimeRobot Free HTTP(S) monitor를 5분 간격과 operator email contact로 연결해야 한다.
+
+### 구현 중 발견하고 수정한 문제
+
+1. Node test memory repository에서 `Array.map(structuredClone)`이 index를 options 인자로 전달해 실패했다. Arrow callback으로 교정했다.
+2. DLQ duplicate가 이미 delivered event를 덮어쓸 수 있는 경계를 final-state read/ACK로 차단했다.
+3. 기본 `TextDecoder`가 invalid UTF-8을 대체할 수 있어 `{ fatal: true }`로 변경했다.
+4. D1 insert 후 Queue publish failure가 durable row를 유지하고 duplicate retry로 복구되는 테스트를 추가했다.
+5. Slack 성공 row의 diagnostic payload 장기 보존을 제거했다.
+6. Receiver async permanent failure가 sender state에 나타나지 않는 관측 공백을 `/health` 503으로 노출했다.
+
+### 자동 검증
+
+Sender:
+
+```text
+tests=10
+passed=10
+failed=0
+errors=0
+result=PASS
+```
+
+Receiver:
+
+```text
+tests=14
+passed=14
+failed=0
+result=PASS
+```
+
+Receiver test 범위:
+
+```text
+HMAC exact body, tamper, stale timestamp
+canonical payload hash
+durable accept, duplicate, conflict
+invalid signature before D1
+invalid UTF-8 before D1
+Queue failure durable recovery
+Slack 2xx, 429 Retry-After, permanent 400, network failure
+DLQ exhaustion and delivered-state preservation
+scheduled reconciliation
+/health degradation
+```
+
+Wrangler validation:
+
+```text
+version=4.125.0
+npm audit vulnerabilities=0
+bundle dry-run=PASS
+upload size=28.68 KiB
+gzip size=7.22 KiB
+fresh local D1 migration=3 commands PASS
+```
+
+GitHub Actions에 Node.js 22 receiver job을 추가했다. Locked dependency install, Node tests, syntax check와 Worker dry-run을 실행한다.
+
+### SLO와 운영 정책
+
+초기 provisional 목표:
+
+```text
+receiver acceptance=99% within 60초
+Slack delivered=99% within additional 300초
+sender outbox warning/critical=60/300초
+sender failure warning/critical=60/300초
+receiver stale health=600초
+```
+
+Sender retry는 pending을 무기한 보존하고, receiver Slack retry는 10회 후 D1 final failure로 분리했다. Owner는 현재 단일 `AeroTrace service operator` 역할이고 secondary가 없다는 위험을 기록했다.
+
+### Production 안전 상태
+
+다음 작업은 수행하지 않았다.
+
+```text
+Cloudflare login/deploy
+remote D1 migration
+Slack app/Webhook 생성
+/etc/aerotrace/notification.env 생성
+/etc/systemd/system unit 설치
+production timer/service 변경
+```
+
+Installed runtime은 계속 local-file 기준선이다.
+
+### 다음 단계
+
+- 운영자가 Slack private channel과 Incoming Webhook을 생성한다.
+- Cloudflare Worker를 secrets file과 함께 deploy하고 remote migration을 적용한다.
+- Synthetic 202, Slack 1회, duplicate와 `/health`를 검증한다.
+- UptimeRobot `/health` DOWN/UP email, HMAC rotation과 local-file rollback을 rehearsal한다.
+- 결과를 문서에 반영하고 전체 문서 review 후 commit/push한다.

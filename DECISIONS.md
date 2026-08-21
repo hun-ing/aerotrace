@@ -7988,3 +7988,172 @@ Draft PR #1의 최초 GitHub Actions run `32441836314`에서 `notification-outbo
 - 실제 receiver용 integration environment를 도입할 때
 - Test runtime이 5분에 접근하거나 flaky socket failure가 발생할 때
 - Branch protection 또는 merge queue 정책을 도입할 때
+
+---
+
+## ADR — Slack 앞에 Cloudflare Worker, D1, Queue receiver를 둔다
+
+### 상태
+
+채택 — repository 구현 완료, remote production 미배포
+
+### 배경
+
+AeroTrace notification의 사용자 channel로 Slack, Telegram, Discord를 비교했다. 현재 목적은 개인 MVP 운영 경보지만 향후 팀 channel, 검색, thread와 app 관리까지 고려하면 Slack이 운영 메시지에 가장 적합했다.
+
+Sender가 Slack Incoming Webhook을 직접 호출하면 다음 문제가 남는다.
+
+- Slack URL 형식과 credential이 host에 직접 결합된다.
+- Sender timeout 후 Slack이 실제 수신했는지 확인할 durable idempotency record가 없다.
+- Slack 장애와 rate limit이 host outbox의 head-of-line blocking을 직접 만든다.
+- Channel을 바꾸면 sender transport code와 production secret을 함께 바꿔야 한다.
+- Receiver acceptance 시각과 Slack 최종 delivery 시각을 분리해 측정할 수 없다.
+
+### 결정
+
+```text
+AeroTrace sender
+-> HMAC HTTPS
+-> Cloudflare Worker
+-> D1 event_id claim
+-> Cloudflare Queue
+-> Slack Incoming Webhook
+```
+
+Receiver source는 `receiver/cloudflare-slack/`에 둔다.
+
+HTTP 2xx는 Slack 표시 완료가 아니라 다음 두 durability 조건을 뜻한다.
+
+```text
+D1 event_id row 존재
+Cloudflare Queue write 완료
+```
+
+D1은 `event_id` primary key와 canonical payload SHA-256으로 duplicate와 conflict를 구분한다. Queue는 Slack retryable failure를 10회 제한으로 처리하고 DLQ 소비 결과를 `failed_exhausted`로 보존한다.
+
+### 인증 결정
+
+Sender는 다음 exact bytes를 HMAC-SHA256으로 서명한다.
+
+```text
+v1.<unix-seconds>.<exact-request-body>
+```
+
+Receiver는 기본 ±300초 replay window와 constant-time signature verification을 사용한다. Secret은 32 UTF-8 bytes 이상이며 sender `/etc/aerotrace/notification.env`와 Cloudflare secret binding에만 저장한다.
+
+### 선택 이유
+
+- Slack app/channel UX를 사용하면서 provider-specific secret을 receiver에 격리한다.
+- D1 insert로 restart-safe dedup과 payload conflict evidence를 남긴다.
+- Queue write가 완료된 뒤에만 sender pending을 ACK한다.
+- Slack 장애가 sender HTTP acceptance latency와 직접 결합되지 않는다.
+- Free tier 범위에서 작은 notification volume을 처리할 수 있다.
+- `/health`를 primary Slack과 독립된 UptimeRobot Free email monitor가 5분 간격으로 감시할 수 있다.
+
+### 검토한 대안
+
+`Sender -> Slack direct`
+
+- 구성은 가장 단순하지만 durable receiver dedup, channel abstraction, delivery state 관측이 없다.
+
+`Cloudflare Worker -> Slack without D1/Queue`
+
+- HTTP hop만 추가하고 timeout ambiguity와 Slack 장애 격리를 해결하지 못한다.
+
+`Telegram bot`
+
+- 무료 개인 알림은 우수하지만 운영 team channel, app 관리와 향후 협업 맥락에서 Slack보다 우선하지 않았다.
+
+`Discord webhook`
+
+- 설정이 간단하고 무료지만 현재 프로젝트의 운영 협업·포트폴리오 맥락에서는 Slack을 선택했다.
+
+`D1 only scheduled polling`
+
+- Queue 없이 구현할 수 있지만 retry delay, DLQ, disk-confirmed publish API를 직접 다시 만들어야 한다.
+
+### Trade-off와 한계
+
+- Cloudflare와 Slack 두 external dependency가 생긴다.
+- Slack 성공 후 D1 update 전 crash는 duplicate Slack message를 만들 수 있다.
+- Sender 202 이후 Slack failure는 sender가 아니라 receiver D1에서 재처리해야 한다.
+- HMAC dual-secret overlap을 아직 지원하지 않아 rotation change window가 필요하다.
+- D1 성공 row payload는 redaction하지만 row retention job은 없다.
+- 단일 운영자와 UptimeRobot account/email contact가 필요하다.
+
+### 검증
+
+```text
+Python sender regression tests=10/10 PASS
+Node receiver tests=14/14 PASS
+Wrangler 4.125.0 dry-run=PASS
+fresh local D1 migration=PASS
+production filesystem/systemd mutation=없음
+```
+
+### 재검토 조건
+
+- Slack Incoming Webhook 제한 또는 비용 변경
+- Free tier quota 접근
+- Duplicate Slack incident
+- Multi-channel fan-out 요구
+- Team on-call과 secondary owner 도입
+- D1 row retention 요구
+- HMAC rotation 중 permanent latch 사고
+
+---
+
+## ADR — Notification 초기 SLO와 sender/receiver retry budget을 분리한다
+
+### 상태
+
+채택 — production activation 전 provisional
+
+### 결정
+
+```text
+Receiver durable acceptance
+  rolling 30 days 99% within 60초
+
+Slack delivery
+  accepted event의 rolling 30 days 99% within additional 300초
+
+Sender outbox
+  warning age/count=60초/5
+  critical age/count=300초/20
+
+Sender failure
+  warning duration/count=60초/4
+  critical duration/count=300초/7
+
+Receiver health
+  permanent/exhausted 즉시 degraded
+  stale in-flight=600초
+```
+
+Sender -> receiver retryable failure는 pending을 무기한 보존하면서 300초 상한 backoff로 재시도한다. Receiver -> Slack은 Queue `max_retries=10` 후 D1 `failed_exhausted`로 전환한다.
+
+### 선택 이유
+
+- 정상 5초 evaluator/processor cadence에 비해 60초는 scheduling jitter와 짧은 transient retry를 허용한다.
+- 300초는 현재 sender maximum backoff와 ALERT 운영 인지 한계를 일치시킨다.
+- Slack 비동기 retry에는 5분을 주되 그 이후 지연은 SLO miss로 관측한다.
+- Sender pending은 source event이므로 장기 receiver 장애에서도 자동 삭제하지 않는다.
+- Receiver는 sender가 이미 ACK한 event를 다루므로 유한 retry 후 final failure를 명시적으로 노출한다.
+
+### Ownership
+
+현재 pipeline, receiver, Slack credential, incident primary와 change approver는 `AeroTrace service operator` 역할이 맡는다. Secondary owner는 없으며 24x7 SLA를 주장하지 않는다. UptimeRobot Free가 `/health`를 5분 간격으로 확인하고 operator email을 fallback으로 사용한다.
+
+### Measurement gate
+
+Local-file runtime은 SLO 데이터가 아니다. Remote receiver, Slack synthetic, health monitor와 production Webhook activation timestamp가 준비된 뒤 계산을 시작한다. Eligible event가 없으면 compliance를 100%로 만들지 않고 `NO_DATA`로 기록한다.
+
+### 재검토 조건
+
+- 최초 7일 daily review와 30일 SLI review
+- Event volume 또는 operator response 요구 변경
+- Error budget 소진
+- Queue exhaustion/permanent failure
+- Count threshold false positive
+- 팀 on-call 도입

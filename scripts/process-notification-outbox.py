@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
+import hmac
 import json
 import math
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,6 +33,12 @@ VALID_STATUSES = {
     "CRITICAL",
     "UNKNOWN",
 }
+
+WEBHOOK_SIGNING_SECRET_ENV = (
+    "AEROTRACE_WEBHOOK_SIGNING_SECRET"
+)
+WEBHOOK_SIGNATURE_VERSION = "v1"
+WEBHOOK_SIGNING_SECRET_MIN_BYTES = 32
 
 
 class NoRedirectHandler(HTTPRedirectHandler):
@@ -1017,6 +1026,7 @@ def deliver_to_webhook(
     receipt_dir: Path,
     payload: dict[str, Any],
     webhook_url: str,
+    webhook_signing_secret: bytes,
     timeout_sec: float,
     failure_state_file: Path | None,
     retry_permanent_failure: bool,
@@ -1143,6 +1153,13 @@ def deliver_to_webhook(
         separators=(",", ":"),
     ).encode("utf-8")
 
+    signature_headers = (
+        build_webhook_signature_headers(
+            request_body=request_body,
+            signing_secret=webhook_signing_secret,
+        )
+    )
+
     request = Request(
         webhook_url,
         data=request_body,
@@ -1156,6 +1173,7 @@ def deliver_to_webhook(
             "X-AeroTrace-Event-Id": (
                 payload["event_id"]
             ),
+            **signature_headers,
         },
     )
 
@@ -1311,6 +1329,72 @@ def resolve_webhook_url(
     return value or None
 
 
+def resolve_webhook_signing_secret() -> bytes | None:
+    value = os.environ.get(
+        WEBHOOK_SIGNING_SECRET_ENV
+    )
+
+    if value is None:
+        return None
+
+    if not value or value != value.strip():
+        raise ValueError(
+            f"{WEBHOOK_SIGNING_SECRET_ENV} must not be empty "
+            "or contain surrounding whitespace"
+        )
+
+    encoded = value.encode("utf-8")
+
+    if len(encoded) < WEBHOOK_SIGNING_SECRET_MIN_BYTES:
+        raise ValueError(
+            f"{WEBHOOK_SIGNING_SECRET_ENV} must contain at "
+            f"least {WEBHOOK_SIGNING_SECRET_MIN_BYTES} UTF-8 bytes"
+        )
+
+    return encoded
+
+
+def build_webhook_signature_headers(
+    request_body: bytes,
+    signing_secret: bytes,
+    timestamp: int | None = None,
+) -> dict[str, str]:
+    if len(signing_secret) < WEBHOOK_SIGNING_SECRET_MIN_BYTES:
+        raise ValueError(
+            "webhook signing secret must contain at least "
+            f"{WEBHOOK_SIGNING_SECRET_MIN_BYTES} bytes"
+        )
+
+    if timestamp is None:
+        timestamp = int(time.time())
+
+    if timestamp < 0:
+        raise ValueError(
+            "webhook signature timestamp must be non-negative"
+        )
+
+    timestamp_text = str(timestamp)
+    signed_content = (
+        WEBHOOK_SIGNATURE_VERSION.encode("ascii")
+        + b"."
+        + timestamp_text.encode("ascii")
+        + b"."
+        + request_body
+    )
+    signature = hmac.new(
+        signing_secret,
+        signed_content,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return {
+        "X-AeroTrace-Timestamp": timestamp_text,
+        "X-AeroTrace-Signature": (
+            f"{WEBHOOK_SIGNATURE_VERSION}={signature}"
+        ),
+    }
+
+
 def validate_webhook_url(
     url: str,
 ) -> None:
@@ -1413,6 +1497,7 @@ def main() -> int:
         return 4
 
     webhook_url = None
+    webhook_signing_secret = None
 
     if args.transport == "local-file":
         if args.webhook_url is not None:
@@ -1463,6 +1548,26 @@ def main() -> int:
         except ValueError as exc:
             print(
                 f"adapter_error={exc}",
+                file=sys.stderr,
+            )
+            return 4
+
+        try:
+            webhook_signing_secret = (
+                resolve_webhook_signing_secret()
+            )
+        except ValueError as exc:
+            print(
+                f"adapter_error={exc}",
+                file=sys.stderr,
+            )
+            return 4
+
+        if webhook_signing_secret is None:
+            print(
+                "adapter_error="
+                f"{WEBHOOK_SIGNING_SECRET_ENV} is required "
+                "for --transport webhook",
                 file=sys.stderr,
             )
             return 4
@@ -1584,6 +1689,11 @@ def main() -> int:
                         "webhook URL was not resolved"
                     )
 
+                if webhook_signing_secret is None:
+                    raise ValueError(
+                        "webhook signing secret was not resolved"
+                    )
+
                 (
                     delivery_result,
                     failure_state_cleared,
@@ -1593,6 +1703,9 @@ def main() -> int:
                     receipt_dir=args.receipt_dir,
                     payload=payload,
                     webhook_url=webhook_url,
+                    webhook_signing_secret=(
+                        webhook_signing_secret
+                    ),
                     timeout_sec=(
                         args.webhook_timeout_sec
                     ),

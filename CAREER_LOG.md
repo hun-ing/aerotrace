@@ -5380,3 +5380,101 @@ TimescaleDB 컨테이너 재생성 전후 데이터:
 > 실제 telemetry 유실을 재현하고, 관측 지표의 의미를 재정의하고, benchmark 자체의 오류까지 수정한 뒤 PostgreSQL과 Collector 사이의 장애 연쇄를 반복 가능한 A/B 실험으로 해결했다.
 
 는 운영 경험이다.
+
+---
+
+## Portfolio Checkpoint — Durable Slack Notification Receiver
+
+### 직접 구현한 범위
+
+```text
+AeroTrace filesystem outbox
+-> HMAC-signed HTTPS
+-> Cloudflare Worker
+-> D1 durable event_id dedup
+-> Cloudflare Queue retry/DLQ
+-> Slack Incoming Webhook
+```
+
+Sender가 Slack을 직접 호출하게 만들지 않고 provider-neutral HTTP contract와 receiver-side state machine을 분리했다.
+
+핵심 구현:
+
+- Exact request body와 timestamp를 HMAC-SHA256으로 서명하고 ±300초 replay window에서 검증
+- D1 `event_id` primary key와 canonical payload hash로 new, duplicate, conflict를 원자적으로 구분
+- D1 insert와 Queue disk write가 완료된 뒤에만 HTTP 202 반환
+- Queue publish 실패 시 durable `accepted` row를 보존하고 sender retry로 복구
+- Slack 429 `Retry-After`, 408/5xx, network/timeout의 bounded retry와 DLQ exhaustion 상태 구현
+- Slack 성공 후 diagnostic payload redaction, hash와 delivery metadata 보존
+- Receiver 내부 Slack failure를 `/health` HTTP 503으로 노출해 UptimeRobot Free 5분 email fallback 연결점 제공
+- Sender와 receiver failure/retry budget을 분리한 초기 SLO와 runbook 작성
+
+### 검증 증거
+
+```text
+Python sender tests=10/10 PASS
+Node receiver tests=14/14 PASS
+Wrangler 4.125.0 bundle dry-run=PASS
+fresh local D1 migration=PASS
+npm audit vulnerabilities=0
+production runtime mutation=없음
+```
+
+### 장애 semantics에서 얻은 경험
+
+Receiver의 202는 Slack 표시 완료가 아니라 D1과 Queue의 durable acceptance다. 따라서 sender receipt와 Slack delivery timestamp를 같은 성공 시각으로 사용하지 않았다.
+
+다음 두 ambiguous window도 분리했다.
+
+```text
+Sender -> Worker timeout
+  D1 event_id duplicate로 side effect 재시작을 억제
+
+Worker -> Slack timeout 또는 success 후 D1 update 전 crash
+  Slack provider idempotency key가 없어 user-visible duplicate 가능
+```
+
+따라서 “exactly-once Slack notification”이라고 표현하지 않는다. 정확한 표현은 “durable receiver deduplication과 at-least-once Slack delivery”다.
+
+### 이력서 문장 초안
+
+> Filesystem Outbox 기반 운영 알림에 exact-body HMAC 인증과 Cloudflare Worker·D1·Queue receiver를 구현해, `event_id` 원자적 중복 방지와 payload conflict 탐지, Slack 429/5xx bounded retry·DLQ·reconciliation을 24개 sender/receiver 회귀 테스트와 D1 migration dry-run으로 검증
+
+짧은 버전:
+
+> HMAC Webhook과 Cloudflare D1/Queue 기반 Slack 알림 receiver를 설계해 durable acceptance, 중복 억제, retry/DLQ 및 비동기 delivery 관측 경계를 자동 테스트로 고정
+
+### 예상 면접 질문
+
+- Slack Webhook을 sender에서 직접 호출하지 않은 이유는 무엇인가?
+- 왜 Worker가 Slack 성공 전에 sender에 202를 반환해도 안전한가?
+- D1 insert와 Queue send 사이의 dual-write 실패는 어떻게 복구하는가?
+- Canonical payload hash가 필요한 이유는 무엇인가?
+- HTTP duplicate와 user-visible duplicate는 어떻게 다른가?
+- Slack 성공 후 D1 update 전에 Worker가 죽으면 어떤 일이 생기는가?
+- Sender retry는 무제한인데 receiver Queue retry는 유한한 이유는 무엇인가?
+- Notification pipeline 장애를 같은 Slack 경로로만 알리면 왜 위험한가?
+- 성공 payload를 redaction하면서 dedup을 어떻게 유지하는가?
+- HMAC secret rotation에서 timer를 중지하는 이유는 무엇인가?
+
+### 과장하지 않을 범위
+
+현재 repository 구현, local tests, Wrangler dry-run과 local D1 migration까지 완료했다. 다음 항목은 아직 완료됐다고 표현하지 않는다.
+
+```text
+Cloudflare remote production deploy
+Slack real channel acceptance
+UptimeRobot /health email monitor
+production sender Webhook activation
+real provider failure injection
+24x7 on-call operation
+```
+
+### 다음 검증
+
+- Remote Cloudflare D1/Queue와 Slack synthetic end-to-end
+- 같은 signed event의 duplicate Slack side effect 1회 확인
+- Controlled Slack credential failure와 D1 requeue
+- HMAC rotation rehearsal
+- Installed local-file rollback rehearsal
+- 첫 30일 SLI measurement와 threshold review
