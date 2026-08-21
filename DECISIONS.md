@@ -7972,7 +7972,7 @@ Workflow 권한은 `contents: read`만 허용하고 checkout credential은 유�
 
 ### 검증
 
-Draft PR #1의 최초 GitHub Actions run `32441836314`에서 `notification-outbox` job과 회귀 테스트 단계가 모두 성공했다.
+Draft PR #1의 최초 GitHub Actions run `32441836314`에서 `notification-outbox` job과 회귀 테스트 단계가 모두 성공했다. Pull request path filter를 제거한 최신 HEAD 검증 run `32442220666`도 성공했다.
 
 ### Trade-off
 

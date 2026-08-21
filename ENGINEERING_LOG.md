@@ -14834,6 +14834,8 @@ PR은 `main` 기준 충돌 없이 merge 가능한 상태로 확인했다.
 
 이후 문서-only 커밋을 push했을 때 기존 path filter 때문에 최신 HEAD에 run이 생성되지 않는 것을 확인했다. Pull request의 `paths` filter를 제거해 모든 synchronize 이벤트에서 suite를 실행하도록 수정했다. `main` push의 path filter는 유지했다.
 
+수정 커밋 `79dd9e9`의 GitHub Actions run `32442220666`에서 job과 모든 step이 다시 성공했다.
+
 ### Production 안전 상태
 
 이 단계는 repository workflow와 문서만 변경했다. `/etc/systemd/system`, `/etc/aerotrace`, production outbox·receipt·failure-state에는 쓰기를 수행하지 않았다. 실제 runtime은 계속 local-file 기준선이다.
