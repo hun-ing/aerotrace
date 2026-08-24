@@ -15411,3 +15411,61 @@ Frontend build, Python fake receiver와 local D1은 제한된 sandbox의 loopbac
 ### 안전 경계
 
 Production systemd, Cloudflare remote resource, D1 production data, Slack secret과 notification endpoint는 변경하지 않았다. D+4 review는 예정일인 2026-08-25 전에는 실행 또는 완료로 기록하지 않는다. 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않았다.
+
+---
+
+## V-7B-4-14 Frontend dependency audit 해소와 CI 추가
+
+### 발견
+
+Root README의 Frontend 검증 명령을 재현하기 위해 `npm ci`를 실행한 뒤 기존 lockfile에서 high severity vulnerable package 4개를 확인했다.
+
+```text
+next=16.2.12
+postcss=8.4.31
+sharp=0.34.5
+nanoid=3.3.16
+npm audit high=4
+```
+
+문서 변경과 dependency 변경을 한 commit에 섞지 않고 PR #2 merge 뒤 별도 branch에서 처리했다. GitHub reviewed advisory와 npm registry metadata를 확인하고, audit가 제안한 같은 major의 patched Next.js를 선택했다.
+
+### 변경
+
+```text
+next=16.3.2
+eslint-config-next=16.3.2
+next bundled postcss=8.5.23
+sharp=0.35.3
+nanoid=3.3.18
+```
+
+Next.js와 eslint config patch version을 함께 맞췄다. `nanoid`는 선언된 transitive range 안에서 patched version으로 갱신했다. `--force`나 semver-major update는 사용하지 않았다.
+
+Frontend change가 pull request와 관련 `main` push에서 자동 검증되도록 다음 workflow를 추가했다.
+
+```text
+.github/workflows/frontend-tests.yml
+Node.js=22
+npm ci
+npm audit --audit-level=high
+npm run lint
+npm run build
+permissions=contents:read
+```
+
+### Local 검증
+
+```text
+clean npm ci=PASS
+npm audit=0 vulnerabilities, PASS
+Frontend lint=PASS
+Frontend production build=PASS
+generated routes=/, /_not-found, /api/traces, /api/traces/[traceId]
+workflow YAML syntax parse=PASS
+git diff --check=PASS
+```
+
+### 안전 경계
+
+Dependency package와 tracked CI만 변경한다. Frontend container 재배포, public exposure, production systemd, Cloudflare resource와 notification runtime은 변경하지 않는다. D+4 운영 review도 이 dependency 작업과 분리한다.
