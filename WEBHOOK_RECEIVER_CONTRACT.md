@@ -1,6 +1,6 @@
 # AeroTrace Webhook Receiver Contract
 
-> 마지막 업데이트: 2026-08-21
+> 마지막 업데이트: 2026-08-24
 > Contract version: 2
 > 상태: Slack + Cloudflare Worker/D1/Queue production 활성
 
@@ -132,7 +132,9 @@ Receiver 검증 순서:
 3. HMAC constant-time 검증
 4. UTF-8/JSON parse
 5. payload schema 확인
-6. D1 durable acceptance
+6. D1 event ID claim
+7. Queue send와 queued mark
+8. HTTP response
 ```
 
 기본 replay window는 receiver 시각 기준 ±300초다. Sender host와 Cloudflare의 clock 차이가 이 범위를 넘으면 유효한 요청도 401로 거부된다.
@@ -211,6 +213,17 @@ D1 state=accepted insert
 ```
 
 Queue send가 실패하면 D1의 `accepted` row를 유지하고 HTTP 503을 반환한다. Sender retry 또는 5분 scheduled reconciliation이 같은 event를 Queue에 다시 넣는다.
+
+D1 timestamp 의미는 다음처럼 구분한다.
+
+```text
+accepted_at     최초 event ID를 D1에 claim한 시각, Queue write 전
+enqueued_at     Queue send 성공 후 mark가 남은 정상 경로의 시각
+last_attempt_at Queue consumer가 실제 message를 claim한 시각
+delivered_at    Slack 2xx 뒤 D1 finalization 시각
+```
+
+`accepted_at`만으로 HTTP 2xx 또는 D1+Queue durable acceptance 완료를 증명하지 않는다. Sender receipt는 2xx를 확인한 경계, `enqueued_at`은 receiver 내부 Queue-to-Slack SLI의 정상 시작 marker로 사용한다. Queue send 성공 뒤 `enqueued_at` update 전에 중단될 수 있으므로 consumer timestamp가 있는데 `enqueued_at`이 없는 row는 durable evidence는 있지만 Boundary B measurement gap으로 기록한다.
 
 ### Duplicate with same payload
 
@@ -315,6 +328,8 @@ Timeout 직후 sender pending, D1 row, Queue, failure state를 임의 삭제하�
 
 ## 11. Payload retention and privacy
 
+세부 기한과 purge 안전 조건은 [Notification Data Retention Policy](DATA_RETENTION_POLICY.md)를 따른다.
+
 - D1은 async Slack delivery에 필요한 payload 원문을 보존한다.
 - Slack delivery 성공 시 `payload_json='{}'`와 `payload_redacted_at`을 기록한다.
 - Dedup용 `payload_hash`, event type/status, evaluated/accepted/delivered timestamp는 유지한다.
@@ -367,8 +382,8 @@ Structured Worker log에는 event ID와 결과는 기록할 수 있지만 secret
 Repository에서 완료:
 
 ```text
-Python sender regression tests 10/10 PASS
-Node receiver tests 14/14 PASS
+Python sender/SLI regression tests 17/17 PASS
+Node receiver/SLI wrapper tests 17/17 PASS
 HMAC exact-body/tamper/stale validation PASS
 D1 duplicate/conflict state logic PASS
 Queue publication failure durable recovery PASS

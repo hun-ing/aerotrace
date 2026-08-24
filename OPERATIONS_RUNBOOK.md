@@ -1,6 +1,6 @@
 # AeroTrace Notification Operations Runbook
 
-> 마지막 업데이트: 2026-08-21
+> 마지막 업데이트: 2026-08-24
 > 범위: Collector queue alert outbox, HMAC Webhook, Cloudflare receiver, Slack delivery, retry와 rollback
 
 ---
@@ -9,6 +9,9 @@
 
 - [Webhook Receiver Contract](WEBHOOK_RECEIVER_CONTRACT.md)
 - [Notification SLO](NOTIFICATION_SLO.md)
+- [Notification Operations Review](NOTIFICATION_OPERATIONS_REVIEW.md)
+- [Notification Incident Template](NOTIFICATION_INCIDENT_TEMPLATE.md)
+- [Notification Data Retention Policy](DATA_RETENTION_POLICY.md)
 - [Cloudflare Slack Receiver](receiver/cloudflare-slack/README.md)
 
 ## 1. 현재 Production 기준선
@@ -233,6 +236,30 @@ journalctl -u aerotrace-notification-outbox.service -n 100 --no-pager
 Notification service는 timer가 반복 실행하는 oneshot이다. 성공 후 `inactive (dead)`로 보이는 것은 정상일 수 있으므로 최근 `Result`와 `ExecMainStatus`, timer 상태를 함께 본다.
 
 `--quiet-idle`이 설정된 repository Webhook service는 pending event가 없으면 journal output을 남기지 않는다.
+
+### Rolling SLI 읽기 전용 점검
+
+Sender Boundary A는 Webhook receipt와 아직 receipt가 없는 pending outbox를 함께 센다.
+
+```bash
+cd /home/huning/aerotrace
+python3 scripts/report-notification-sli.py \
+  --outbox-dir /var/lib/aerotrace-monitoring/notification-outbox \
+  --receipt-dir /var/lib/aerotrace-monitoring/notification-receipts \
+  --activation-at 2026-08-21T07:18:00Z \
+  --window-days 30 \
+  --acceptance-target-sec 60 \
+  --objective-percent 99
+```
+
+Receiver Boundary B는 tracked SELECT를 사용한다.
+
+```bash
+cd /home/huning/aerotrace/receiver/cloudflare-slack
+npm run sli:remote
+```
+
+정상 idle production에서는 두 결과 모두 `NO_DATA` 또는 count 0일 수 있다. 이를 100%나 PASS로 바꾸지 않는다. `missing_enqueued_at > 0`, clock anomaly, local/remote eligible count 불일치 또는 compliance 99% 미만은 exact event ID를 공개하지 않고 incident template로 조사한다. 실행 시각과 aggregate는 [operations review](NOTIFICATION_OPERATIONS_REVIEW.md)에 기록한다.
 
 ## 5. Processor 결과 해석
 
@@ -779,6 +806,8 @@ Slack Webhook URL rotation은 Cloudflare `SLACK_WEBHOOK_URL`을 먼저 바꾸고
 
 ## 14. Incident 종료 조건
 
+사고 기록은 [Notification Incident Template](NOTIFICATION_INCIDENT_TEMPLATE.md)을 private record로 복사해 사용한다.
+
 Notification incident는 다음을 모두 확인한 뒤 종료한다.
 
 ```text
@@ -824,7 +853,7 @@ Webhook ALERT가 있었다면 필요한 RECOVERY 전달 확인
 - Free Queue message retention은 24시간으로 고정된다. DLQ message 자체는 이후 사라질 수 있으므로 D1 `failed_exhausted` row가 장기 장애 증거다.
 - HMAC active secret 하나만 지원하며 dual-secret 무중단 rotation은 없다.
 - Slack 성공 후 D1 update 전 crash는 user-visible duplicate를 만들 수 있다.
-- Receiver 성공 row의 원문은 redaction하지만 D1 row 자동 retention/deletion은 없다.
+- Receiver 성공 row의 원문은 redaction하지만 D1 row 자동 retention/deletion은 없다. 목표 기한과 승인된 purge 조건은 [data retention policy](DATA_RETENTION_POLICY.md)를 따른다.
 - Tracked tests는 local fake와 state machine을 검증하지만 실제 Cloudflare/Slack acceptance를 대신하지 않는다.
 - Live activation은 exact duplicate replay, Slack 429/permanent/DLQ, receiver `/health` 503, HMAC rotation과 receiver requeue를 인위적으로 주입하지 않았다.
 - 단일 운영자 구조로 24x7 response와 secondary on-call을 보장하지 않는다.

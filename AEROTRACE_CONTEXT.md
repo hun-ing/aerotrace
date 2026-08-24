@@ -1,15 +1,15 @@
 # AeroTrace 프로젝트 컨텍스트
 
-> 마지막 업데이트: 2026-08-21
+> 마지막 업데이트: 2026-08-24
 > 현재 상태: Slack + Cloudflare Worker/D1/Queue notification production 활성, HMAC sender와 독립 email health fallback 운영
 > 현재 Phase: Phase 9 — notification production 활성화 완료 및 초기 운영 관찰
-> 다음 작업: 첫 7일 health/failure daily review와 첫 30일 SLI 관찰을 수행하고, 실제 incident 또는 승인된 maintenance window에서만 rotation/requeue 절차를 훈련한다.
+> 다음 작업: D+4~D+7 health/failure review와 첫 30일 weekly SLI·retention 관찰을 수행하고, 실제 incident 또는 승인된 maintenance window에서만 rotation/requeue 절차를 훈련한다.
 
 이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
 
 ---
 
-## 현재 작업 컨텍스트 — 2026-08-21
+## 현재 작업 컨텍스트 — 2026-08-24
 
 현재 feature branch 기준점:
 
@@ -31,6 +31,13 @@ OPERATIONS_RUNBOOK.md
 tests/test_notification_outbox.py
 receiver/cloudflare-slack/
 .github/workflows/notification-outbox-tests.yml
+NOTIFICATION_INCIDENT_TEMPLATE.md
+NOTIFICATION_OPERATIONS_REVIEW.md
+DATA_RETENTION_POLICY.md
+SECURITY.md
+scripts/report-notification-sli.py
+tests/test_notification_sli.py
+receiver/cloudflare-slack/queries/notification-sli.sql
 ```
 
 다음 untracked 파일은 별도 성능 분석 작업이므로 이번 변경에서 수정하거나 커밋하지 않는다.
@@ -109,7 +116,7 @@ tests/test_notification_outbox.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-이 suite는 backoff 계산과 configuration, local-file smoke, HMAC request contract, retryable defer/복구, `ACK_EXISTING` 우선순위, permanent latch와 explicit retry를 local fake HTTP receiver로 검증한다. 현재 10개가 통과한다.
+이 suite는 backoff 계산과 configuration, local-file smoke, HMAC request contract, retryable defer/복구, `ACK_EXISTING` 우선순위, permanent latch와 explicit retry, 그리고 rolling sender SLI 분모·제외·crash-window·clock anomaly·입력 경로 검증을 local fixture와 fake HTTP receiver로 확인한다. 현재 17개가 통과한다.
 
 Receiver suite:
 
@@ -121,7 +128,7 @@ npm run deploy:dry-run
 npm run db:migrate:local
 ```
 
-현재 Node test 14개, Wrangler 4.125.0 bundle dry-run과 fresh local D1 migration이 통과했다. GitHub Actions에는 Python 3.10 sender job과 Node.js 22 receiver job이 포함된다.
+현재 Node test 17개, Wrangler 4.125.0 bundle dry-run과 fresh local D1 migration이 통과했다. GitHub Actions에는 Python 3.10 sender job과 Node.js 22 receiver job이 포함된다.
 
 현재 서버에 설치된 production runtime은 Webhook 기준선이다.
 
@@ -139,6 +146,8 @@ fallback=UptimeRobot Free GET /health, 5분, operator email
 Repository Webhook unit과 permanent retry oneshot unit을 production에 설치했다. 기존 local-file unit은 `/etc/systemd/system/aerotrace-notification-outbox.service.local-file.bak`에 보존했고, local-file rollback과 Webhook 재설치 rehearsal을 완료했다.
 
 Activation acceptance에서는 isolated synthetic 한 건과 controlled production outbox smoke 한 건이 각각 Slack에 한 번 전달됐고, D1은 두 row 모두 `delivered`, 성공 payload 원문 보존 row는 0건이었다. Exact duplicate/conflict, Slack failure/DLQ, `/health` degraded는 tracked test로 검증했다. 실제 HMAC rotation, receiver final-failure requeue, ALERT→RECOVERY pair는 정상 production에 인위적 위험을 만들지 않기 위해 아직 live drill하지 않았다.
+
+2026-08-24 D+3 읽기 전용 review에서는 두 timer와 최근 sender service가 정상이고 pending/failure가 0이며 UptimeRobot monitor가 `Up`임을 확인했다. Activation 이후 eligible production notification이 없어 Boundary A와 B compliance는 `NO_DATA`다. Local receipt+pending reporter와 remote D1 SELECT를 tracked 도구로 추가했고, remote query가 row를 쓰지 않음을 Wrangler metadata로 확인했다. 실행하지 않은 D+1/D+2 snapshot은 사후 PASS로 기록하지 않는다.
 
 ---
 

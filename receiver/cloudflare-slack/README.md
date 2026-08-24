@@ -2,7 +2,7 @@
 
 이 Worker는 AeroTrace Webhook event를 HMAC으로 검증하고 D1에 원자적으로 저장한 뒤 Cloudflare Queue를 통해 Slack Incoming Webhook으로 전달한다.
 
-2026-08-21 현재 production sender가 이 receiver를 사용한다. Remote D1 migration, Queue/DLQ, private Slack Incoming Webhook, isolated synthetic, controlled production smoke, UptimeRobot health monitor와 sender rollback rehearsal을 완료했다.
+2026-08-24 현재 production sender가 이 receiver를 사용한다. Remote D1 migration, Queue/DLQ, private Slack Incoming Webhook, isolated synthetic, controlled production smoke, UptimeRobot health monitor와 sender rollback rehearsal을 완료했다.
 
 ## Architecture
 
@@ -157,6 +157,15 @@ npx wrangler d1 execute DB --remote --command \
 ```
 
 두 번째 명령의 event ID도 운영 metadata다. 공개 issue나 chat에 그대로 붙이지 않는다.
+
+Rolling 30-day aggregate SLI는 tracked query와 wrapper로 확인한다.
+
+```bash
+cd /home/huning/aerotrace/receiver/cloudflare-slack
+npm run sli:remote
+```
+
+Wrapper는 `queries/notification-sli.sql`에서 comment를 제거하고 read-only `WITH`/`SELECT`인지 확인한 뒤 Wrangler `--command --json`으로 실행한다. Wrangler의 `--file`은 migration/import 동작이므로 inspection query에 사용하지 않는다. 결과의 `missing_enqueued_at`은 Queue durable evidence가 없어졌다는 뜻이 아니라 Queue send 성공 후 D1 mark가 빠진 measurement gap일 수 있으며, 0이 아니면 runbook에 따라 조사한다.
 
 ## Retry and recovery
 

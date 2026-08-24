@@ -15270,15 +15270,90 @@ historical record versus current truth separation
 
 새 deployment/test 설명서는 runbook, receiver README와 tracked suite를 중복하므로 만들지 않는다. Production 활성 이후 우선순위가 높아진 추가 문서는 `NOTIFICATION_INCIDENT_TEMPLATE.md`이며 첫 실제 incident 전에 작성하는 것을 권장한다. `DATA_RETENTION_POLICY.md`는 D1 30일 volume 측정 뒤, `SECURITY.md`는 외부 contributor 또는 공개 vulnerability report 경로가 필요할 때 작성한다.
 
+---
+
+## V-7B-4-12 Notification SLI 측정 경계와 초기 운영 문서화
+
+### 목적
+
+Production 활성 뒤 첫 7일·30일 review를 재현 가능한 aggregate로 남기고, incident·security disclosure·payload retention 절차를 실제 운영 전에 준비한다. Production failure나 remote mutation을 주입하지 않고 local durable files와 D1을 읽기 전용으로 측정한다.
+
+### 측정 경계 검토
+
+초기 문서의 `event.evaluated_at -> receiver.accepted_at` 표현을 코드와 대조했다. Worker는 D1 insert 때 `accepted_at`을 기록한 뒤 Queue send를 수행하므로 이 값은 D1 claim 시각이지 D1+Queue 완료 시각이 아니다.
+
+다음 경계로 수정했다.
+
+```text
+Boundary A=event.evaluated_at -> sender receipt.delivered_at
+Boundary B=receiver.enqueued_at -> receiver.delivered_at
+```
+
+Local reporter는 receipt만 세지 않고 receipt 없는 pending outbox를 합쳐 receiver 도달 전 실패도 분모에 남긴다. `ACK_EXISTING` crash window의 동일 event는 합집합에서 한 번만 세고 payload가 다르면 `UNKNOWN`으로 중단한다. Local-file, activation 이전, `synthetic-`와 `smoke-` event는 제외한다.
+
+Remote D1 query는 `enqueued_at`을 Boundary B 시작 marker로 사용한다. `enqueued_at`이 없지만 `last_attempt_at`/`delivered_at`이 있으면 durable acceptance evidence는 인정하되 SLO good으로 세지 않고 `missing_enqueued_at`으로 노출한다.
+
+### 구현
+
+```text
+scripts/report-notification-sli.py
+tests/test_notification_sli.py
+receiver/cloudflare-slack/queries/notification-sli.sql
+receiver/cloudflare-slack/scripts/run-sli-query.mjs
+npm run sli:remote
+.github/workflows/notification-outbox-tests.yml path filter
+```
+
+Python suite에 `NO_DATA`, Webhook/local-file 분리, late+pending miss, activation/synthetic 제외, `ACK_EXISTING` 중복 억제, receipt filename 무결성, future timestamp clock anomaly와 missing input directory 거부를 추가했다. Remote wrapper는 tracked SQL comment를 제거한 뒤 read-only `WITH`/`SELECT`와 mutation keyword 부재를 확인하고 shell 없이 local Wrangler binary를 실행한다.
+
+처음에는 Wrangler `d1 execute --file`로 SELECT를 시도했다. 이 옵션은 import 경로를 사용해 query result 대신 import summary를 반환했고, 실제 notification row write는 0이었지만 metadata에 import transaction `changes=1`이 표시됐다. Inspection 경로를 `--command --json`으로 바꿔 최종 실행에서 `changes=0`, `changed_db=false`, `rows_written=0`을 확인했다.
+
+### 운영 문서
+
+다음을 추가했다.
+
+```text
+NOTIFICATION_OPERATIONS_REVIEW.md
+NOTIFICATION_INCIDENT_TEMPLATE.md
+DATA_RETENTION_POLICY.md
+SECURITY.md
+```
+
+Repository가 public임을 확인해 private vulnerability reporting을 우선하는 security policy를 채택했다. Incident template은 secret, endpoint, payload 원문과 exact event ID를 public repository에 남기지 않도록 설계했다. Retention은 automatic enforcement가 아닌 초기 target임을 명시하고, delivered payload 즉시 redaction, failed payload 최대 30일, receipt 원문 최대 30일·최소 metadata 90일과 승인 없는 purge 금지를 구분했다.
+
+### D+3 읽기 전용 결과
+
+```text
+collector alert timer=active
+notification timer=active
+latest sender service Result=success, ExecMainStatus=0
+installed Webhook unit matches repository=yes
+pending_events=0
+active_failure=false
+Boundary A eligible production events=0, status=NO_DATA
+Boundary B receiver production rows=0, compliance=N/A
+D1 delivered rows=2
+D1 unredacted delivered rows=0
+D1 database size=0.04 MB
+Cloudflare current deployment traffic=100%
+```
+
+Activation synthetic과 controlled smoke 두 row는 final activation boundary 이전이므로 production SLI에 포함되지 않는다. D+1과 D+2에 당일 snapshot을 만들지 않았으므로 사후 PASS로 기록하지 않았다. D+3 UptimeRobot current 상태는 운영자가 `Up`으로 확인했다. 같은 시점의 direct curl snapshot은 별도로 만들지 않았으며 endpoint를 문서나 shell history에서 꺼내지 않았다.
+
+### 안전 경계
+
+Remote deploy, D1 UPDATE/DELETE, Queue requeue, secret rotation, Slack failure injection과 sudo runtime 변경은 수행하지 않았다. 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않았다.
+
 ### 최종 repository 검증
 
 ```text
-Python sender regression=10/10 PASS
-Node receiver regression=14/14 PASS
+Python sender/SLI regression=17/17 PASS
+Node receiver/SLI wrapper regression=17/17 PASS
 Node syntax check=PASS
 Wrangler version=4.125.0
 Worker dry-run upload=28.76 KiB, gzip=7.26 KiB, PASS
-fresh local D1 migration=3 commands PASS
+local D1 migration=no pending migrations, PASS
+remote SLI SELECT=changes 0, rows_written 0, PASS
 repository AeroTrace systemd unit errors=0
 git diff --check=PASS
 Markdown code fences/local links=PASS

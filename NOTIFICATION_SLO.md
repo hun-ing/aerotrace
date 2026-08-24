@@ -1,6 +1,6 @@
 # AeroTrace Notification SLO
 
-> 마지막 업데이트: 2026-08-21
+> 마지막 업데이트: 2026-08-24
 > 상태: 2026-08-21 production 활성, 첫 30일 calibration 진행
 > 범위: notification event 생성부터 receiver durable acceptance와 Slack delivery까지
 
@@ -32,11 +32,13 @@ notification-required event 발생
 비동기 receiver이므로 성공을 두 경계로 나눈다.
 
 ```text
-Boundary A: event.evaluated_at -> receiver.accepted_at
-Boundary B: receiver.accepted_at -> receiver.delivered_at
+Boundary A: event.evaluated_at -> sender receipt.delivered_at
+Boundary B: receiver.enqueued_at -> receiver.delivered_at
 ```
 
-Sender receipt의 `delivered_at`은 receiver HTTP 2xx 확인 시각이다. Slack 표시 완료 시각이 아니므로 Boundary A의 proxy로만 사용한다.
+Sender receipt의 `delivered_at`은 receiver가 D1 claim과 Queue write를 끝낸 뒤 반환한 HTTP 2xx를 sender가 확인한 시각이다. 따라서 Boundary A의 보수적인 end-to-end proxy이며 Slack 표시 완료 시각은 아니다.
+
+D1 `accepted_at`은 최초 event ID claim 시각으로 Queue write보다 앞선다. 이 필드만으로 durable acceptance 완료를 주장하지 않는다. `enqueued_at` 필드의 존재는 Queue write가 성공한 뒤 D1 mark가 실행됐다는 정상 경로의 증거다. 이 mark가 빠진 crash window에서는 `last_attempt_at` 또는 `delivered_at`이 Queue consumer 관측의 fallback 증거지만 Boundary B 시작 시각으로 사용하지 않고 measurement gap으로 센다.
 
 ## 3. 초기 SLO
 
@@ -56,15 +58,15 @@ Slack provider가 `event_id` idempotency를 지원하지 않아 “duplicate Sla
 ### SLI-1 — Receiver durable acceptance latency
 
 ```text
-receiver.accepted_at - event.evaluated_at
+sender_receipt.delivered_at - event.evaluated_at
 ```
 
-분모는 `alert_required=true`로 outbox에 durable하게 생성된 unique `event_id`다.
+분모는 `alert_required=true`로 outbox에 durable하게 생성된 unique `event_id`다. Local reporter는 Webhook receipt와 아직 receipt가 없는 pending outbox의 합집합을 사용하므로 receiver D1에 도달하지 못한 event도 분모에서 빠지지 않는다.
 
 Good event:
 
 ```text
-60초 이내 receiver D1 insert와 Queue write 완료
+60초 이내 receiver D1 claim과 Queue write가 끝난 HTTP 2xx receipt 저장
 ```
 
 다음은 good으로 계산하지 않는다.
@@ -75,13 +77,26 @@ Good event:
 - D1 insert 전에 반환된 잘못된 2xx
 - 60초가 지난 뒤의 최종 성공
 
+Tracked reporter:
+
+```bash
+python3 scripts/report-notification-sli.py \
+  --outbox-dir /var/lib/aerotrace-monitoring/notification-outbox \
+  --receipt-dir /var/lib/aerotrace-monitoring/notification-receipts \
+  --activation-at 2026-08-21T07:18:00Z
+```
+
+`NO_DATA`는 eligible production event가 없다는 뜻이며 100% 또는 PASS가 아니다. `synthetic-`과 `smoke-` event ID는 분모에서 제외한다.
+
 ### SLI-2 — Slack delivery latency
 
 ```text
-receiver.delivered_at - receiver.accepted_at
+receiver.delivered_at - receiver.enqueued_at
 ```
 
 Good event는 300초 이내 Slack 2xx와 D1 `delivered` 갱신이 완료된 unique event다.
+
+`enqueued_at` timestamp 값은 request 처리 중 만든 시각이지만 해당 필드의 존재는 Queue send가 성공한 뒤 D1 update가 실행됐다는 증거다. `enqueued_at`이 없고 consumer 관측만 남은 event는 durable accepted 분모에는 포함하되 Boundary B good으로 계산하지 않는다. Remote report의 `missing_enqueued_at`을 measurement-quality incident로 조사한다.
 
 `failed_permanent`, `failed_exhausted`, 아직 queued/delivering인 event는 good이 아니다.
 
@@ -238,7 +253,7 @@ Rolling 30-day receiver objective:
 
 ```text
 eligible_events = 생성된 notification-required unique events
-good_events     = 60초 이내 durable accepted unique events
+good_events     = 60초 이내 Webhook receipt가 저장된 unique events
 compliance      = good_events / eligible_events
 target          = 99%
 ```
@@ -297,11 +312,19 @@ outbox/failure checker output
 Receiver sources:
 
 ```text
-D1 accepted_at, delivered_at, state, attempts
+D1 accepted_at, enqueued_at, last_attempt_at, delivered_at, state, attempts
 payload hash and event_id
 Worker structured logs
 /health aggregate
 Cloudflare Queue/DLQ metrics
+```
+
+`accepted_at`은 claim·dedup 조사에는 유효하지만 SLI 경계 완료 시각으로 단독 사용하지 않는다. 정기 측정 도구는 다음과 같다.
+
+```text
+Boundary A: scripts/report-notification-sli.py
+Boundary B: receiver/cloudflare-slack/queries/notification-sli.sql
+remote wrapper: receiver/cloudflare-slack/scripts/run-sli-query.mjs
 ```
 
 보고서 규칙:
@@ -322,6 +345,8 @@ Production activation 후:
 30일 후 objective/threshold 정식 review
 이후 monthly SLO review
 ```
+
+실행 날짜와 결과는 [Notification Operations Review](NOTIFICATION_OPERATIONS_REVIEW.md)에 누적한다. 실행하지 않은 checkpoint를 사후 추정으로 PASS 처리하지 않는다.
 
 다음 조건에서는 즉시 재검토한다.
 

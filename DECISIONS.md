@@ -8106,7 +8106,7 @@ production filesystem/systemd mutation=없음
 
 ### 상태
 
-채택 — production activation 전 provisional
+채택 — 2026-08-21 production 활성, 첫 30일 calibration
 
 ### 결정
 
@@ -8235,3 +8235,65 @@ UptimeRobot DOWN/UP 경로는 최초 monitor URL에서 `/health`를 누락해 ro
 - Secret rotation 사고
 - Secondary on-call 도입
 - D1 retention job 도입
+
+---
+
+## ADR — Notification SLI 경계는 sender receipt와 Queue marker로 분리 측정한다
+
+### 상태
+
+채택 — 2026-08-24, production calibration
+
+### 배경
+
+D1 `accepted_at`은 최초 event ID claim 때 기록되고 Queue send보다 앞선다. 따라서 이 값만 사용하면 receiver가 D1과 Queue를 모두 완료한 시각처럼 보이는 측정 오류가 생긴다. 반대로 receiver D1만 조회하면 receiver에 도달하지 못하고 sender outbox에 남은 event가 분모에서 사라진다.
+
+### 결정
+
+```text
+Boundary A
+  event.evaluated_at -> sender Webhook receipt.delivered_at
+  denominator=Webhook receipt와 receipt 없는 pending outbox의 unique event 합집합
+
+Boundary B
+  receiver.enqueued_at -> receiver.delivered_at
+  denominator=Queue durable evidence가 있는 receiver event
+```
+
+Boundary A의 receipt timestamp는 D1 claim과 Queue send 완료 뒤 반환된 HTTP 2xx를 sender가 확인한 보수적 end-to-end proxy다. Boundary B의 `enqueued_at` 필드 존재는 Queue send 성공 후 mark가 실행된 정상 경로를 뜻한다.
+
+Queue send 성공 뒤 `enqueued_at` update 전에 중단될 수 있다. 이때 `last_attempt_at`이나 `delivered_at`은 consumer가 message를 관측했다는 durable evidence지만 정확한 Boundary B 시작 timestamp가 아니다. 해당 row는 durable accepted 분모에는 포함하되 good으로 세지 않고 `missing_enqueued_at` measurement gap으로 보고한다.
+
+Tracked 측정 도구:
+
+```text
+scripts/report-notification-sli.py
+receiver/cloudflare-slack/queries/notification-sli.sql
+receiver/cloudflare-slack/scripts/run-sli-query.mjs
+```
+
+Activation 전 event와 `synthetic-`·`smoke-` prefix는 production SLI에서 제외한다. Eligible event가 0이면 compliance는 `NO_DATA`이며 100%로 표현하지 않는다. Remote wrapper는 read-only `WITH`/`SELECT`를 검사하고 Wrangler `--command`를 사용한다. `--file`은 inspection이 아니라 import/migration 경로이므로 사용하지 않는다.
+
+### 보존과 운영 기록
+
+Sender receipt와 receiver delivery metadata는 rolling 30-day 분모를 재현할 수 있도록 보존한다. Full checker output은 SLI에 필요하지 않으므로 receipt 원문은 최대 30일, 최소 metadata는 90일을 초기 목표로 둔다. 자동 purge는 아직 없으며 대상 count, hold와 승인 없이 production data를 삭제하지 않는다.
+
+Public repository의 vulnerability disclosure 경로가 필요해 `SECURITY.md`를 채택하고, 실제 incident 전에 private record용 template을 준비한다. 첫 7일·30일 checkpoint는 `NOTIFICATION_OPERATIONS_REVIEW.md`에 실행한 사실만 기록하며 누락한 날짜를 사후 PASS 처리하지 않는다.
+
+### 검증과 현재 결과
+
+```text
+2026-08-24 D+3 host pending=0, active failure=false
+Boundary A eligible production events=0, status=NO_DATA
+Boundary B durable production events=0, compliance=N/A
+D1 aggregate delivered rows=2, unredacted delivered rows=0
+remote SLI query rows_written=0
+```
+
+### 재검토 조건
+
+- `missing_enqueued_at > 0` 또는 sender/receiver count gap
+- 첫 eligible production ALERT/RECOVERY
+- 첫 30일 SLO와 retention review
+- Receipt metadata-only redaction/purge 구현
+- Multi-channel 또는 team on-call 도입

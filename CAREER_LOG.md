@@ -5547,3 +5547,33 @@ Exact duplicate/conflict, retryable/permanent response, Queue exhaustion과 `/he
 - 첫 eligible production notification의 두 delivery boundary 기록
 - 첫 30일 SLI sample size와 Free tier 사용량 review
 - 승인된 maintenance window의 HMAC rotation 또는 첫 실제 incident의 receiver requeue 기록
+
+---
+
+## Portfolio Checkpoint — Notification SLI와 운영 거버넌스
+
+### 실제로 완료한 것
+
+```text
+sender receipt+pending 기반 rolling Boundary A reporter
+Cloudflare D1 read-only Boundary B aggregate query
+activation/synthetic/smoke 분모 제외와 NO_DATA 처리
+incident template, security disclosure, retention target
+D+3 production read-only health/SLI snapshot
+```
+
+D1 `accepted_at`이 Queue write 전 claim timestamp라는 구현 사실을 찾아, durable acceptance 완료 시각으로 잘못 해석하던 문서를 수정했다. Sender에 남은 pending이 receiver D1 분모에서 빠지는 문제는 local receipt와 pending의 unique 합집합으로 해결했고, Queue send 후 D1 mark가 누락되는 crash window는 `missing_enqueued_at` measurement-quality signal로 분리했다.
+
+### 이력서 성과 문장 초안
+
+> Production Slack 알림의 sender receipt·pending과 Cloudflare D1 delivery state를 결합한 rolling SLI를 구현하고, `NO_DATA`·synthetic 제외·dual-write crash window를 명시적으로 처리해 운영 지표의 분모 누락과 과대 보고를 방지
+
+### 과장하지 않을 범위
+
+```text
+eligible production notification은 아직 0건
+30-day SLO compliance는 아직 NO_DATA
+receipt/D1 metadata purge는 policy target이며 자동화 전
+D+1/D+2 daily snapshot은 기록하지 않음
+live /health 503, requeue, HMAC rotation drill은 수행하지 않음
+```

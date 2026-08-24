@@ -9,7 +9,9 @@ on:
       - ".github/workflows/notification-outbox-tests.yml"
       - "receiver/cloudflare-slack/**"
       - "scripts/process-notification-outbox.py"
+      - "scripts/report-notification-sli.py"
       - "tests/test_notification_outbox.py"
+      - "tests/test_notification_sli.py"
   workflow_dispatch:
 
 permissions:
