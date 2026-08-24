@@ -15516,3 +15516,31 @@ permissions=contents:read
 첫 Backend CI 실행에서는 71개 test 중 DB context를 사용하는 10개가 `localhost:5432` connection failure로 실패했다. 새 Gradle task compile은 통과했지만 test step 실패로 task help 단계는 실행되지 않았다. 기존 Backend suite가 TimescaleDB를 전제로 하므로 workflow에 repository와 같은 `timescale/timescaledb:2.28.3-pg15` ephemeral service, health check와 CI 전용 DB credential을 추가했다. 이 credential은 해당 Actions service container에만 사용하는 비운영 값이다.
 
 수정된 PR HEAD의 Backend Tests run #2에서 TimescaleDB service 초기화, Java 21 setup, 전체 Backend test와 `provisionProjectApiKey` task help가 모두 성공했다. 같은 HEAD의 Notification Pipeline Tests run #13도 sender와 receiver job 모두 성공했다.
+
+---
+
+## V-7B-4-16 Project API Key ephemeral provisioning acceptance
+
+### 목적
+
+Gradle task help는 task registration만 확인하며 실제 Spring context, Flyway, tenant/project insert와 Key issue 경로를 실행하지 않는다. Local/production DB를 변경하지 않고 CI의 일회성 TimescaleDB에서 발급 성공과 활성 Key 중복 거부까지 검증한다.
+
+### 구현
+
+Backend workflow의 task-help step을 다음 acceptance로 교체했다.
+
+```text
+CI 전용 tenant/project/key metadata 설정
+-> provisionProjectApiKey 실행
+-> stdout을 mode 0600 임시 파일에만 저장
+-> tenant/project/key UUID와 atr_<16>.<43> 출력 형식 확인
+-> 같은 이름으로 두 번째 실행
+-> active API Key duplicate 거부 확인
+-> trap으로 stdout/stderr 임시 파일 삭제
+```
+
+원문 Key가 포함된 파일을 Actions log나 artifact로 출력·업로드하지 않는다. 발급 DB와 credential은 job 종료 시 제거되는 service container 전용이며 production runtime과 연결되지 않는다.
+
+### 안전 경계
+
+이 검증은 GitHub-hosted ephemeral TimescaleDB만 변경한다. Local/production tenant, project, API Key, secret file, container와 systemd는 변경하지 않는다. 현재 host에는 Java가 없으므로 실제 acceptance 결과는 PR CI에서 확인한다.
