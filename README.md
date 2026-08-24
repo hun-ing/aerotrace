@@ -94,9 +94,39 @@ frontend.env
   Next.js BFF가 사용할 같은 Project API Key
 ```
 
-Collector와 Frontend에는 DB에 등록된 동일 Project API Key를 넣어야 한다. 원문 Key는 발급 시 한 번만 표시되고 DB에는 hash만 저장된다. `ProjectApiKeyProvisioner` Java main을 사용할 수 있지만 Compose 최초 bootstrap은 아직 자동화하지 않았으므로 placeholder로 end-to-end 성공을 기대하면 안 된다. Secret 파일과 발급 결과는 Git, issue, terminal command argument에 남기지 않는다.
+Collector와 Frontend에는 DB에 등록된 동일 Project API Key를 넣어야 한다. 원문 Key는 발급 시 한 번만 표시되고 DB에는 hash만 저장된다. Secret 파일과 발급 결과는 Git, issue, terminal command argument에 남기지 않는다.
 
-### 2. 구성 검사와 시작
+### 2. 최초 Project API Key 발급
+
+이 단계는 새 DB에 tenant/project/key가 아직 없을 때 한 번 수행한다. 먼저 TimescaleDB만 시작한다.
+
+```bash
+docker compose -f docker-compose.yaml up -d timescaledb
+```
+
+Java 21이 설치된 host에서 `.env`와 같은 DB 이름·사용자를 입력하고, DB password는 화면에 표시되지 않는 prompt로 받는다. 아래 tenant/project 값은 local 예시이며 slug는 소문자 영문·숫자·하이픈만 사용할 수 있다.
+
+```bash
+(
+  cd backend
+  export AEROTRACE_DB_URL='jdbc:postgresql://localhost:5432/aerotrace?reWriteBatchedInserts=true'
+  export AEROTRACE_DB_USERNAME='postgres'
+  read -rsp 'AeroTrace DB password: ' AEROTRACE_DB_PASSWORD
+  echo
+  export AEROTRACE_DB_PASSWORD
+  export AEROTRACE_PROVISION_TENANT_NAME='AeroTrace Local'
+  export AEROTRACE_PROVISION_TENANT_SLUG='aerotrace-local'
+  export AEROTRACE_PROVISION_PROJECT_NAME='AeroTrace Local'
+  export AEROTRACE_PROVISION_PROJECT_SLUG='aerotrace-local'
+  export AEROTRACE_PROVISION_API_KEY_NAME='local-runtime'
+  export AEROTRACE_PROVISION_API_KEY_EXPIRATION_DAYS='365'
+  bash ./gradlew provisionProjectApiKey
+)
+```
+
+출력의 `AEROTRACE_PROVISIONED_API_KEY` 원문을 즉시 `otel-collector.env`와 `frontend.env`의 `AEROTRACE_API_KEY`에 각각 저장한다. 다른 출력 ID는 진단용 metadata이며 Key 원문을 별도 문서나 shell history에 복사하지 않는다. 같은 tenant/project slug는 같은 이름일 때 재사용하지만, 같은 이름의 활성 API Key가 있으면 중복 발급하지 않고 실패한다.
+
+### 3. 구성 검사와 시작
 
 ```bash
 docker compose \
@@ -118,7 +148,7 @@ Windows PowerShell에서는 다음 helper를 사용할 수 있다.
 .\scripts\runtime\aerotrace.ps1 Up
 ```
 
-### 3. 확인
+### 4. 확인
 
 | 대상 | 주소 |
 |---|---|
@@ -142,7 +172,7 @@ docker compose \
 
 `aerotrace-otel-storage-init`이 `Exited (0)`인 것은 persistent queue 디렉터리 권한 설정을 마친 정상 상태다.
 
-### 4. 종료
+### 5. 종료
 
 ```bash
 docker compose \
