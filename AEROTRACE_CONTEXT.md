@@ -11,15 +11,17 @@
 
 ## 현재 작업 컨텍스트 — 2026-08-24
 
-현재 feature branch 기준점:
+Notification repository 통합 상태:
 
 ```text
-branch=feature/notification-contract-slo-tests
 upstream HEAD before Slack receiver work=a9187fe
 Slack receiver implementation commit=063b7b2
 Slack verification/docs commit=0e80ace
-draft PR=#1
-GitHub Actions run 32445952757=sender/receiver jobs PASS
+final feature head=b37dff5
+PR #1=merged on 2026-08-24
+main merge commit=1684cf8
+PR Actions run #8=sender/receiver jobs PASS
+main push Actions run #9=sender/receiver jobs PASS
 ```
 
 Slack receiver와 후속 문서·자동 검증 범위:
@@ -38,6 +40,8 @@ SECURITY.md
 scripts/report-notification-sli.py
 tests/test_notification_sli.py
 receiver/cloudflare-slack/queries/notification-sli.sql
+README.md
+frontend/README.md
 ```
 
 다음 untracked 파일은 별도 성능 분석 작업이므로 이번 변경에서 수정하거나 커밋하지 않는다.
@@ -108,6 +112,7 @@ Tracked 회귀 테스트:
 
 ```text
 tests/test_notification_outbox.py
+tests/test_notification_sli.py
 ```
 
 표준 실행:
