@@ -1,6 +1,6 @@
 # AeroTrace Engineering Log
 
-> 마지막 업데이트: 2026-08-24
+> 마지막 업데이트: 2026-08-25
 > 현재 Phase: Phase 9 — notification production 활성화 및 초기 운영 관찰
 > 기록 원칙: 사용자가 직접 적용하고 실행한 결과만 완료로 기록하며, 원본 출력이 없는 수치는 추측하지 않는다.
 
@@ -15589,3 +15589,73 @@ diff credential pattern scan=PASS
 ### 안전 경계
 
 문서만 변경한다. Production systemd, Cloudflare resource, D1 data, Slack secret, Project API Key와 local runtime은 변경하지 않는다. 2026-08-24의 read-only snapshot은 D+4 PASS로 승격하지 않으며 D+4 review는 예정일인 2026-08-25에 별도로 수행한다. 기존 untracked PostgreSQL 분석 script 세 개는 수정하거나 stage하지 않는다.
+
+---
+
+## V-7B-4-18 Notification D+4 운영 점검
+
+### 범위와 시각
+
+2026-08-25 08:46 KST부터 production notification의 host, sender Boundary A, receiver Boundary B, D1 data hygiene, direct health와 UptimeRobot fallback을 읽기 전용으로 확인했다. Secret, Worker endpoint, account ID, exact event ID와 payload는 출력하거나 문서에 기록하지 않았다.
+
+### Host와 Sender Boundary A
+
+```text
+collector alert timer=active
+notification timer=active
+latest service Result=success
+latest service ExecMainCode=0
+latest service ExecMainStatus=0
+installed Webhook unit matches repository=yes
+pending_events=0
+active_failure=false
+sender SLI status=NO_DATA
+eligible_events=0
+accepted_events=0
+pending_with_receipt=0
+clock_anomaly_events=0
+```
+
+`NO_DATA`는 eligible production event가 없다는 뜻이며 PASS 또는 100% compliance로 바꾸지 않는다.
+
+### Receiver Boundary B와 D1
+
+Tracked `npm run sli:remote` wrapper가 다음 aggregate를 반환했다.
+
+```text
+receiver_claim_rows=0
+durably_accepted_events=0
+missing_queue_durable_evidence=0
+missing_enqueued_at=0
+delivered_events=0
+failed_permanent_events=0
+failed_exhausted_events=0
+clock_anomaly_events=0
+slack_delivery_compliance_percent=N/A
+changed_db=false
+rows_written=0
+```
+
+전체 data hygiene aggregate는 activation row 2개가 모두 `delivered`이고 permanent/exhausted failure와 unredacted delivered payload가 각각 0임을 확인했다. Database size는 36,864 bytes였고 aggregate query도 `rows_written=0`이었다.
+
+첫 remote SLI call은 Cloudflare API code `7403`으로 SQL 실행 전에 거부됐다. 같은 OAuth session의 account login과 D1 permission, D1 list 접근이 정상임을 읽기 전용으로 확인한 뒤 동일 wrapper를 한 번 재시도해 성공했다. Endpoint, credential, config와 remote resource는 변경하지 않았다. 지속 failure가 아니며 `/health`와 D1 state도 정상이므로 transient CLI/API authorization response로 기록한다.
+
+### Health와 판정
+
+```text
+direct /health HTTP=200
+receiver status=ok
+failed_permanent=0
+failed_exhausted=0
+stale_in_flight=0
+UptimeRobot current Up=operator confirmed
+UptimeRobot /health suffix=operator confirmed
+host pipeline=OK
+receiver durable state=OK
+production SLI=NO_DATA
+D+4 review=COMPLETE
+```
+
+### 안전 경계
+
+Systemd start/stop, sudo, remote deploy, D1 mutation, Queue action, secret 변경과 synthetic notification을 수행하지 않았다. 문서 외 production 상태는 변경하지 않았고 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않는다.

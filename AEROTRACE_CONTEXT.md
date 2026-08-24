@@ -1,15 +1,15 @@
 # AeroTrace 프로젝트 컨텍스트
 
-> 마지막 업데이트: 2026-08-24
+> 마지막 업데이트: 2026-08-25
 > 현재 상태: Slack + Cloudflare Worker/D1/Queue notification production 활성, HMAC sender와 독립 email health fallback 운영
 > 현재 Phase: Phase 9 — notification production 활성화 완료 및 초기 운영 관찰
-> 다음 작업: D+4~D+7 health/failure review와 첫 30일 weekly SLI·retention 관찰을 수행하고, 실제 incident 또는 승인된 maintenance window에서만 rotation/requeue 절차를 훈련한다.
+> 다음 작업: D+5~D+7 health/failure review와 첫 30일 weekly SLI·retention 관찰을 수행하고, 실제 incident 또는 승인된 maintenance window에서만 rotation/requeue 절차를 훈련한다.
 
 이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
 
 ---
 
-## 현재 작업 컨텍스트 — 2026-08-24
+## 현재 작업 컨텍스트 — 2026-08-25
 
 Repository 통합 상태:
 
@@ -172,6 +172,8 @@ Repository Webhook unit과 permanent retry oneshot unit을 production에 설치�
 Activation acceptance에서는 isolated synthetic 한 건과 controlled production outbox smoke 한 건이 각각 Slack에 한 번 전달됐고, D1은 두 row 모두 `delivered`, 성공 payload 원문 보존 row는 0건이었다. Exact duplicate/conflict, Slack failure/DLQ, `/health` degraded는 tracked test로 검증했다. 실제 HMAC rotation, receiver final-failure requeue, ALERT→RECOVERY pair는 정상 production에 인위적 위험을 만들지 않기 위해 아직 live drill하지 않았다.
 
 2026-08-24 D+3 읽기 전용 review에서는 두 timer와 최근 sender service가 정상이고 pending/failure가 0이며 UptimeRobot monitor가 `Up`임을 확인했다. Activation 이후 eligible production notification이 없어 Boundary A와 B compliance는 `NO_DATA`다. Local receipt+pending reporter와 remote D1 SELECT를 tracked 도구로 추가했고, remote query가 row를 쓰지 않음을 Wrangler metadata로 확인했다. 실행하지 않은 D+1/D+2 snapshot은 사후 PASS로 기록하지 않는다.
+
+2026-08-25 D+4 review에서도 두 timer와 최근 sender service가 정상이고 pending/failure가 0이었다. Direct Worker `/health`는 HTTP 200과 zero failure aggregate를 반환했고 운영자가 UptimeRobot의 현재 `Up` 및 `/health` URL suffix를 확인했다. Production SLI 대상 event는 여전히 0이므로 Boundary A와 B는 `NO_DATA`다. 전체 D1은 activation row 2개가 모두 `delivered`, permanent/exhausted failure와 unredacted delivered payload는 0이며 두 aggregate SELECT 모두 row를 쓰지 않았다. 첫 remote SLI query의 transient API `7403`은 동일 session 재시도에서 성공했고 receiver 장애로 분류하지 않았다.
 
 ---
 
