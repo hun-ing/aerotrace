@@ -11,17 +11,21 @@
 
 ## 현재 작업 컨텍스트 — 2026-08-24
 
-Notification repository 통합 상태:
+Repository 통합 상태:
 
 ```text
 upstream HEAD before Slack receiver work=a9187fe
 Slack receiver implementation commit=063b7b2
 Slack verification/docs commit=0e80ace
 final feature head=b37dff5
-PR #1=merged on 2026-08-24
-main merge commit=1684cf8
-PR Actions run #8=sender/receiver jobs PASS
-main push Actions run #9=sender/receiver jobs PASS
+PR #1 Slack receiver=merged, 1684cf8
+PR #2 repository entry docs=merged, 1e837e8
+PR #3 Frontend dependency/CI=merged, 6882fb0
+PR #4 Project API Key task/Backend CI=merged, f737d3a
+PR #5 Project API Key provisioning E2E=merged, 6bf376f
+post-provisioning integration baseline=6bf376f
+Backend main push run #7=PASS
+Project API Key main job log raw credential matches=0
 ```
 
 Slack receiver와 후속 문서·자동 검증 범위:
@@ -134,6 +138,21 @@ npm run db:migrate:local
 ```
 
 현재 Node test 17개, Wrangler 4.125.0 bundle dry-run과 fresh local D1 migration이 통과했다. GitHub Actions에는 Python 3.10 sender job과 Node.js 22 receiver job이 포함된다.
+
+Repository CI는 notification sender/receiver, Frontend와 Backend를 각각 독립 workflow로 검증한다. Frontend workflow는 Node.js 22에서 clean install, high severity dependency audit, lint와 production build를 수행한다. Backend workflow는 Java 21과 ephemeral TimescaleDB에서 전체 test와 Project API Key provisioning acceptance를 수행한다.
+
+최초 Project API Key bootstrap은 자동 startup이나 Compose hook이 아니라 운영자가 명시적으로 실행하는 Gradle task다.
+
+```text
+working directory=backend
+command=bash ./gradlew provisionProjectApiKey
+raw key format=atr_<16>.<43>
+raw key storage=DB 저장 안 함, 발급 시 한 번만 출력
+duplicate policy=같은 이름의 active key 재발급 거부
+CI acceptance=ephemeral TimescaleDB 첫 발급 + duplicate 거부 PASS
+```
+
+실행 순서는 root `README.md`에 있으며 원문 Key는 Collector와 Frontend의 local secret file에만 저장한다. Production tenant/project/key는 이번 CI 검증에서 생성하거나 변경하지 않았다.
 
 현재 서버에 설치된 production runtime은 Webhook 기준선이다.
 

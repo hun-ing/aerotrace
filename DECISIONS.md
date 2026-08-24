@@ -1,6 +1,6 @@
 # AeroTrace 설계 결정 기록
 
-> 마지막 업데이트: 2026-08-21
+> 마지막 업데이트: 2026-08-24
 > 상태: 채택 / 보류 / 재검토 필요
 
 이 문서는 AeroTrace의 주요 설계 결정, 검토한 대안, 선택 이유, 위험, 재검토 조건을 시간순으로 기록한다. 과거 결정의 상태 문장은 당시 근거이며, 같은 주제의 최신 ADR이 현재 기준선이다.
@@ -8297,3 +8297,52 @@ remote SLI query rows_written=0
 - 첫 30일 SLO와 retention review
 - Receipt metadata-only redaction/purge 구현
 - Multi-channel 또는 team on-call 도입
+
+---
+
+## ADR — Project API Key 최초 발급은 명시적 operator task로 수행한다
+
+### 상태
+
+채택 — 2026-08-24
+
+### 배경
+
+Backend의 `ProjectApiKeyProvisioner`는 tenant/project 생성, slug·name 충돌 검증, 원문 Key 일회성 생성, hash 저장과 active Key 중복 거부를 구현한다. 그러나 실행 가능한 repository entry point가 없으면 새 DB의 Collector와 Frontend가 요구하는 Key를 문서만으로 재현할 수 없다. 반대로 애플리케이션 또는 Compose 시작 시 자동 발급하면 재시작이 credential 생성과 결합되고 원문 Key의 전달·보존 경계도 불명확해진다.
+
+### 결정
+
+최초 bootstrap과 후속 수동 발급은 `backend`의 `provisionProjectApiKey` Gradle `JavaExec` task로만 명시적으로 수행한다.
+
+```text
+TimescaleDB 시작
+-> 운영자가 DB password와 tenant/project/key metadata를 환경변수로 제공
+-> bash ./gradlew provisionProjectApiKey
+-> 한 번만 출력된 atr_ 원문 Key를 승인된 secret file에 저장
+-> Collector와 Frontend 시작
+```
+
+애플리케이션 startup, Flyway migration과 Docker Compose에는 자동 Key 발급 hook을 넣지 않는다. 같은 이름의 active Key가 있으면 기존 Key를 출력하거나 새 Key를 만들지 않고 실패한다. DB에는 원문 대신 hash만 저장한다.
+
+CI는 production과 분리된 ephemeral TimescaleDB에서 첫 발급, `atr_<16>.<43>` 출력 형식과 같은 이름의 active Key 중복 거부를 검증한다. 원문 출력은 mode 0600 임시 파일에서만 검사하고 log나 artifact에 내보내지 않는다.
+
+### 선택 이유
+
+- 서비스 재시작과 credential lifecycle을 분리한다.
+- 원문 Key가 표시되는 시점과 이를 취급하는 운영자를 명확히 한다.
+- 기존 domain validation과 hash-only 저장 구현을 별도 script에 복제하지 않는다.
+- Local bootstrap은 재현 가능하게 만들면서 production credential을 자동 생성하지 않는다.
+
+### 단점과 위험
+
+- 현재는 수동 복사 단계가 있어 잘못된 secret file에 저장하거나 원문을 분실할 수 있다.
+- Self-service onboarding, key 목록·폐기·rotation UI가 없다.
+- 명령 stdout은 민감 정보이므로 terminal recording, CI log와 issue에 남기면 안 된다.
+- 같은 이름의 active Key가 있으면 원문을 복구할 수 없으므로 폐기·재발급 절차가 별도로 필요하다.
+
+### 재검토 조건
+
+- 사용자 onboarding 또는 multi-tenant 관리 UI 도입
+- Managed secret store와 자동 배포 연동
+- 무중단 Key rotation이나 복수 active Key 정책 변경
+- 운영자가 여러 명이 되어 발급 승인·감사 기록이 필요할 때
