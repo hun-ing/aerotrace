@@ -25,6 +25,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    services:
+      timescaledb:
+        image: timescale/timescaledb:2.28.3-pg15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: aerotrace-ci-only
+          POSTGRES_DB: aerotrace
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d aerotrace"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      AEROTRACE_DB_URL: >-
+        jdbc:postgresql://localhost:5432/aerotrace?reWriteBatchedInserts=true
+      AEROTRACE_DB_USERNAME: postgres
+      AEROTRACE_DB_PASSWORD: aerotrace-ci-only
+
     defaults:
       run:
         working-directory: backend

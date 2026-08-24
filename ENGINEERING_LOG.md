@@ -15512,3 +15512,5 @@ permissions=contents:read
 ### 안전 경계
 
 현재 host에는 Java runtime이 없어 Backend suite와 Gradle task를 local에서 실행하지 않는다. GitHub-hosted Java 21 CI에서 task registration과 기존 Backend tests를 검증한다. 실제 provisioner, tenant/project/API Key DB write, production container 재배포, systemd와 Cloudflare 변경은 수행하지 않는다.
+
+첫 Backend CI 실행에서는 71개 test 중 DB context를 사용하는 10개가 `localhost:5432` connection failure로 실패했다. 새 Gradle task compile은 통과했지만 test step 실패로 task help 단계는 실행되지 않았다. 기존 Backend suite가 TimescaleDB를 전제로 하므로 workflow에 repository와 같은 `timescale/timescaledb:2.28.3-pg15` ephemeral service, health check와 CI 전용 DB credential을 추가했다. 이 credential은 해당 Actions service container에만 사용하는 비운영 값이다.
