@@ -15544,3 +15544,5 @@ CI 전용 tenant/project/key metadata 설정
 ### 안전 경계
 
 이 검증은 GitHub-hosted ephemeral TimescaleDB만 변경한다. Local/production tenant, project, API Key, secret file, container와 systemd는 변경하지 않는다. 현재 host에는 Java가 없으므로 실제 acceptance 결과는 PR CI에서 확인한다.
+
+PR Backend Tests run #5에서 기존 Backend tests와 Project API Key 첫 발급·출력 형식·활성 Key duplicate 거부 acceptance가 모두 성공했다. Job log 49,161 bytes를 실제 credential 형식으로 검사해 raw API Key, provisioned tenant ID와 Key ID 값 노출이 각각 0건임을 확인했다. 같은 HEAD의 Notification Pipeline Tests run #15도 성공했다.
