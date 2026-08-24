@@ -38,3 +38,10 @@ dependencies {
 tasks.named('test') {
     useJUnitPlatform()
 }
+
+tasks.register('provisionProjectApiKey', JavaExec) {
+    group = 'application'
+    description = 'Provision a tenant, project, and Project API Key from environment variables.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.huning.aerotrace.auth.infrastructure.ProjectApiKeyProvisioner'
+}

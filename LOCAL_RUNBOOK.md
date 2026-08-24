@@ -95,7 +95,7 @@ frontend.env
 
 `otel-collector.env`와 `frontend.env`에는 DB에 등록된 같은 `atr_` 형식 Project API Key를 사용한다. Placeholder 값으로는 ingest와 trace query가 성공하지 않는다.
 
-Project API Key는 원문을 DB에 저장하지 않고 발급 시 한 번만 표시한다. 최초 tenant/project/key bootstrap은 현재 Compose가 자동화하지 않으며 `ProjectApiKeyProvisioner` Java main을 승인된 local 환경에서 실행해야 한다. 발급 결과를 Git, issue, screenshot이나 shell history에 복사하지 않는다.
+Project API Key는 원문을 DB에 저장하지 않고 발급 시 한 번만 표시한다. 최초 tenant/project/key bootstrap은 Compose가 자동 실행하지 않으며 Java 21 host에서 `bash ./gradlew provisionProjectApiKey` Gradle task를 명시적으로 실행한다. TimescaleDB 시작, 필수 환경변수와 password prompt를 포함한 전체 절차는 [root README의 최초 Project API Key 발급](README.md#2-최초-project-api-key-발급)을 따른다. 발급 결과를 Git, issue, screenshot이나 shell history에 복사하지 않는다.
 
 ## 3. 통합 실행 명령
 

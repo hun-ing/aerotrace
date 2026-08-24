@@ -15469,3 +15469,50 @@ git diff --check=PASS
 ### 안전 경계
 
 Dependency package와 tracked CI만 변경한다. Frontend container 재배포, public exposure, production systemd, Cloudflare resource와 notification runtime은 변경하지 않는다. D+4 운영 review도 이 dependency 작업과 분리한다.
+
+---
+
+## V-7B-4-15 Project API Key 명시적 발급 경로와 Backend CI
+
+### 문제
+
+`ProjectApiKeyProvisioner` main class는 tenant/project 생성, slug/name 충돌 방지, 활성 Key 중복 거부와 만료 기간 검증을 구현했지만 이를 호출하는 tracked Gradle task가 없었다. Root README가 실제 Key를 요구하면서도 재현 가능한 실행 명령을 제공하지 않아 새 DB의 local Compose bootstrap이 문서만으로 완결되지 않았다.
+
+### 구현
+
+`backend/build.gradle`에 기존 provisioner를 그대로 호출하는 `provisionProjectApiKey` JavaExec task를 추가했다. 새 발급 로직이나 자동 startup hook은 만들지 않았으므로 Key 발급은 계속 operator가 명시적으로 실행할 때만 발생한다.
+
+Root README에는 다음 순서를 추가했다.
+
+```text
+TimescaleDB만 시작
+-> DB password를 non-echo prompt로 입력
+-> tenant/project/key metadata를 환경변수로 전달
+-> bash ./gradlew provisionProjectApiKey
+-> 한 번만 출력된 원문 Key를 Collector와 Frontend secret file에 저장
+-> 전체 Compose 시작
+```
+
+같은 이름의 활성 Key가 있으면 기존 provisioner가 중복 발급을 거부한다. DB password와 발급 Key는 command argument로 전달하거나 파일에 자동 기록하지 않는다.
+
+Backend 변경을 pull request와 관련 `main` push에서 자동 검증하도록 `.github/workflows/backend-tests.yml`을 추가했다.
+
+```text
+Java=21 Temurin
+Gradle cache=enabled
+bash ./gradlew test --no-daemon
+bash ./gradlew help --task provisionProjectApiKey --no-daemon
+permissions=contents:read
+```
+
+### D+4 전 읽기 전용 기준선
+
+2026-08-24 14:19 KST에 두 notification timer가 active이고 pending event 0, active failure false, installed Webhook unit과 repository unit이 동일함을 확인했다. 예정일 전 snapshot이므로 D+4 결과나 daily PASS로 기록하지 않는다.
+
+### 안전 경계
+
+현재 host에는 Java runtime이 없어 Backend suite와 Gradle task를 local에서 실행하지 않는다. GitHub-hosted Java 21 CI에서 task registration과 기존 Backend tests를 검증한다. 실제 provisioner, tenant/project/API Key DB write, production container 재배포, systemd와 Cloudflare 변경은 수행하지 않는다.
+
+첫 Backend CI 실행에서는 71개 test 중 DB context를 사용하는 10개가 `localhost:5432` connection failure로 실패했다. 새 Gradle task compile은 통과했지만 test step 실패로 task help 단계는 실행되지 않았다. 기존 Backend suite가 TimescaleDB를 전제로 하므로 workflow에 repository와 같은 `timescale/timescaledb:2.28.3-pg15` ephemeral service, health check와 CI 전용 DB credential을 추가했다. 이 credential은 해당 Actions service container에만 사용하는 비운영 값이다.
+
+수정된 PR HEAD의 Backend Tests run #2에서 TimescaleDB service 초기화, Java 21 setup, 전체 Backend test와 `provisionProjectApiKey` task help가 모두 성공했다. 같은 HEAD의 Notification Pipeline Tests run #13도 sender와 receiver job 모두 성공했다.
