@@ -1,0 +1,4 @@
+# Copy this file to .dev.vars and replace both values.
+# Never commit .dev.vars or paste its contents into logs or issues.
+AEROTRACE_SIGNING_SECRET="replace-with-at-least-32-random-bytes"
+SLACK_WEBHOOK_URL="https://hooks.slack.com/services/replace/me"

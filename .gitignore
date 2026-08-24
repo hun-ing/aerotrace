@@ -24,6 +24,12 @@
 /frontend/build/
 /frontend/.env*.local
 
+# Cloudflare Slack receiver
+/receiver/cloudflare-slack/node_modules/
+/receiver/cloudflare-slack/.wrangler/
+/receiver/cloudflare-slack/.dev.vars
+/receiver/cloudflare-slack/.env
+
 http-client.private.env.json
 
 # Local runtime secrets
