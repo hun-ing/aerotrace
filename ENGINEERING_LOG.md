@@ -1,6 +1,6 @@
 # AeroTrace Engineering Log
 
-> 마지막 업데이트: 2026-08-21
+> 마지막 업데이트: 2026-08-24
 > 현재 Phase: Phase 9 — notification production 활성화 및 초기 운영 관찰
 > 기록 원칙: 사용자가 직접 적용하고 실행한 결과만 완료로 기록하며, 원본 출력이 없는 수치는 추측하지 않는다.
 
@@ -15361,3 +15361,53 @@ diff credential scan=PASS
 ```
 
 Local fake HTTP server와 Miniflare local D1은 loopback socket이 필요하므로 제한된 sandbox 밖에서 동일 test command를 다시 실행해 최종 PASS를 확인했다. Remote deploy나 production D1 mutation은 이 최종 repository 검증에서 수행하지 않았다.
+
+---
+
+## V-7B-4-13 Repository 진입 문서와 병합 후 상태 정리
+
+### 목적
+
+Slack notification 작업이 `main`에 통합된 뒤 새 사용자가 실제 구현 범위, 실행 전제와 운영 문서 경계를 한 곳에서 파악할 수 있도록 repository 진입 문서를 정리한다. 과거 feature branch 상태를 current truth에서 제거하되, 아직 관찰하지 않은 날짜의 운영 결과를 미리 기록하지 않는다.
+
+### 확인 결과
+
+Repository root에는 README가 없었고 `frontend/README.md`는 create-next-app 기본 문서였다. Compose 파일, Backend controller와 API Key provisioner, Frontend BFF route, notification sender/receiver 설정을 대조해 architecture, port, runtime version과 검증 명령을 확인했다.
+
+최초 tenant/project/API Key bootstrap은 Compose가 자동화하지 않으며 전용 실행 script도 없다. 따라서 quick start는 실제로 발급되어 DB에 등록된 같은 Project API Key가 Collector와 Frontend에 필요하다는 전제를 명시한다. Placeholder만 복사한 상태를 end-to-end ready로 설명하지 않는다.
+
+### 문서 변경
+
+```text
+README.md
+frontend/README.md
+LOCAL_RUNBOOK.md
+AEROTRACE_CONTEXT.md
+NOTIFICATION_OPERATIONS_REVIEW.md
+ENGINEERING_LOG.md
+```
+
+Root README에 구현 범위, architecture, 기술 stack, repository layout, Compose 실행, 검증 명령, 운영 문서 index와 현재 제한을 추가했다. Frontend README는 server-only BFF, 환경변수, route, timeout과 공개 배포 전 인증 한계 중심으로 교체했다. Context와 operations review에는 PR #1 merge commit과 main push CI 성공을 current integration evidence로 반영했다.
+
+### 검증
+
+```text
+Compose merged config=PASS
+Frontend npm ci=PASS
+Frontend lint=PASS
+Frontend production build=PASS
+Python notification regression=17/17 PASS
+Node receiver regression=17/17 PASS
+Node syntax check=PASS
+Worker deploy dry-run=PASS
+local D1 migration=no pending migrations, PASS
+Backend test=NOT_RUN, host Java runtime absent
+```
+
+Backend wrapper는 executable bit가 없는 tracked file이므로 문서 명령을 `bash ./gradlew test`로 수정했다. 현재 host에는 Java runtime이 없어 Backend suite 결과를 새로 주장하지 않는다. Frontend `npm ci` 뒤 audit에서 기존 dependency tree의 high severity 항목 4개가 확인됐으며, 문서 변경과 섞어 강제 update하지 않고 별도 dependency update로 검증한다.
+
+Frontend build, Python fake receiver와 local D1은 제한된 sandbox의 loopback socket 금지로 처음 실패했다. 동일 명령을 허용된 local 환경에서 다시 실행해 위 PASS를 확인했다.
+
+### 안전 경계
+
+Production systemd, Cloudflare remote resource, D1 production data, Slack secret과 notification endpoint는 변경하지 않았다. D+4 review는 예정일인 2026-08-25 전에는 실행 또는 완료로 기록하지 않는다. 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않았다.

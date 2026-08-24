@@ -1,36 +1,69 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AeroTrace Frontend
 
-## Getting Started
+Next.js 기반 trace explorer다. Browser가 Spring Boot에 Project API Key를 직접 보내지 않도록 server-only BFF route가 Backend trace API를 호출한다.
 
-First, run the development server:
+## 기능
+
+- UTC 시간 범위 기반 trace 조회
+- Service name exact match, error-only와 최소 span duration filter
+- Cursor pagination과 추가 결과 로드
+- Trace별 span 수, service 수와 최대 duration 요약
+- 선택한 trace의 span timeline과 status/detail 표시
+- Backend 오류·timeout·잘못된 JSON의 안전한 BFF 응답 변환
+
+## 요구 사항
+
+- Node.js 22 이상
+- 실행 중인 AeroTrace Backend
+- DB에 등록된 `atr_` 형식 Project API Key
+
+## 환경 설정
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cd frontend
+cp .env.example .env.local
+chmod 600 .env.local
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+```text
+AEROTRACE_BACKEND_BASE_URL=http://localhost:8080
+AEROTRACE_API_KEY=<provisioned-project-api-key>
+```
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+두 값은 server-only 환경변수다. `NEXT_PUBLIC_` 이름으로 바꾸거나 Browser bundle, Git, issue와 screenshot에 원문 API Key를 노출하지 않는다.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Docker 통합 runtime은 repository root의 `frontend.env`에서 Key를 읽고 Backend URL을 Compose service name으로 덮어쓴다.
 
-## Learn More
+## 실행
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+npm ci
+npm run dev
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+<http://localhost:3000>에서 확인한다.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## 검증
 
-## Deploy on Vercel
+```bash
+npm run lint
+npm run build
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## BFF route
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```text
+GET /api/traces
+  -> GET <backend>/api/v1/traces
+
+GET /api/traces/{traceId}
+  -> GET <backend>/api/v1/traces/{traceId}
+```
+
+BFF는 허용된 query parameter만 전달하고 Backend 요청에 `Authorization: Bearer <Project API Key>`를 추가한다. Response는 `no-store`이며 Backend 요청 timeout은 5초다.
+
+## 현재 보안 경계
+
+현재 Frontend에는 사용자 로그인과 session이 없다. 서버당 하나의 Project API Key를 사용하므로 local 개발, private deployment 또는 접근이 제한된 PoC에만 적합하다. 공개 SaaS 인증·tenant 선택 구조로 사용하지 않는다.
+
+전체 runtime과 운영 문서는 [repository root README](../README.md)를 따른다.

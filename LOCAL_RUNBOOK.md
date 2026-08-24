@@ -1,5 +1,8 @@
 # AeroTrace Local Runtime Runbook
 
+> 마지막 업데이트: 2026-08-24
+> 이 문서의 helper 예시는 Windows PowerShell 기준이다. Linux/macOS Compose quick start와 전체 문서 색인은 [root README](README.md)를 따른다.
+
 ## 1. 실행 모드
 
 AeroTrace는 개발 모드와 Docker 통합 모드를 지원한다.
@@ -76,6 +79,23 @@ frontend.env
 otel-collector.env.example
 frontend.env.example
 ```
+
+환경 파일 역할:
+
+```text
+.env
+  TimescaleDB database name, username and password
+
+otel-collector.env
+  Backend endpoint and Project API Key
+
+frontend.env
+  Next.js BFF용 Project API Key
+```
+
+`otel-collector.env`와 `frontend.env`에는 DB에 등록된 같은 `atr_` 형식 Project API Key를 사용한다. Placeholder 값으로는 ingest와 trace query가 성공하지 않는다.
+
+Project API Key는 원문을 DB에 저장하지 않고 발급 시 한 번만 표시한다. 최초 tenant/project/key bootstrap은 현재 Compose가 자동화하지 않으며 `ProjectApiKeyProvisioner` Java main을 승인된 local 환경에서 실행해야 한다. 발급 결과를 Git, issue, screenshot이나 shell history에 복사하지 않는다.
 
 ## 3. 통합 실행 명령
 
