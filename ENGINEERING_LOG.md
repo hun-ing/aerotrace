@@ -15546,3 +15546,46 @@ CI 전용 tenant/project/key metadata 설정
 이 검증은 GitHub-hosted ephemeral TimescaleDB만 변경한다. Local/production tenant, project, API Key, secret file, container와 systemd는 변경하지 않는다. 현재 host에는 Java가 없으므로 실제 acceptance 결과는 PR CI에서 확인한다.
 
 PR Backend Tests run #5에서 기존 Backend tests와 Project API Key 첫 발급·출력 형식·활성 Key duplicate 거부 acceptance가 모두 성공했다. Job log 49,161 bytes를 실제 credential 형식으로 검사해 raw API Key, provisioned tenant ID와 Key ID 값 노출이 각각 0건임을 확인했다. 같은 HEAD의 Notification Pipeline Tests run #15도 성공했다.
+
+---
+
+## V-7B-4-17 Post-activation 문서 전면 일관성 검토
+
+### 범위
+
+Tracked Markdown 목록, current-state marker, 날짜, local-file/Webhook 표현, D+4 일정, Project API Key bootstrap, 문서 index와 운영 계약을 실제 repository main 상태와 대조했다. 과거 engineering/decision evidence의 당시 상태는 소급 수정하지 않고 각 문서 최상단과 최신 ADR만 current truth로 유지한다.
+
+### 발견과 수정
+
+```text
+AEROTRACE_CONTEXT.md current integration status=PR #1까지만 기록
+DECISIONS.md header date=최신 2026-08-24 ADR보다 오래된 2026-08-21
+explicit Project API Key provisioning policy=Engineering Log에만 있고 ADR 없음
+```
+
+Context에 PR #2~#5, current main, Frontend/Backend CI와 Project API Key provisioning acceptance를 추가했다. Decisions의 갱신일을 실제 최신 결정일로 맞추고, startup·Compose 자동 발급을 금지하며 명시적 Gradle task와 hash-only 저장 경계를 채택한 ADR을 추가했다.
+
+Root README가 이미 current architecture, 실행 순서, 개발 검증과 12개 상세 문서의 index를 제공한다. Receiver contract, SLO, operations runbook, review log, incident template, retention과 security policy도 책임이 분리되어 있어 별도 documentation index나 중복 runbook은 추가하지 않는다.
+
+### Main CI evidence 재확인
+
+PR #5 merge commit `6bf376f`의 Backend main push run #7이 TimescaleDB 초기화, Java 21 setup, 전체 Backend test, provisioning E2E와 cleanup까지 성공했다. Job `97344237728`의 48,744-byte log를 실제 credential 정규식으로 다시 검사한 결과는 다음과 같다.
+
+```text
+raw API Key matches=0
+provisioned tenant ID value matches=0
+provisioned key ID value matches=0
+```
+
+### 문서 검증
+
+```text
+tracked Markdown local links=PASS
+Markdown fenced code balance=PASS
+git diff --check=PASS
+diff credential pattern scan=PASS
+```
+
+### 안전 경계
+
+문서만 변경한다. Production systemd, Cloudflare resource, D1 data, Slack secret, Project API Key와 local runtime은 변경하지 않는다. 2026-08-24의 read-only snapshot은 D+4 PASS로 승격하지 않으며 D+4 review는 예정일인 2026-08-25에 별도로 수행한다. 기존 untracked PostgreSQL 분석 script 세 개는 수정하거나 stage하지 않는다.
