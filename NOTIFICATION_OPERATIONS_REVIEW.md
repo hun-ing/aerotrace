@@ -1,6 +1,6 @@
 # AeroTrace Notification Operations Review
 
-> 마지막 업데이트: 2026-08-24
+> 마지막 업데이트: 2026-08-25
 > Activation: 2026-08-21 16:18 KST
 > 범위: 첫 7일 daily health review와 첫 30일 SLI/Free tier calibration
 
@@ -14,7 +14,7 @@
 | D+1 | 2026-08-22 | 당시 별도 snapshot 없음 |
 | D+2 | 2026-08-23 | 당시 별도 snapshot 없음 |
 | D+3 | 2026-08-24 | 완료 — host/D1/SLI와 UptimeRobot Up 확인 |
-| D+4 | 2026-08-25 | 예정 |
+| D+4 | 2026-08-25 | 완료 — host/D1/SLI, direct health와 UptimeRobot Up 확인 |
 | D+5 | 2026-08-26 | 예정 |
 | D+6 | 2026-08-27 | 예정 |
 | D+7 / weekly review 1 | 2026-08-28 | 예정 |
@@ -188,7 +188,99 @@ UptimeRobot current Up UI snapshot=confirmed by operator
 direct /health HTTP snapshot=not separately captured
 ```
 
-## 6. Weekly and 30-day review fields
+## 6. D+4 — 2026-08-25
+
+검증 시각: 2026-08-25 08:46 KST부터 시작한 동일 점검 session
+
+Host와 sender:
+
+```text
+collector alert timer=active
+notification timer=active
+latest notification service Result=success
+latest notification service ExecMainCode=0
+latest notification service ExecMainStatus=0
+installed Webhook unit matches repository=yes
+pending_events=0
+pending_bytes=0
+active_failure=false
+failure_count=0
+```
+
+Sender Boundary A:
+
+```text
+status=NO_DATA
+window_start=2026-08-21T07:18:00Z
+window_end=2026-08-24T23:47:09.777357Z
+eligible_events=0
+accepted_events=0
+pending_events=0
+pending_with_receipt=0
+good_acceptance_events=0
+acceptance_miss_events=0
+clock_anomaly_events=0
+acceptance_compliance_percent=N/A
+```
+
+Receiver Boundary B:
+
+```text
+receiver_claim_rows=0
+durably_accepted_events=0
+missing_queue_durable_evidence=0
+missing_enqueued_at=0
+receiver_acceptance_crosscheck_good_events=0
+delivered_events=0
+slack_boundary_good_events=0
+failed_permanent_events=0
+failed_exhausted_events=0
+clock_anomaly_events=0
+slack_delivery_compliance_percent=N/A
+query changes=0
+query changed_db=false
+query rows_written=0
+```
+
+전체 D1 data hygiene:
+
+```text
+total_rows=2
+delivered_rows=2
+failed_permanent_rows=0
+failed_exhausted_rows=0
+unredacted_delivered_rows=0
+database_size_bytes=36864
+aggregate query rows_written=0
+```
+
+Public health와 fallback:
+
+```text
+direct /health HTTP status=200
+receiver status=ok
+failed_permanent=0
+failed_exhausted=0
+stale_in_flight=0
+UptimeRobot current status=Up, confirmed by operator
+UptimeRobot URL suffix=/health, confirmed by operator
+```
+
+첫 remote SLI query는 Cloudflare API code `7403`으로 SQL 실행 전에 거부됐다. 동일 session에서 endpoint나 credential을 바꾸지 않고 Wrangler `whoami`의 OAuth login·D1 permission과 D1 목록 접근을 확인한 뒤 같은 tracked read-only wrapper를 한 번 재시도해 성공했다. 성공 query는 `changed_db=false`, `rows_written=0`이었다. 따라서 이를 receiver health failure나 D1 data failure로 분류하지 않고 transient CLI/API authorization response로 기록한다.
+
+판정:
+
+```text
+host pipeline=OK
+receiver durable state=OK
+production SLI=NO_DATA
+direct receiver health=OK
+independent fallback monitor=OK
+observed incident indicators=none
+D+4 review=COMPLETE
+```
+
+## 7. Weekly and 30-day review fields
 
 각 checkpoint에 다음을 기록한다.
 
