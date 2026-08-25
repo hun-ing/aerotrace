@@ -1,0 +1,42 @@
+name: Database Backup Restore Tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/database-backup-restore-tests.yml"
+      - "backend/src/main/resources/db/migration/**"
+      - "scripts/database/**"
+      - "tests/fixtures/database-backup-restore-fixture.sql"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/database-backup-restore-tests.yml"
+      - "backend/src/main/resources/db/migration/**"
+      - "scripts/database/**"
+      - "tests/fixtures/database-backup-restore-fixture.sql"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: database-backup-restore-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backup-restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate shell syntax
+        run: bash -n scripts/database/*.sh
+
+      - name: Run isolated TimescaleDB backup and restore acceptance
+        run: bash scripts/database/test-backup-restore.sh

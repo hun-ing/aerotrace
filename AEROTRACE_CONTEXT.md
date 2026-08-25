@@ -3,7 +3,7 @@
 > 마지막 업데이트: 2026-08-25
 > 현재 상태: Slack + Cloudflare Worker/D1/Queue notification production 활성, HMAC sender와 독립 email health fallback 운영
 > 현재 Phase: Phase 9 — notification production 활성화 완료 및 초기 운영 관찰
-> 다음 작업: D+5~D+7 health/failure review와 첫 30일 weekly SLI·retention 관찰을 수행하고, 실제 incident 또는 승인된 maintenance window에서만 rotation/requeue 절차를 훈련한다.
+> 다음 작업: D+5~D+7 notification review를 병행하면서 production-sized backup 시간·용량과 off-host 보관 위치를 확정하고, 이후 Project API Key lifecycle을 구현한다.
 
 이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
 
@@ -174,6 +174,8 @@ Activation acceptance에서는 isolated synthetic 한 건과 controlled producti
 2026-08-24 D+3 읽기 전용 review에서는 두 timer와 최근 sender service가 정상이고 pending/failure가 0이며 UptimeRobot monitor가 `Up`임을 확인했다. Activation 이후 eligible production notification이 없어 Boundary A와 B compliance는 `NO_DATA`다. Local receipt+pending reporter와 remote D1 SELECT를 tracked 도구로 추가했고, remote query가 row를 쓰지 않음을 Wrangler metadata로 확인했다. 실행하지 않은 D+1/D+2 snapshot은 사후 PASS로 기록하지 않는다.
 
 2026-08-25 D+4 review에서도 두 timer와 최근 sender service가 정상이고 pending/failure가 0이었다. Direct Worker `/health`는 HTTP 200과 zero failure aggregate를 반환했고 운영자가 UptimeRobot의 현재 `Up` 및 `/health` URL suffix를 확인했다. Production SLI 대상 event는 여전히 0이므로 Boundary A와 B는 `NO_DATA`다. 전체 D1은 activation row 2개가 모두 `delivered`, permanent/exhausted failure와 unredacted delivered payload는 0이며 두 aggregate SELECT 모두 row를 쓰지 않았다. 첫 remote SLI query의 transient API `7403`은 동일 session 재시도에서 성공했고 receiver 장애로 분류하지 않았다.
+
+TimescaleDB logical backup/restore 도구는 production과 분리된 `2.28.3-pg15` tmpfs container 두 개에서 검증했다. Full migration과 fixture를 custom-format archive로 만들고 새 빈 DB에 TimescaleDB 공식 pre/post restore 순서로 복원한 뒤 hypertable, columnstore, 두 policy, row count와 application data fingerprint가 일치했다. Existing target overwrite, corrupted archive와 version mismatch는 target DB 생성 전에 거부한다. Production DB backup, production-sized restore와 off-host copy는 아직 실행하지 않았으므로 재해복구 완료로 표현하지 않는다.
 
 ---
 

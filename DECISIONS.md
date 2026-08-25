@@ -1,6 +1,6 @@
 # AeroTrace 설계 결정 기록
 
-> 마지막 업데이트: 2026-08-24
+> 마지막 업데이트: 2026-08-25
 > 상태: 채택 / 보류 / 재검토 필요
 
 이 문서는 AeroTrace의 주요 설계 결정, 검토한 대안, 선택 이유, 위험, 재검토 조건을 시간순으로 기록한다. 과거 결정의 상태 문장은 당시 근거이며, 같은 주제의 최신 ADR이 현재 기준선이다.
@@ -8346,3 +8346,70 @@ CI는 production과 분리된 ephemeral TimescaleDB에서 첫 발급, `atr_<16>.
 - Managed secret store와 자동 배포 연동
 - 무중단 Key rotation이나 복수 active Key 정책 변경
 - 운영자가 여러 명이 되어 발급 승인·감사 기록이 필요할 때
+
+---
+
+## ADR — TimescaleDB backup은 version-pinned full logical archive를 빈 target에 복원 검증한다
+
+### 상태
+
+채택 — 2026-08-25, ephemeral acceptance 완료
+
+### 배경
+
+Docker Named Volume은 container 재생성 후 data 보존을 확인했지만 host disk 손상, volume 삭제, 잘못된 SQL·migration과 새 서버 이전에는 사용할 수 없다. Backup 파일을 생성하는 것만으로는 TimescaleDB hypertable, internal catalog, columnstore와 background policy가 실제로 복원되는지 알 수 없다.
+
+### 결정
+
+현재 소규모 AeroTrace database는 PostgreSQL custom-format full logical dump를 사용한다.
+
+```text
+pg_dump --format=custom --no-owner --no-privileges
+-> SHA-256 + source version metadata
+-> empty template0 database
+-> CREATE EXTENSION timescaledb
+-> timescaledb_pre_restore()
+-> single-process pg_restore --exit-on-error
+-> timescaledb_post_restore()
+-> ANALYZE
+-> schema/policy/count/fingerprint verification
+```
+
+PostgreSQL major와 TimescaleDB version은 metadata와 exact match해야 한다. TimescaleDB 공식 제한에 따라 parallel `pg_restore -j`를 사용하지 않는다. 기존 database는 drop, clean 또는 overwrite하지 않고 새 빈 target에서 검증한 후 connection cutover를 별도 승인한다.
+
+한 backup set은 mode 0600 custom archive, metadata와 checksum 세 파일이다. Metadata는 credential과 row payload를 포함하지 않지만 archive 자체에는 trace payload와 API Key hash가 있으므로 민감 자료로 취급한다. Backup directory는 symlink와 group/other permission을 거부한다.
+
+### 검증
+
+Production container, network와 volume을 공유하지 않는 source/target tmpfs TimescaleDB `2.28.3-pg15`에서 migration V1~V8과 fixture를 사용했다.
+
+```text
+full custom archive create=PASS
+archive TOC/checksum=PASS
+pre_restore -> pg_restore -> post_restore -> ANALYZE=PASS
+source/target application data fingerprint match=PASS
+hypertable/columnstore/scheduled policies=PASS
+existing target overwrite refused=PASS
+production baseline container target refused=PASS
+corrupted archive refused before target create=PASS
+TimescaleDB version mismatch refused before target create=PASS
+metadata credential scan=PASS
+```
+
+`pg_dump`가 TimescaleDB internal `continuous_agg` circular foreign-key warning을 출력했지만 full database restore는 `--exit-on-error`로 완료됐고 source/target schema와 data verification이 일치했다. 경고를 숨기지 않고 후속 version upgrade에서 재검토한다.
+
+### 제외와 Trade-off
+
+- `pg_dump`는 cluster role/global object, environment secret과 Collector pending queue를 보존하지 않는다.
+- Project API Key 원문은 DB에 없으므로 별도 secret custody가 필요하다.
+- Local disk backup은 off-host copy 전까지 host-loss backup이 아니다.
+- Full logical restore는 database가 커지면 RTO가 길어진다.
+- Production-sized timing과 off-host 경로를 검증하지 않아 committed RPO/RTO는 아직 없다.
+
+### 재검토 조건
+
+- Database가 100 GB에 접근하거나 logical restore window를 초과할 때
+- Point-in-time recovery 또는 더 짧은 RPO가 필요할 때
+- PostgreSQL role/tablespace가 복잡해질 때
+- Cross-major PostgreSQL/TimescaleDB migration
+- 첫 production-sized restore와 off-host rehearsal 결과

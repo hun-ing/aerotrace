@@ -56,8 +56,8 @@ Notification receiver의 HTTP 2xx는 D1 claim과 Queue write 완료를 뜻하며
 backend/                     Spring Boot ingest/query/auth application
 frontend/                    Next.js trace explorer and server-only BFF
 receiver/cloudflare-slack/   Durable Slack Webhook receiver
-scripts/                     Benchmark, queue checker and notification tools
-tests/                       Notification sender and SLI regression tests
+scripts/                     Runtime, benchmark, notification and DB recovery tools
+tests/                       Notification regressions and DB recovery fixtures
 deploy/systemd/              Notification evaluator/outbox units and timers
 benchmark-results/           Reproducible measurement evidence
 ```
@@ -230,6 +230,7 @@ npm run db:migrate:local
 | [Decisions](DECISIONS.md) | 채택한 기술·운영 결정과 trade-off |
 | [Engineering Log](ENGINEERING_LOG.md) | 구현·실험·검증 evidence |
 | [Local Runbook](LOCAL_RUNBOOK.md) | 로컬/통합 runtime과 데이터 보존 |
+| [Database Backup/Restore Runbook](DATABASE_BACKUP_RESTORE_RUNBOOK.md) | TimescaleDB backup, 빈 target 복원과 DR 경계 |
 | [Webhook Receiver Contract](WEBHOOK_RECEIVER_CONTRACT.md) | Payload, HMAC, HTTP, dedup 계약 |
 | [Notification SLO](NOTIFICATION_SLO.md) | Delivery 경계, threshold와 error budget |
 | [Notification Operations Runbook](OPERATIONS_RUNBOOK.md) | 장애 확인, retry, rollback과 복구 |
@@ -247,6 +248,7 @@ npm run db:migrate:local
 - Slack delivery는 at-least-once이며 provider timeout에서 사용자-visible duplicate가 가능하다.
 - Notification 운영은 단일 owner 구조이며 24x7 SLA가 아니다.
 - Receipt/D1 metadata retention은 초기 policy target이고 자동 purge는 아직 없다.
+- TimescaleDB backup/restore는 ephemeral acceptance만 완료됐고 production-sized/off-host backup은 아직 없다.
 - Eligible production notification이 아직 없어 첫 30일 SLO는 `NO_DATA` calibration 상태다.
 
 보안 문제는 공개 issue에 세부 정보를 올리지 말고 [Security Policy](SECURITY.md)의 private report 절차를 사용한다.

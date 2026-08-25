@@ -1,8 +1,8 @@
 # AeroTrace Career Log
 
-> 마지막 업데이트: 2026-08-21
-> 현재 Portfolio 단계: 수집·저장·조회 MVP, 장애 복구와 Cloudflare/Slack notification production 활성화 검증
-> 다음 Checkpoint: notification 첫 7일 health review와 30일 SLI·Free tier 사용량 검토
+> 마지막 업데이트: 2026-08-25
+> 현재 Portfolio 단계: 수집·저장·조회 MVP, notification production 운영과 TimescaleDB 격리 backup/restore acceptance
+> 다음 Checkpoint: notification D+5~D+7 review와 production-sized backup/off-host 보관 검증
 
 이 문서는 checkpoint를 시간순으로 누적한다. 과거 항목의 `현재`와 `다음 검증`은 당시 상태이며 마지막 checkpoint가 최신 범위다.
 
@@ -75,6 +75,9 @@
 - DB 복구 후 자동 재전송
 - Queue Metric과 DB 최종 결과를 함께 검증
 - 실험 오류로 200행이 생성된 원인 분석과 재실험
+- TimescaleDB custom-format full logical backup
+- 빈 target의 pre/restore/post 순서와 version gate
+- Hypertable·columnstore·retention policy와 data fingerprint 복원 검증
 
 ### Query API
 
@@ -5577,3 +5580,50 @@ receipt/D1 metadata purge는 policy target이며 자동화 전
 D+1/D+2 daily snapshot은 기록하지 않음
 live /health 503, requeue, HMAC rotation drill은 수행하지 않음
 ```
+
+---
+
+## Portfolio Checkpoint — TimescaleDB Backup/Restore Ephemeral Acceptance
+
+### 실제로 완료한 것
+
+```text
+PostgreSQL custom-format full logical archive와 SHA-256 metadata
+PostgreSQL major/TimescaleDB exact-version restore gate
+template0 기반 새 DB + pre_restore -> pg_restore -> post_restore -> ANALYZE
+hypertable, columnstore, 두 scheduled policy와 application data fingerprint 비교
+existing target, production baseline target, 손상 archive와 version mismatch 거부
+production network·volume과 분리된 tmpfs source/target acceptance 및 CI
+```
+
+Backup 파일의 존재가 아니라 실제 복원 가능성을 성공 조건으로 삼았다. Source migration과 fixture를 백업해 별도의 빈 TimescaleDB에 단일 process로 복원하고, row 원문이나 API Key hash를 출력하지 않는 aggregate와 one-way fingerprint로 source/target 일치를 확인했다. 실패한 restore target은 증거 보존을 위해 자동 삭제하지 않고 기존 DB를 drop·clean·overwrite하는 기능은 제공하지 않았다.
+
+### 이력서 성과 문장 초안
+
+> TimescaleDB full logical backup을 version-pinned 빈 target에 실제 복원하는 자동 acceptance를 구현하고, checksum·hypertable·columnstore·retention policy·application data fingerprint 검증과 destructive restore 방지 gate를 CI로 고정
+
+짧은 버전:
+
+> TimescaleDB backup을 별도 빈 DB에 복원해 schema·policy·data 일치를 검증하는 재현 가능한 DR acceptance와 안전한 운영 runbook을 구축
+
+### 과장하지 않을 범위
+
+```text
+production DB archive 생성은 아직 수행하지 않음
+production-sized dump/restore 소요 시간은 아직 측정하지 않음
+off-host encrypted copy와 deletion isolation은 아직 없음
+committed RPO/RTO와 point-in-time recovery는 아직 없음
+실제 장애의 connection cutover rehearsal은 아직 없음
+```
+
+이번 결과는 논리 백업·복구 절차와 자동 회귀 검증의 증거다. Host loss까지 견디는 재해복구 체계라고 표현하려면 production-sized timing, 독립 off-host 보관, restore rehearsal과 cutover evidence가 추가로 필요하다.
+
+### 예상 면접 질문
+
+- Docker Named Volume을 backup으로 보지 않은 이유는 무엇인가?
+- Backup 생성 성공과 usable restore proof는 어떻게 다른가?
+- TimescaleDB restore 전후에 전용 administration function을 호출한 이유는 무엇인가?
+- Parallel `pg_restore`를 금지하고 exact version을 요구한 이유는 무엇인가?
+- 기존 DB를 덮어쓰지 않고 새 target에 복원하면 어떤 안전성이 생기는가?
+- Row 원문을 로그에 노출하지 않고 source/target data 일치를 어떻게 확인했는가?
+- Logical backup이 커졌을 때 어떤 조건에서 physical backup과 WAL archiving을 검토할 것인가?

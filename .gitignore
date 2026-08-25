@@ -39,6 +39,10 @@ http-client.private.env.json
 
 # Temporary Phase 9 snapshots
 /phase9-*.zip
+
+# Local database backup archives
+/backups/
+
 # Python cache
 __pycache__/
 *.py[cod]
