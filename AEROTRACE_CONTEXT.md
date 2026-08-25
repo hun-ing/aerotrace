@@ -31,6 +31,9 @@ PR #9 Project API Key lifecycle initial implementation=validated, 77b85ed
 PR #9 initial Backend/Frontend/Notification CI=PASS
 Backend main push run #7=PASS
 Project API Key main job log raw credential matches=0
+PR #10 authentication/onboarding design initial head=e89189b
+PR #10 Frontend/Notification CI=PASS
+PR #10 job logs raw API Key/Slack Webhook matches=0
 ```
 
 Slack receiver와 후속 문서·자동 검증 범위:

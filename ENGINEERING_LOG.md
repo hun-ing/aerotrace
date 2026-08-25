@@ -15872,3 +15872,16 @@ changed-line credential pattern scan=PASS
 전체 기존 문서 credential 정규식 검사는 과거 corrupt failure-state 보존 검증에 기록된 동일 SHA-256 checksum을 탐지했다. 이는 secret이 아니라 test file의 실행 전후 동일성을 증명하는 기존 evidence이며 이번 diff에는 포함되지 않는다. 이를 삭제하거나 새 credential 발견으로 잘못 기록하지 않고 changed-line scan을 별도로 통과시켰다.
 
 새 설계 문서는 기존 Project API Key runbook, Backup/Restore runbook과 Notification retention policy의 책임을 복제하지 않는다. 실제 auth schema와 운영 명령이 생기는 구현 PR에서 `AUTHENTICATION_OPERATIONS_RUNBOOK.md`와 `USER_DATA_RETENTION_POLICY.md`를 추가하도록 checkpoint를 남겼다. 별도 수동 test 설명서는 만들지 않고 acceptance를 tracked test/CI로 구현한다.
+
+PR #10 initial head `e89189b`의 path-filtered GitHub Actions 결과는 다음과 같다.
+
+```text
+Frontend Tests=PASS
+Notification Pipeline notification-outbox=PASS
+Notification Pipeline cloudflare-slack-receiver=PASS
+job log bytes=19,831 / 19,429 / 29,086
+raw Project API Key matches=0
+Slack Webhook URL matches=0
+```
+
+Backend와 Database path는 바뀌지 않아 해당 workflow를 실행 완료로 과장하지 않는다. 첫 log scan command는 0-match `rg`의 exit code 1을 `set -euo pipefail`이 실패로 처리해 결과 출력 전에 종료됐다. 0-match를 명시적으로 정상 처리하도록 수정한 재실행에서 세 job 모두 위 결과를 반환했다.
