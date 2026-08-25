@@ -27,6 +27,8 @@ PR #6 operations documentation review=merged, 73eb0fe
 PR #7 notification D+4 review=merged, bfd5dfe
 PR #8 TimescaleDB backup/restore acceptance=merged, 45909f4
 Project API Key lifecycle implementation base=45909f4
+PR #9 Project API Key lifecycle initial implementation=validated, 77b85ed
+PR #9 initial Backend/Frontend/Notification CI=PASS
 Backend main push run #7=PASS
 Project API Key main job log raw credential matches=0
 ```

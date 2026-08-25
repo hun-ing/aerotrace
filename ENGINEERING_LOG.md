@@ -15767,6 +15767,20 @@ project_api_key_lifecycle_final_acceptance=PASS
 
 테스트 컨테이너는 port, production volume과 production network를 사용하지 않았다. 종료 전 label, tmpfs와 network 연결을 확인했고 tmpfs DB container와 빈 전용 network만 제거했다.
 
+PR #9 initial head `77b85ed`의 GitHub Actions 결과는 다음과 같다.
+
+```text
+Backend Tests run #8=PASS
+Frontend Tests run #3=PASS
+Notification Pipeline Tests run #20=PASS
+Backend job log bytes=60,420
+raw API Key matches=0
+lookup key_id matches=0
+API Key row UUID output matches=0
+```
+
+Backend job은 전체 test 다음에 ephemeral TimescaleDB의 bootstrap, missing-project issue 거부, last-active 보호, existing-project replacement, revoke와 repeated revoke acceptance까지 완료했다. Credential을 담은 mode 0600 임시 파일은 trap으로 제거했고 log나 artifact에 업로드하지 않았다.
+
 ### 운영·문서 경계
 
 Production tenant/project/Key, secret file, Docker service와 systemd는 변경하지 않았다. Backblaze B2는 provider/빈 private bucket 준비까지만 current state로 기록하고 application key, client-side encryption key와 실제 backup transfer는 사용자 data 수집 전 checkpoint로 보류한다. 기존 untracked PostgreSQL 분석 script 세 개는 수정하거나 stage하지 않는다.
