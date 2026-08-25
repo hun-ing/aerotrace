@@ -235,6 +235,7 @@ npm run db:migrate:local
 | [Career Log](CAREER_LOG.md) | 검증된 성과와 과장하지 않을 범위 |
 | [Local Runbook](LOCAL_RUNBOOK.md) | 로컬/통합 runtime과 데이터 보존 |
 | [Project API Key Lifecycle Runbook](PROJECT_API_KEY_RUNBOOK.md) | 기존 project의 Key 조회, 교체, 폐기와 침해 대응 |
+| [User Authentication and Onboarding Design](USER_AUTH_ONBOARDING_DESIGN.md) | GitHub OAuth, server session, invite-only onboarding과 tenant RBAC 구현 계약 |
 | [Database Backup/Restore Runbook](DATABASE_BACKUP_RESTORE_RUNBOOK.md) | TimescaleDB backup, 빈 target 복원과 DR 경계 |
 | [Webhook Receiver Contract](WEBHOOK_RECEIVER_CONTRACT.md) | Payload, HMAC, HTTP, dedup 계약 |
 | [Notification SLO](NOTIFICATION_SLO.md) | Delivery 경계, threshold와 error budget |
@@ -247,7 +248,7 @@ npm run db:migrate:local
 
 ## 알려진 제한
 
-- Frontend는 server-side Project API Key 하나를 사용하며 사용자 로그인·세션이 없다.
+- Frontend는 현재 server-side Project API Key 하나를 사용하며 사용자 로그인·세션이 없다. 다음 구현 경계는 [User Authentication and Onboarding Design](USER_AUTH_ONBOARDING_DESIGN.md)에 채택했지만 아직 적용되지 않았다.
 - Project/API Key self-service onboarding, rotation UI와 expiry alert가 없으며 lifecycle은 operator task로 수행한다.
 - 기본 Compose는 개발 편의를 위해 서비스 port를 host에 게시하므로 firewall, TLS와 접근 제어 없이 public network에 배포하면 안 된다.
 - Slack delivery는 at-least-once이며 provider timeout에서 사용자-visible duplicate가 가능하다.

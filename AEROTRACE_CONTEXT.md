@@ -1,9 +1,9 @@
 # AeroTrace 프로젝트 컨텍스트
 
 > 마지막 업데이트: 2026-08-25
-> 현재 상태: Notification production 운영과 Project API Key operator lifecycle 검증 완료, off-host backup 실전 적용은 사용자 data 수집 전까지 보류
-> 현재 Phase: Phase 9 — self-hosted MVP 운영 안정화와 credential lifecycle
-> 다음 작업: D+5~D+7 notification review를 병행하면서 사용자 인증·onboarding 경계를 설계한다. Production-sized/off-host backup은 실제 사용자 data 수집 전 필수 checkpoint다.
+> 현재 상태: Notification 운영·Project API Key lifecycle 검증 완료, 사용자 인증·invite-only onboarding 구현 계약 채택, 실제 login/session/RBAC는 아직 미구현
+> 현재 Phase: Phase 9 — 공개 MVP 사용자 인증과 tenant authorization 구현 준비
+> 다음 작업: 인증 Phase A의 schema·default-deny authorization test를 시작하고 D+5~D+7 notification review를 병행한다. Production-sized/off-host backup은 실제 사용자 data 수집 전 필수 checkpoint다.
 
 이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
 
@@ -174,6 +174,25 @@ production mutation=수행하지 않음
 ```
 
 격리 Java 21과 tmpfs TimescaleDB에서 Backend 전체 test와 발급·조회·마지막 Key 보호·existing-project replacement·폐기·반복 폐기 acceptance를 수행한다. 실제 production tenant/project/Key와 secret file은 변경하지 않는다.
+
+사용자 인증과 onboarding 경계는 `USER_AUTH_ONBOARDING_DESIGN.md`에 구현 전 계약으로 채택했다.
+
+```text
+initial identity provider=GitHub OAuth Web Application Flow
+provider identity key=변경 가능한 login/email이 아닌 GitHub numeric user ID
+provider scope=repository/organization/email scope 요청 안 함
+OAuth token=identity 확인 뒤 비보존
+session=Spring Security + Spring Session JDBC, opaque HttpOnly cookie
+onboarding=invite-only, raw invite one-time output + hash-only DB storage
+membership=tenant-level OWNER / ADMIN / VIEWER
+authorization=Backend default-deny + 매 요청 active membership 확인
+BFF=allowlisted same-origin proxy, universal Project API Key 제거 목표
+Project API Key=Collector workload credential로 유지
+public self-signup=rate limit/quota/abuse 방어 전까지 보류
+implementation status=미구현
+```
+
+첫 구현은 user/identity/membership/invite/audit/session schema, permission service, bootstrap invite task와 concurrency/last-owner test다. OAuth app 생성, client secret 배치, production route/session table 변경은 이 설계 작업에 포함하지 않는다.
 
 현재 서버에 설치된 production runtime은 Webhook 기준선이다.
 

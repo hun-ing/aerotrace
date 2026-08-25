@@ -8485,3 +8485,99 @@ production credential mutation=none
 - Expiry notification과 scheduled rotation 요구
 - 여러 운영자의 RBAC·approval·audit log 요구
 - 하나의 Project API Key를 여러 독립 client가 사용하지 않도록 scope를 분리할 때
+
+---
+
+## ADR — 사람의 인증은 GitHub OAuth와 Backend server session으로 분리한다
+
+### 상태
+
+채택 — 2026-08-25, 구현 전 설계 계약
+
+### 해결하려는 문제
+
+현재 Next.js BFF는 server-only Project API Key 하나로 trace를 조회한다. Browser에 Key 원문은 노출되지 않지만 사용자 신원, tenant membership과 project 선택이 없어서 Frontend 접근자 모두가 같은 project를 볼 수 있다. Project API Key를 사용자 token처럼 확장하면 Collector credential과 사람의 권한이 섞이고 BFF secret 하나의 권한이 지나치게 커진다.
+
+공개 MVP 전에 다음을 분리해야 한다.
+
+```text
+workload identity=Project API Key
+human identity=external OAuth identity + local server session
+resource authorization=Backend tenant membership
+```
+
+### 검토한 대안
+
+1. AeroTrace 자체 email/password
+2. Next.js에서만 session과 RBAC 관리
+3. BFF가 사용자별 project API Key를 선택
+4. 별도 self-hosted IdP
+5. Managed authentication SaaS
+6. GitHub OAuth login과 AeroTrace server session
+
+### 결정
+
+초기 identity provider는 개발자 대상 MVP에 맞는 GitHub OAuth Web Application Flow로 한다. OAuth `state`, PKCE `S256`과 exact HTTPS callback을 사용한다. Repository, organization과 email scope는 요청하지 않으며 변경 가능한 login/email 대신 GitHub numeric user ID를 provider subject로 저장한다. Provider token은 identity 확인 뒤 DB, session, log와 audit에 보존하지 않는다.
+
+Backend와 PostgreSQL이 `app_users`, `user_identities`, `tenant_memberships`, invite, audit와 session의 source of truth다. Spring Security와 Spring Session JDBC의 불투명 server session을 사용하고 Browser cookie에는 session ID만 둔다. Production cookie는 `__Host-aerotrace_session`, `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`으로 한다. Session ID rotation, idle 8시간, absolute 7일, POST logout과 user disable 시 전체 session 폐기를 요구한다. Membership revoke는 session을 유지하더라도 해당 tenant 접근을 다음 요청부터 거부한다.
+
+초기 onboarding은 invite-only다. CSPRNG 256-bit 이상 원문 invite는 한 번만 표시하고 SHA-256 hash만 저장하며 기본 24시간, single-use로 한다. URL에 token을 넣지 않고 same-origin POST body로 받은 즉시 hash 검증한 뒤 anonymous server session에는 원문이 아닌 intent ID만 연결한다. Callback transaction이 invite row를 잠그고 identity와 membership을 만든다. Invite 없는 새 identity의 자동 user/tenant 생성은 거부한다.
+
+Tenant membership은 `OWNER`, `ADMIN`, `VIEWER` 세 역할이며 초기에는 tenant 아래 모든 project에 적용한다. Backend는 default-deny로 매 요청 active membership과 project의 tenant 관계를 함께 확인한다. 마지막 OWNER의 revoke/demotion은 기본 거부한다.
+
+Invite, owner/role 변경과 Project API Key issue/revoke는 role 검사 외에 15분 이내의 최근 인증을 요구한다. Membership revoke는 남아 있는 session으로도 해당 tenant 접근을 다음 요청부터 거부하고, user disable이나 account incident에서는 그 사용자의 모든 session을 폐기한다.
+
+Next.js BFF는 유지하되 auth/application path와 header를 allowlist로 proxy한다. UI와 BFF의 검사는 조기 거부용이고 Backend authorization을 대신하지 않는다. Frontend 전환이 끝나면 universal `AEROTRACE_API_KEY`를 제거하고 Project API Key는 Collector workload credential과 operator/self-service lifecycle에만 사용한다.
+
+Full database restore에서는 traffic 재개 전 restored session을 모두 삭제하고 미사용 invite를 revoke한다. Login 후 redirect는 same-origin 상대 경로 allowlist만 허용한다. Local과 Production은 callback과 client secret이 다른 OAuth app으로 분리한다.
+
+Public self-signup과 자동 tenant 생성은 rate limit, quota, abuse monitoring, account privacy/deletion과 production-sized encrypted off-host backup이 준비될 때까지 보류한다.
+
+### 선택 이유
+
+- AeroTrace가 password, reset email, breach와 MFA lifecycle을 직접 운영하지 않는다.
+- 외부 identity 확인과 local tenant 권한을 분리해 provider token이 AeroTrace authorization이 되지 않는다.
+- Backend가 최종 권한을 판단해 BFF 우회와 향후 API 추가에도 tenant isolation을 일관되게 적용할 수 있다.
+- 불투명 JDBC session과 매 요청 membership 확인은 즉시 logout, user disable과 tenant 접근 revoke를 가능하게 한다.
+- Invite-only 시작은 quota와 abuse 방어가 없는 상태의 무제한 tenant 생성을 막는다.
+- 기존 Project API Key ingest와 operator rotation 경계를 유지해 migration을 단계화할 수 있다.
+
+### 단점과 위험
+
+- GitHub 로그인과 provider 가용성에 의존한다.
+- Next.js가 OAuth redirect, cookie와 CSRF를 정확히 proxy해야 한다.
+- JDBC session은 DB write와 cleanup 부하를 추가한다.
+- Full database backup에 session/invite table이 포함되므로 DR activation에 명시적 무효화 단계가 필요하다.
+- Tenant-level role은 같은 tenant 안의 project별 접근 제한을 제공하지 않는다.
+- Invite 전달은 별도 안전한 out-of-band channel이 필요하다.
+- OAuth app/client secret, session incident와 provider outage runbook이 새로 필요하다.
+- User identity, invite, session과 audit metadata의 보존·삭제 정책이 새로 필요하다.
+- 설계만 채택된 상태이며 현재 Frontend는 여전히 로그인 없이 단일 Project API Key를 사용한다.
+
+### 검증 계약
+
+구현은 `USER_AUTH_ONBOARDING_DESIGN.md`의 acceptance를 따라 다음을 자동 검증한다.
+
+```text
+invalid state/PKCE/exact callback refusal
+forbidden provider scope absence
+open redirect refusal
+session fixation/expiry/logout/revocation
+OAuth and session credential non-persistence scan
+invite hash-only/single-use/expiry/concurrent consume
+OWNER/ADMIN/VIEWER permission matrix
+last OWNER protection
+cross-tenant IDOR/list/detail/cursor refusal
+CSRF and unexpected Origin refusal
+BFF path/header allowlist
+existing OTLP API Key regression
+restored session/invite invalidation
+```
+
+### 재검토 조건
+
+- GitHub 계정 없는 실제 사용자 또는 enterprise SSO 요구
+- Project별 ACL 요구
+- 공개 self-signup, billing과 automated provisioning 도입
+- JDBC session storage가 scale/availability 병목이 될 때
+- Managed 또는 self-hosted OIDC provider의 운영 이점이 커질 때
