@@ -2,7 +2,7 @@ package com.huning.aerotrace.auth.infrastructure;
 
 import com.huning.aerotrace.BackendApplication;
 import com.huning.aerotrace.auth.application.IssuedProjectApiKey;
-import com.huning.aerotrace.auth.application.ProjectApiKeyIssueService;
+import com.huning.aerotrace.auth.application.ProjectApiKeyLifecycleIssueService;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -85,16 +85,9 @@ public final class ProjectApiKeyProvisioner {
                       request.projectSlug()
               );
 
-      assertNoActiveApiKey(
-              jdbcTemplate,
-              tenantId,
-              projectId,
-              request.apiKeyName()
-      );
-
-      ProjectApiKeyIssueService issueService =
+      ProjectApiKeyLifecycleIssueService issueService =
               context.getBean(
-                      ProjectApiKeyIssueService.class
+                      ProjectApiKeyLifecycleIssueService.class
               );
 
       Instant expiresAt =
@@ -104,7 +97,7 @@ public final class ProjectApiKeyProvisioner {
               );
 
       IssuedProjectApiKey issued =
-              issueService.issue(
+              issueService.issueForExistingProject(
                       tenantId,
                       projectId,
                       request.apiKeyName(),
@@ -424,44 +417,6 @@ public final class ProjectApiKeyProvisioner {
                       + " slug already exists with "
                       + "a different name. Existing name: "
                       + existingName
-      );
-    }
-  }
-
-  private static void assertNoActiveApiKey(
-          JdbcTemplate jdbcTemplate,
-          UUID tenantId,
-          UUID projectId,
-          String apiKeyName
-  ) {
-    Integer activeKeyCount =
-            jdbcTemplate.queryForObject(
-                    """
-                    SELECT COUNT(*)
-                    FROM project_api_keys
-                    WHERE tenant_id = ?
-                      AND project_id = ?
-                      AND name = ?
-                      AND revoked_at IS NULL
-                      AND (
-                          expires_at IS NULL
-                          OR expires_at > CURRENT_TIMESTAMP
-                      )
-                    """,
-                    Integer.class,
-                    tenantId,
-                    projectId,
-                    apiKeyName
-            );
-
-    if (
-            activeKeyCount != null
-                    && activeKeyCount > 0
-    ) {
-      throw new IllegalStateException(
-              "An active API Key already exists "
-                      + "with this name: "
-                      + apiKeyName
       );
     }
   }

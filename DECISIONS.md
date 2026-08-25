@@ -8413,3 +8413,75 @@ metadata credential scan=PASS
 - PostgreSQL role/tablespace가 복잡해질 때
 - Cross-major PostgreSQL/TimescaleDB migration
 - 첫 production-sized restore와 off-host rehearsal 결과
+
+---
+
+## ADR — Project API Key rotation은 existing-project operator task와 overlap 방식으로 수행한다
+
+### 상태
+
+채택 — 2026-08-25, ephemeral acceptance 완료
+
+### 배경
+
+최초 bootstrap용 `provisionProjectApiKey`는 tenant/project가 없으면 생성한다. 이 동작은 새 환경 준비에는 적합하지만 rotation에서 slug 오타가 별도 tenant/project 생성으로 이어질 수 있어 안전한 후속 발급 경로가 아니다. 또한 원문 Key를 DB에 저장하지 않으므로 기존 Key를 교체하려면 두 client가 새 Key를 사용하는 것을 확인할 때까지 기존 Key를 함께 허용해야 한다.
+
+### 결정
+
+기존 tenant/project의 목록, replacement 발급과 폐기는 `manageProjectApiKeys` Gradle operator task로 수행한다.
+
+```text
+list current metadata
+-> existing-project-only issue with unique name
+-> Collector와 Frontend에 새 원문 반영
+-> ingest/query 검증
+-> old row UUID + exact name + REVOKE confirmation
+-> old Key logical revoke
+```
+
+`issue`와 `revoke`는 project row를 `FOR UPDATE`로 잠가 같은 project의 lifecycle 변경을 직렬화한다. 폐기는 대상 Key row도 잠그고 `revoked_at IS NULL` 조건으로 한 row만 갱신한다. 여러 활성 Key는 rotation overlap 동안 허용하지만 같은 이름의 활성 Key는 다시 발급하지 않는다.
+
+마지막 활성 Key 폐기는 기본 거부한다. 침해 대응이나 의도적인 서비스 중단에서만 `AEROTRACE_API_KEY_ALLOW_LAST_ACTIVE=true`를 명시한다. 같은 폐기를 반복하면 `ALREADY_REVOKED`를 반환하고 row를 다시 쓰지 않는다. Un-revoke와 row 삭제 기능은 제공하지 않는다.
+
+목록 query는 row UUID, 이름과 timestamp만 읽는다. Credential 원문, lookup용 `key_id`와 `secret_hash`는 읽거나 출력하지 않는다. 운영자 입력 이름에 control character가 있어도 output line을 위조하지 못하도록 이름은 UTF-8 Base64URL로 표시한다.
+
+기존 V5의 `created_at`, `expires_at`, `revoked_at`을 사용하므로 migration을 추가하지 않는다. 만료는 인증을 거부하지만 자동 replacement나 alert를 만들지 않는다.
+
+### 선택 이유
+
+- 최초 환경 bootstrap과 기존 project credential lifecycle의 권한을 분리한다.
+- 새 Key 검증 전 이전 Key를 폐기하지 않아 Collector ingest와 Frontend query의 무중단 교체가 가능하다.
+- Project 단위 잠금으로 동시 issue/revoke의 last-active 판정과 duplicate 검사를 직렬화한다.
+- 마지막 Key 보호와 다중 확인값으로 operator 실수의 blast radius를 줄인다.
+- 폐기 row를 보존해 incident와 audit에서 시각과 상태를 확인할 수 있다.
+
+### 단점과 위험
+
+- 현재는 Collector와 Frontend secret을 운영자가 각각 갱신해야 한다.
+- 원문이 stdout에 한 번 표시되므로 terminal recording과 잘못된 복사가 여전히 위험하다.
+- Expiry alert와 scheduled rotation이 없어 정기 metadata 점검이 필요하다.
+- 긴급 last-active override는 의도적으로 ingest/query outage를 만들 수 있다.
+- Self-service UI, RBAC, 다중 운영자 승인과 managed secret store 연동이 없다.
+
+### 검증
+
+```text
+status unit tests=ACTIVE / EXPIRED / REVOKED
+duplicate active name refusal=PASS
+project lock before issue/revoke=PASS
+last active default refusal=PASS
+explicit last active override=PASS
+expired/revoked handling=PASS
+repeated revoke idempotency=PASS
+ephemeral DB issue/list/revoke state transition=PASS
+lifecycle output credential scan=PASS
+production credential mutation=none
+```
+
+### 재검토 조건
+
+- 사용자 login/onboarding 또는 Project 관리 UI 도입
+- Managed secret store와 자동 deployment 도입
+- Expiry notification과 scheduled rotation 요구
+- 여러 운영자의 RBAC·approval·audit log 요구
+- 하나의 Project API Key를 여러 독립 client가 사용하지 않도록 scope를 분리할 때

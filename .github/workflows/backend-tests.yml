@@ -66,7 +66,7 @@ jobs:
       - name: Run Backend tests
         run: bash ./gradlew test --no-daemon
 
-      - name: Verify Project API Key provisioning
+      - name: Verify Project API Key provisioning and lifecycle
         env:
           AEROTRACE_PROVISION_TENANT_NAME: AeroTrace CI
           AEROTRACE_PROVISION_TENANT_SLUG: aerotrace-ci
@@ -79,8 +79,11 @@ jobs:
           umask 077
 
           output_file="$(mktemp)"
+          replacement_file="$(mktemp)"
+          list_file="$(mktemp)"
+          revoke_file="$(mktemp)"
           error_file="$(mktemp)"
-          trap 'rm -f "$output_file" "$error_file"' EXIT
+          trap 'rm -f "$output_file" "$replacement_file" "$list_file" "$revoke_file" "$error_file"' EXIT
 
           bash ./gradlew \
             provisionProjectApiKey \
@@ -116,5 +119,173 @@ jobs:
           fi
 
           grep -Fq \
-            'An active API Key already exists with this name: ci-runtime' \
+            'An active API Key already exists with the requested name' \
             "$error_file"
+
+          api_key_id="$(
+            sed -n \
+              's/^AEROTRACE_PROVISIONED_API_KEY_ID=//p' \
+              "$output_file"
+          )"
+
+          if [[ ! "$api_key_id" =~ ^[0-9a-f-]{36}$ ]]; then
+            echo 'provisioned API Key row ID was invalid' >&2
+            exit 1
+          fi
+
+          AEROTRACE_API_KEY_ACTION=list \
+          AEROTRACE_API_KEY_TENANT_SLUG=aerotrace-ci \
+          AEROTRACE_API_KEY_PROJECT_SLUG=aerotrace-ci \
+            bash ./gradlew \
+              manageProjectApiKeys \
+              --no-daemon \
+              >"$list_file"
+
+          grep -Fqx \
+            'AEROTRACE_API_KEY_LIST_RESULT=OK' \
+            "$list_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_COUNT=1' \
+            "$list_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_ACTIVE_COUNT=1' \
+            "$list_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_1_NAME_BASE64URL=Y2ktcnVudGltZQ' \
+            "$list_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_1_STATUS=ACTIVE' \
+            "$list_file"
+
+          if \
+            AEROTRACE_API_KEY_ACTION=issue \
+            AEROTRACE_API_KEY_TENANT_SLUG=missing-tenant \
+            AEROTRACE_API_KEY_PROJECT_SLUG=missing-project \
+            AEROTRACE_API_KEY_NAME=must-not-be-issued \
+            AEROTRACE_API_KEY_EXPIRATION_DAYS=1 \
+              bash ./gradlew \
+                manageProjectApiKeys \
+                --no-daemon \
+                >/dev/null \
+                2>"$error_file"; then
+            echo 'API Key was unexpectedly issued for a missing project' >&2
+            exit 1
+          fi
+
+          grep -Fq \
+            'The requested tenant/project was not found' \
+            "$error_file"
+
+          if \
+            AEROTRACE_API_KEY_ACTION=revoke \
+            AEROTRACE_API_KEY_TENANT_SLUG=aerotrace-ci \
+            AEROTRACE_API_KEY_PROJECT_SLUG=aerotrace-ci \
+            AEROTRACE_API_KEY_ID="$api_key_id" \
+            AEROTRACE_API_KEY_EXPECTED_NAME=ci-runtime \
+            AEROTRACE_API_KEY_CONFIRM_REVOKE=REVOKE \
+              bash ./gradlew \
+                manageProjectApiKeys \
+                --no-daemon \
+                >/dev/null \
+                2>"$error_file"; then
+            echo 'last active API Key was unexpectedly revoked' >&2
+            exit 1
+          fi
+
+          grep -Fq \
+            'Refusing to revoke the last active API Key.' \
+            "$error_file"
+
+          AEROTRACE_API_KEY_ACTION=issue \
+          AEROTRACE_API_KEY_TENANT_SLUG=aerotrace-ci \
+          AEROTRACE_API_KEY_PROJECT_SLUG=aerotrace-ci \
+          AEROTRACE_API_KEY_NAME=ci-runtime-next \
+          AEROTRACE_API_KEY_EXPIRATION_DAYS=1 \
+            bash ./gradlew \
+              manageProjectApiKeys \
+              --no-daemon \
+              >"$replacement_file"
+
+          grep -Eq \
+            '^AEROTRACE_API_KEY=atr_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}$' \
+            "$replacement_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_ISSUE_RESULT=ISSUED' \
+            "$replacement_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_ISSUED_NAME_BASE64URL=Y2ktcnVudGltZS1uZXh0' \
+            "$replacement_file"
+
+          if grep -Eiq \
+            'secret_hash|(^|_)KEY_ID=' \
+            "$replacement_file"; then
+            echo 'issue output exposed stored credential material' >&2
+            exit 1
+          fi
+
+          AEROTRACE_API_KEY_ACTION=revoke \
+          AEROTRACE_API_KEY_TENANT_SLUG=aerotrace-ci \
+          AEROTRACE_API_KEY_PROJECT_SLUG=aerotrace-ci \
+          AEROTRACE_API_KEY_ID="$api_key_id" \
+          AEROTRACE_API_KEY_EXPECTED_NAME=ci-runtime \
+          AEROTRACE_API_KEY_CONFIRM_REVOKE=REVOKE \
+            bash ./gradlew \
+              manageProjectApiKeys \
+              --no-daemon \
+              >"$revoke_file"
+
+          grep -Fqx \
+            'AEROTRACE_API_KEY_REVOKE_RESULT=REVOKED' \
+            "$revoke_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_ACTIVE_COUNT_AFTER=1' \
+            "$revoke_file"
+
+          AEROTRACE_API_KEY_ACTION=revoke \
+          AEROTRACE_API_KEY_TENANT_SLUG=aerotrace-ci \
+          AEROTRACE_API_KEY_PROJECT_SLUG=aerotrace-ci \
+          AEROTRACE_API_KEY_ID="$api_key_id" \
+          AEROTRACE_API_KEY_EXPECTED_NAME=ci-runtime \
+          AEROTRACE_API_KEY_CONFIRM_REVOKE=REVOKE \
+            bash ./gradlew \
+              manageProjectApiKeys \
+              --no-daemon \
+              >"$revoke_file"
+
+          grep -Fqx \
+            'AEROTRACE_API_KEY_REVOKE_RESULT=ALREADY_REVOKED' \
+            "$revoke_file"
+
+          AEROTRACE_API_KEY_ACTION=list \
+          AEROTRACE_API_KEY_TENANT_SLUG=aerotrace-ci \
+          AEROTRACE_API_KEY_PROJECT_SLUG=aerotrace-ci \
+            bash ./gradlew \
+              manageProjectApiKeys \
+              --no-daemon \
+              >"$list_file"
+
+          grep -Fqx \
+            'AEROTRACE_API_KEY_COUNT=2' \
+            "$list_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_ACTIVE_COUNT=1' \
+            "$list_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_1_NAME_BASE64URL=Y2ktcnVudGltZS1uZXh0' \
+            "$list_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_1_STATUS=ACTIVE' \
+            "$list_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_2_NAME_BASE64URL=Y2ktcnVudGltZQ' \
+            "$list_file"
+          grep -Fqx \
+            'AEROTRACE_API_KEY_2_STATUS=REVOKED' \
+            "$list_file"
+
+          if grep -Eiq \
+            'atr_|secret_hash|(^|_)KEY_ID=' \
+            "$list_file" "$revoke_file"; then
+            echo 'lifecycle output exposed credential material' >&2
+            exit 1
+          fi

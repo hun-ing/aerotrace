@@ -64,6 +64,6 @@ BFF는 허용된 query parameter만 전달하고 Backend 요청에 `Authorizatio
 
 ## 현재 보안 경계
 
-현재 Frontend에는 사용자 로그인과 session이 없다. 서버당 하나의 Project API Key를 사용하므로 local 개발, private deployment 또는 접근이 제한된 PoC에만 적합하다. 공개 SaaS 인증·tenant 선택 구조로 사용하지 않는다.
+현재 Frontend에는 사용자 로그인과 session이 없다. 정상 운영에서는 서버가 하나의 runtime Project API Key를 사용하고, [operator rotation](../PROJECT_API_KEY_RUNBOOK.md) 중에만 기존·신규 Key를 짧게 겹쳐 허용한다. 따라서 local 개발, private deployment 또는 접근이 제한된 PoC에만 적합하며 공개 SaaS 인증·tenant 선택 구조로 사용하지 않는다.
 
 전체 runtime과 운영 문서는 [repository root README](../README.md)를 따른다.
