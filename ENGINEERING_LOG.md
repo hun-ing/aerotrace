@@ -1,7 +1,7 @@
 # AeroTrace Engineering Log
 
 > 마지막 업데이트: 2026-08-25
-> 현재 Phase: Phase 9 — notification production 활성화 및 초기 운영 관찰
+> 현재 Phase: Phase 9 — 공개 MVP 사용자 인증과 tenant authorization 구현 준비
 > 기록 원칙: 사용자가 직접 적용하고 실행한 결과만 완료로 기록하며, 원본 출력이 없는 수치는 추측하지 않는다.
 
 이 문서는 검증 결과를 시간순으로 누적한다. 중간 항목의 `현재`와 `다음 단계`는 해당 실험 시점의 표현이며 최종 항목과 `AEROTRACE_CONTEXT.md` 최상단이 최신 상태다.
@@ -15784,3 +15784,104 @@ Backend job은 전체 test 다음에 ephemeral TimescaleDB의 bootstrap, missing
 ### 운영·문서 경계
 
 Production tenant/project/Key, secret file, Docker service와 systemd는 변경하지 않았다. Backblaze B2는 provider/빈 private bucket 준비까지만 current state로 기록하고 application key, client-side encryption key와 실제 backup transfer는 사용자 data 수집 전 checkpoint로 보류한다. 기존 untracked PostgreSQL 분석 script 세 개는 수정하거나 stage하지 않는다.
+
+---
+
+## V-7B-4-21 User Authentication and Onboarding Boundary Design
+
+### 목적
+
+현재 단일 server-only Project API Key를 사용하는 Next.js BFF를 공개 MVP로 확장하기 전에 사람의 identity, server session, tenant authorization, onboarding과 Collector credential의 경계를 고정한다. 구현을 시작하기 전 schema, trust boundary, role matrix, rollout과 acceptance를 review 가능한 계약으로 만든다.
+
+### Repository 조사
+
+```text
+current branch base=main 5bf600c
+tracked working tree before design=clean
+ignored existing untracked analysis scripts=3
+tenant/project schema=V2
+Project API Key schema=V5
+Project API Key protected paths=POST /v1/traces + GET /api/v1/traces/**
+Frontend auth=session 없음
+Frontend BFF credential=single server-only AEROTRACE_API_KEY
+Production network=Frontend edge 연결, Backend/DB host port 미게시
+```
+
+Backend query는 API Key 인증 Filter가 request attribute에 넣은 `(tenant_id, project_id)`를 사용하고 모든 trace SQL이 두 ID로 제한된다. 사용자, 외부 identity, membership, session table과 Spring Security dependency는 없다. 따라서 기존 tenant isolation을 재사용할 수 있지만 사람의 권한을 Project API Key로 대신해서는 안 된다고 판정했다.
+
+### 공식 기준 대조
+
+Spring Security 7.1 reference의 OAuth2 login, session fixation과 CSRF, Spring Session JDBC, repository에 설치된 Next.js 16.3.2 authentication/BFF guide, GitHub OAuth Web Flow/scope/best practice와 OWASP session/authorization guidance를 확인했다.
+
+```text
+authorization=default deny + every request
+session=server-side opaque ID + secure cookie
+CSRF=unsafe cookie-authenticated request와 logout에 유지
+OAuth=state + PKCE + exact callback
+provider identifier=mutable login/email 금지, stable numeric ID
+Next Route Handler=public endpoint이므로 독립 auth/authorization 필요
+```
+
+### 채택 설계
+
+`USER_AUTH_ONBOARDING_DESIGN.md`와 ADR에 다음을 고정했다.
+
+```text
+identity=GitHub OAuth, repository/organization/email scope 없음
+provider token=identity 조회 뒤 비보존
+session=Spring Security + Spring Session JDBC
+cookie=__Host-aerotrace_session, Secure/HttpOnly/SameSite=Lax/Path=/
+onboarding=existing tenant invite-only, raw one-time + SHA-256 hash-only
+roles=tenant OWNER / ADMIN / VIEWER
+authorization=Backend active membership + project tenant relation
+BFF=allowlisted session/CSRF proxy, Backend가 final decision
+Project API Key=Collector workload credential 유지
+public self-signup=quota/rate-limit/abuse 방어 전까지 보류
+```
+
+Data model, 마지막 OWNER 보호, single-use invite concurrency, role matrix, cross-tenant IDOR, CSRF, session revocation, credential scan, legacy ingest 회귀와 단계별 rollout acceptance를 문서에 포함했다.
+
+문서 자체 보안 review에서 OAuth authorization/callback의 `state+PKCE`와 local unsafe method의 CSRF token 역할을 분리해 표현했다. Invite code entropy와 원문 비보존, 15분 recent-auth 민감 작업, same-origin post-login redirect, Local/Production OAuth app 분리, auth endpoint rate limit을 보완했다. Full DB restore가 과거 session과 invite를 되살리지 않도록 traffic 재개 전 session 삭제와 미사용 invite revoke를 DR acceptance에 추가했다.
+
+### 구현 순서
+
+```text
+Phase A=user/identity/membership/invite/audit/session migration + authorization tests
+Phase B=GitHub OAuth + JDBC session + local principal
+Phase C=session project query + BFF/login/project selector + Frontend API Key 제거
+Phase D=RBAC Project API Key self-service
+Phase E=public self-signup readiness 재검토
+```
+
+### 안전 경계
+
+이 단계는 설계 문서만 변경한다. GitHub OAuth app/client secret, Production session table, route, Docker service, systemd, Cloudflare, D1, notification, Project API Key와 B2 resource를 생성하거나 변경하지 않는다. 실제 login/session/RBAC가 구현된 것처럼 current architecture를 바꾸지 않고 README와 Frontend 문서에 미구현 상태를 명시했다. 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않는다.
+
+### 문서 전면 검토와 정적 검증
+
+Tracked Markdown과 새 설계 문서 20개를 함께 검사했다.
+
+```text
+local Markdown link failures=0
+unbalanced fenced code blocks=0
+current-state implementation marker=미구현으로 일치
+git diff --check=PASS
+changed-line credential pattern scan=PASS
+```
+
+전체 기존 문서 credential 정규식 검사는 과거 corrupt failure-state 보존 검증에 기록된 동일 SHA-256 checksum을 탐지했다. 이는 secret이 아니라 test file의 실행 전후 동일성을 증명하는 기존 evidence이며 이번 diff에는 포함되지 않는다. 이를 삭제하거나 새 credential 발견으로 잘못 기록하지 않고 changed-line scan을 별도로 통과시켰다.
+
+새 설계 문서는 기존 Project API Key runbook, Backup/Restore runbook과 Notification retention policy의 책임을 복제하지 않는다. 실제 auth schema와 운영 명령이 생기는 구현 PR에서 `AUTHENTICATION_OPERATIONS_RUNBOOK.md`와 `USER_DATA_RETENTION_POLICY.md`를 추가하도록 checkpoint를 남겼다. 별도 수동 test 설명서는 만들지 않고 acceptance를 tracked test/CI로 구현한다.
+
+PR #10 initial head `e89189b`의 path-filtered GitHub Actions 결과는 다음과 같다.
+
+```text
+Frontend Tests=PASS
+Notification Pipeline notification-outbox=PASS
+Notification Pipeline cloudflare-slack-receiver=PASS
+job log bytes=19,831 / 19,429 / 29,086
+raw Project API Key matches=0
+Slack Webhook URL matches=0
+```
+
+Backend와 Database path는 바뀌지 않아 해당 workflow를 실행 완료로 과장하지 않는다. 첫 log scan command는 0-match `rg`의 exit code 1을 `set -euo pipefail`이 실패로 처리해 결과 출력 전에 종료됐다. 0-match를 명시적으로 정상 처리하도록 수정한 재실행에서 세 job 모두 위 결과를 반환했다.
