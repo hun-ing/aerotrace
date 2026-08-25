@@ -1,6 +1,6 @@
 # AeroTrace Local Runtime Runbook
 
-> 마지막 업데이트: 2026-08-24
+> 마지막 업데이트: 2026-08-25
 > 이 문서의 helper 예시는 Windows PowerShell 기준이다. Linux/macOS Compose quick start와 전체 문서 색인은 [root README](README.md)를 따른다.
 
 ## 1. 실행 모드
@@ -175,6 +175,8 @@ docker compose down -v
 ```
 
 `-v` 옵션은 TimescaleDB 데이터와 Collector Persistent Queue Volume을 삭제할 수 있다.
+
+Named Volume 보존은 host disk 손상, volume 오삭제와 새 서버 이전을 해결하지 않으므로 backup으로 간주하지 않는다. TimescaleDB logical archive 생성, 빈 target restore와 off-host 경계는 [Database Backup/Restore Runbook](DATABASE_BACKUP_RESTORE_RUNBOOK.md)을 따른다.
 
 ## 7. Container 재생성 전후 데이터 보존 확인
 

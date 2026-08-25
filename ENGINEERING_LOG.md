@@ -15659,3 +15659,60 @@ D+4 review=COMPLETE
 ### 안전 경계
 
 Systemd start/stop, sudo, remote deploy, D1 mutation, Queue action, secret 변경과 synthetic notification을 수행하지 않았다. 문서 외 production 상태는 변경하지 않았고 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않는다.
+
+---
+
+## V-7B-4-19 TimescaleDB Backup/Restore Ephemeral Acceptance
+
+### 목적과 공식 기준
+
+Named Volume 보존과 실제 disaster recovery를 분리하기 위해 production DB를 변경하지 않고 full logical archive를 별도 TimescaleDB에 복원한다. TimescaleDB 공식 절차에 따라 `timescaledb_pre_restore()`와 `timescaledb_post_restore()`를 사용하고 catalog 복원에 안전하지 않은 parallel `pg_restore -j`는 금지했다. PostgreSQL custom format, `--exit-on-error`, empty `template0` target과 restore 후 `ANALYZE`를 적용했다.
+
+### 구현
+
+```text
+scripts/database/backup-timescaledb.sh
+scripts/database/restore-timescaledb.sh
+scripts/database/verify-timescaledb-restore.sh
+scripts/database/test-backup-restore.sh
+tests/fixtures/database-backup-restore-fixture.sql
+.github/workflows/database-backup-restore-tests.yml
+DATABASE_BACKUP_RESTORE_RUNBOOK.md
+```
+
+Backup은 container 내부 `POSTGRES_USER`/`POSTGRES_DB`를 사용해 secret command argument를 제거하고 custom archive, source version metadata와 SHA-256을 mode 0600으로 만든다. Restore는 lowercase의 존재하지 않는 DB와 explicit confirmation만 허용하고 source/target PostgreSQL major 및 TimescaleDB version exact match를 확인한다. Existing DB drop/overwrite 기능은 없다.
+
+Verification은 row 원문, ID와 API Key hash를 출력하지 않고 다음 aggregate와 one-way fingerprint만 출력한다.
+
+```text
+required application tables=4
+spans hypertable=1
+columnstore enabled=1
+scheduled columnstore/retention policies=2
+tenant/project/API Key/span counts
+application data fingerprint
+```
+
+### 첫 실행에서 발견한 문제
+
+첫 acceptance는 archive 생성 뒤 restore target 존재 확인 query에서 `psql -c`가 `:'target_database'` variable을 치환하지 않아 SQL syntax error로 중단됐다. Source/target은 `--network none` tmpfs test container였고 trap이 전용 label을 확인한 뒤 모두 제거했다. SQL을 stdin으로 전달하고 identifier validation과 psql variable quoting을 유지하도록 수정했다.
+
+### 최종 local acceptance
+
+같은 pinned image로 분리된 source와 target을 만들고 source에 migration V1~V8, tenant 1, project 1, API Key metadata 1, span 3 fixture를 적용했다. 첫 오류 수정 뒤 safety gate를 단계적으로 추가한 후속 local acceptance는 모두 성공했고, 최종 실행에는 production baseline target 거부까지 포함했다.
+
+```text
+backup_restore_acceptance=PASS
+source_target_summary_match=yes
+existing_target_overwrite_refused=yes
+production_target_container_refused=yes
+invalid_archive_refused_before_target_creation=yes
+version_mismatch_refused_before_target_creation=yes
+metadata_credential_scan=PASS
+```
+
+`pg_dump`는 TimescaleDB internal `continuous_agg` circular foreign-key warning을 출력했다. Full dump를 사용했고 target restore는 `--exit-on-error`로 완료됐으며 hypertable, policy와 application data fingerprint가 source와 일치했으므로 현재 pinned version의 warning을 알려진 evidence로 기록한다.
+
+### 안전 경계
+
+실제 `aerotrace-timescaledb`에서는 information schema와 policy 이름만 읽었다. Production dump, restore, schema/data mutation, container start/stop과 volume 접근은 수행하지 않았다. Acceptance container는 production network·volume·port를 사용하지 않았고 tmpfs에서만 동작했다. Shell syntax와 `git diff --check`는 통과했으며 host에 ShellCheck는 설치되어 있지 않아 그 결과를 PASS로 기록하지 않는다. 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않는다.
