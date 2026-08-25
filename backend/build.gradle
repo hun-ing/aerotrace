@@ -45,3 +45,10 @@ tasks.register('provisionProjectApiKey', JavaExec) {
     classpath = sourceSets.main.runtimeClasspath
     mainClass = 'com.huning.aerotrace.auth.infrastructure.ProjectApiKeyProvisioner'
 }
+
+tasks.register('manageProjectApiKeys', JavaExec) {
+    group = 'application'
+    description = 'List, issue, or revoke Project API Keys from environment variables.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.huning.aerotrace.auth.infrastructure.ProjectApiKeyLifecycleOperator'
+}

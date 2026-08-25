@@ -1,9 +1,9 @@
 # AeroTrace 프로젝트 컨텍스트
 
 > 마지막 업데이트: 2026-08-25
-> 현재 상태: Slack + Cloudflare Worker/D1/Queue notification production 활성, HMAC sender와 독립 email health fallback 운영
-> 현재 Phase: Phase 9 — notification production 활성화 완료 및 초기 운영 관찰
-> 다음 작업: D+5~D+7 notification review를 병행하면서 production-sized backup 시간·용량과 off-host 보관 위치를 확정하고, 이후 Project API Key lifecycle을 구현한다.
+> 현재 상태: Notification production 운영과 Project API Key operator lifecycle 검증 완료, off-host backup 실전 적용은 사용자 data 수집 전까지 보류
+> 현재 Phase: Phase 9 — self-hosted MVP 운영 안정화와 credential lifecycle
+> 다음 작업: D+5~D+7 notification review를 병행하면서 사용자 인증·onboarding 경계를 설계한다. Production-sized/off-host backup은 실제 사용자 data 수집 전 필수 checkpoint다.
 
 이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
 
@@ -23,7 +23,12 @@ PR #2 repository entry docs=merged, 1e837e8
 PR #3 Frontend dependency/CI=merged, 6882fb0
 PR #4 Project API Key task/Backend CI=merged, f737d3a
 PR #5 Project API Key provisioning E2E=merged, 6bf376f
-post-provisioning integration baseline=6bf376f
+PR #6 operations documentation review=merged, 73eb0fe
+PR #7 notification D+4 review=merged, bfd5dfe
+PR #8 TimescaleDB backup/restore acceptance=merged, 45909f4
+Project API Key lifecycle implementation base=45909f4
+PR #9 Project API Key lifecycle initial implementation=validated, 77b85ed
+PR #9 initial Backend/Frontend/Notification CI=PASS
 Backend main push run #7=PASS
 Project API Key main job log raw credential matches=0
 ```
@@ -139,7 +144,7 @@ npm run db:migrate:local
 
 현재 Node test 17개, Wrangler 4.125.0 bundle dry-run과 fresh local D1 migration이 통과했다. GitHub Actions에는 Python 3.10 sender job과 Node.js 22 receiver job이 포함된다.
 
-Repository CI는 notification sender/receiver, Frontend와 Backend를 각각 독립 workflow로 검증한다. Frontend workflow는 Node.js 22에서 clean install, high severity dependency audit, lint와 production build를 수행한다. Backend workflow는 Java 21과 ephemeral TimescaleDB에서 전체 test와 Project API Key provisioning acceptance를 수행한다.
+Repository CI는 notification sender/receiver, Frontend와 Backend를 각각 독립 workflow로 검증한다. Frontend workflow는 Node.js 22에서 clean install, high severity dependency audit, lint와 production build를 수행한다. Backend workflow는 Java 21과 ephemeral TimescaleDB에서 전체 test와 Project API Key provisioning/lifecycle acceptance를 수행한다.
 
 최초 Project API Key bootstrap은 자동 startup이나 Compose hook이 아니라 운영자가 명시적으로 실행하는 Gradle task다.
 
@@ -153,6 +158,22 @@ CI acceptance=ephemeral TimescaleDB 첫 발급 + duplicate 거부 PASS
 ```
 
 실행 순서는 root `README.md`에 있으며 원문 Key는 Collector와 Frontend의 local secret file에만 저장한다. Production tenant/project/key는 이번 CI 검증에서 생성하거나 변경하지 않았다.
+
+기존 project의 credential lifecycle은 `manageProjectApiKeys` Gradle task와 `PROJECT_API_KEY_RUNBOOK.md`로 관리한다.
+
+```text
+actions=list | issue | revoke
+issue target=existing tenant/project only
+rotation=새 Key 발급 -> 두 client 반영 -> ingest/query 검증 -> 이전 Key 폐기
+serialization=project row lock + API Key row lock
+last active revoke=default refusal, emergency explicit override only
+repeated revoke=ALREADY_REVOKED
+list output=원문/key_id/hash 제외, name은 Base64URL
+schema migration=없음, V5 expires_at/revoked_at 재사용
+production mutation=수행하지 않음
+```
+
+격리 Java 21과 tmpfs TimescaleDB에서 Backend 전체 test와 발급·조회·마지막 Key 보호·existing-project replacement·폐기·반복 폐기 acceptance를 수행한다. 실제 production tenant/project/Key와 secret file은 변경하지 않는다.
 
 현재 서버에 설치된 production runtime은 Webhook 기준선이다.
 
@@ -175,7 +196,7 @@ Activation acceptance에서는 isolated synthetic 한 건과 controlled producti
 
 2026-08-25 D+4 review에서도 두 timer와 최근 sender service가 정상이고 pending/failure가 0이었다. Direct Worker `/health`는 HTTP 200과 zero failure aggregate를 반환했고 운영자가 UptimeRobot의 현재 `Up` 및 `/health` URL suffix를 확인했다. Production SLI 대상 event는 여전히 0이므로 Boundary A와 B는 `NO_DATA`다. 전체 D1은 activation row 2개가 모두 `delivered`, permanent/exhausted failure와 unredacted delivered payload는 0이며 두 aggregate SELECT 모두 row를 쓰지 않았다. 첫 remote SLI query의 transient API `7403`은 동일 session 재시도에서 성공했고 receiver 장애로 분류하지 않았다.
 
-TimescaleDB logical backup/restore 도구는 production과 분리된 `2.28.3-pg15` tmpfs container 두 개에서 검증했다. Full migration과 fixture를 custom-format archive로 만들고 새 빈 DB에 TimescaleDB 공식 pre/post restore 순서로 복원한 뒤 hypertable, columnstore, 두 policy, row count와 application data fingerprint가 일치했다. Existing target overwrite, corrupted archive와 version mismatch는 target DB 생성 전에 거부한다. Production DB backup, production-sized restore와 off-host copy는 아직 실행하지 않았으므로 재해복구 완료로 표현하지 않는다.
+TimescaleDB logical backup/restore 도구는 production과 분리된 `2.28.3-pg15` tmpfs container 두 개에서 검증했다. Full migration과 fixture를 custom-format archive로 만들고 새 빈 DB에 TimescaleDB 공식 pre/post restore 순서로 복원한 뒤 hypertable, columnstore, 두 policy, row count와 application data fingerprint가 일치했다. Existing target overwrite, corrupted archive와 version mismatch는 target DB 생성 전에 거부한다. Production DB read-only size는 약 1.35 GB이며 Backblaze B2 US West private bucket, provider-side encryption과 Object Lock까지 준비했지만 bucket은 비어 있다. B2 application key, client-side `age` key, production dump/upload/download/restore는 실제 사용자 data 수집 전까지 보류했으므로 재해복구 완료로 표현하지 않는다.
 
 ---
 
@@ -732,7 +753,7 @@ Fingerprint에는 Tenant, Project, 기간, Service, Error, Minimum Duration이 �
 현재 보안 한계:
 
 - 사용자 로그인 / 세션 없음
-- 서버당 하나의 Project API Key
+- Collector와 Frontend가 같은 runtime Project API Key를 사용하며 rotation 중에만 기존·신규 Key가 겹침
 - 사용자별 Project 선택 없음
 - Frontend 접근자는 설정된 Project 데이터를 조회 가능
 

@@ -1,8 +1,8 @@
 # AeroTrace Career Log
 
 > 마지막 업데이트: 2026-08-25
-> 현재 Portfolio 단계: 수집·저장·조회 MVP, notification production 운영과 TimescaleDB 격리 backup/restore acceptance
-> 다음 Checkpoint: notification D+5~D+7 review와 production-sized backup/off-host 보관 검증
+> 현재 Portfolio 단계: 수집·저장·조회 MVP, notification production 운영, TimescaleDB 격리 restore와 Project API Key operator lifecycle acceptance
+> 다음 Checkpoint: notification D+5~D+7 review와 사용자 인증·onboarding 설계. Production-sized/off-host backup은 사용자 data 수집 전 필수 checkpoint
 
 이 문서는 checkpoint를 시간순으로 누적한다. 과거 항목의 `현재`와 `다음 검증`은 당시 상태이며 마지막 checkpoint가 최신 범위다.
 
@@ -5627,3 +5627,48 @@ committed RPO/RTO와 point-in-time recovery는 아직 없음
 - 기존 DB를 덮어쓰지 않고 새 target에 복원하면 어떤 안전성이 생기는가?
 - Row 원문을 로그에 노출하지 않고 source/target data 일치를 어떻게 확인했는가?
 - Logical backup이 커졌을 때 어떤 조건에서 physical backup과 WAL archiving을 검토할 것인가?
+
+---
+
+## Portfolio Checkpoint — Project API Key Operator Lifecycle
+
+### 실제로 완료한 것
+
+```text
+기존 tenant/project 전용 Key metadata list와 replacement issue
+Project row lock 기반 issue/revoke 직렬화
+last-active revoke 기본 거부와 긴급 explicit override
+row UUID + exact name + REVOKE 확인을 요구하는 logical revoke
+반복 revoke의 ALREADY_REVOKED 멱등 처리
+원문/key_id/hash를 제외한 Base64URL-safe metadata output
+Java 21 + tmpfs TimescaleDB Backend 82/82와 lifecycle E2E acceptance
+```
+
+최초 bootstrap provisioner는 tenant/project를 만들 수 있지만 rotation operator의 `issue`는 기존 slug가 없으면 실패하도록 권한 경계를 분리했다. 새 Key를 Collector와 Frontend에 배포해 ingest/query를 검증한 뒤 이전 Key를 폐기하는 overlap 절차를 runbook으로 고정했고, 실제 production credential은 변경하지 않았다.
+
+### 이력서 성과 문장 초안
+
+> Hash-only Project API Key의 existing-project 발급·조회·폐기 lifecycle을 구현하고, project 단위 잠금·last-active 보호·멱등 폐기와 credential-safe CLI 출력을 ephemeral TimescaleDB E2E 및 CI로 검증
+
+짧은 버전:
+
+> Project API Key 무중단 rotation과 긴급 폐기를 위한 operator lifecycle 및 안전장치를 구현하고 자동 회귀 검증으로 고정
+
+### 과장하지 않을 범위
+
+```text
+production Key rotation은 아직 수행하지 않음
+사용자 self-service UI, login/session과 RBAC는 없음
+expiry alert와 scheduled rotation은 없음
+managed secret store와 자동 client rollout은 없음
+다중 운영자 approval/audit 체계는 없음
+```
+
+### 예상 면접 질문
+
+- Bootstrap 발급과 rotation 발급을 분리한 이유는 무엇인가?
+- 원문 Key를 저장하지 않으면서 어떻게 목록과 폐기 대상을 식별하는가?
+- 새 Key 발급과 이전 Key 폐기를 직렬화해야 하는 이유는 무엇인가?
+- 마지막 활성 Key 폐기를 기본 거부하면서 긴급 override를 둔 이유는 무엇인가?
+- Key 이름을 raw text가 아니라 Base64URL로 출력한 이유는 무엇인가?
+- DB schema migration 없이 lifecycle을 구현할 수 있었던 이유는 무엇인가?

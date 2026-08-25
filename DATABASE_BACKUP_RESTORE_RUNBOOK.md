@@ -1,7 +1,7 @@
 # AeroTrace Database Backup and Restore Runbook
 
 > 마지막 업데이트: 2026-08-25
-> 상태: Ephemeral full-database backup/restore acceptance 완료, production-sized/off-host rehearsal 전
+> 상태: Ephemeral full-database backup/restore acceptance 완료, production-sized/off-host upload·restore rehearsal 보류
 > 범위: Self-hosted TimescaleDB `2.28.3-pg15`의 AeroTrace application database
 
 ## 1. 목적
@@ -227,7 +227,7 @@ Restore 도중 실패하면 partial target DB를 자동 삭제하지 않는다. 
 - 정기 checksum 확인과 restore rehearsal
 - Trace retention·incident hold에 맞는 backup 만료
 
-Off-host provider와 암호화 key custody는 아직 선택하지 않았다. 무료 여부만으로 결정하지 않고 deletion isolation, restore 속도, egress와 key 분실 위험을 함께 검토한다.
+Backblaze B2의 US West private bucket은 준비했고 provider-side encryption과 Object Lock을 활성화했지만 bucket은 현재 비어 있다. 현재 lifecycle은 모든 version 보존이므로 실제 upload 전에 보존 기간, Object Lock mode/기간과 장기 비용을 확정해야 한다. B2 application key, client-side `age` key custody, upload/download와 restore rehearsal은 실제 사용자 data 수집 전 checkpoint로 보류했다. 현재 상태를 off-host backup 완료로 보지 않는다. 정확한 bucket identifier와 credential은 public 문서에 기록하지 않는다.
 
 ## 11. RPO와 RTO 상태
 

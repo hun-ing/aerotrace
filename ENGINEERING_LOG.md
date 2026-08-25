@@ -15716,3 +15716,71 @@ metadata_credential_scan=PASS
 ### 안전 경계
 
 실제 `aerotrace-timescaledb`에서는 information schema와 policy 이름만 읽었다. Production dump, restore, schema/data mutation, container start/stop과 volume 접근은 수행하지 않았다. Acceptance container는 production network·volume·port를 사용하지 않았고 tmpfs에서만 동작했다. Shell syntax와 `git diff --check`는 통과했으며 host에 ShellCheck는 설치되어 있지 않아 그 결과를 PASS로 기록하지 않는다. 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않는다.
+
+---
+
+## V-7B-4-20 Project API Key Operator Lifecycle
+
+### 목적
+
+원문을 복구할 수 없는 Project API Key의 목록·replacement·폐기 경로를 만들고, Collector와 Frontend가 기존 Key에서 새 Key로 겹쳐 사용하는 무중단 rotation 절차를 고정한다. 최초 bootstrap provisioner가 slug 오타에서 새 tenant/project를 만들 수 있으므로 rotation 발급과 bootstrap을 분리한다.
+
+### 구현
+
+```text
+ProjectApiKeyLifecycleService
+ProjectApiKeyLifecycleIssueService
+ProjectApiKeyLifecycleStore
+JdbcProjectApiKeyLifecycleStore
+ProjectApiKeyLifecycleOperator
+manageProjectApiKeys Gradle task
+ProjectApiKeyLifecycleServiceTest
+ProjectApiKeyLifecycleIssueServiceTest
+PROJECT_API_KEY_RUNBOOK.md
+Backend CI lifecycle acceptance
+```
+
+`list`는 row UUID, Base64URL name, created/expires/revoked timestamp와 `ACTIVE|EXPIRED|REVOKED`만 반환한다. SQL projection에 raw Key, `key_id`와 `secret_hash`가 없다. `issue`는 기존 tenant/project resolver를 통과해야 하며 새 tenant/project를 생성하지 않는다. Project row lock 뒤 같은 이름의 active Key를 검사하고 기존 issue service를 같은 transaction에서 호출한다.
+
+`revoke`는 project와 Key row를 잠근 transaction에서 정확한 row UUID와 expected name을 확인한다. 마지막 active Key는 기본 거부하고 긴급 override만 허용한다. 이미 폐기된 row는 update 없이 `ALREADY_REVOKED`를 반환한다. 기존 V5 timestamp column으로 충분해 migration은 추가하지 않았다.
+
+### 검증
+
+Host에는 Java가 없어 첫 Docker Java 21 전체 test는 DB 없이 실행했다. 새 코드 compile은 성공했고 79개 중 DB context가 필요한 기존 10개만 `localhost:5432` connection failure로 실패했으며 나머지 69개는 통과했다. 이 실행을 전체 PASS로 기록하지 않는다.
+
+이후 production과 분리된 전용 Docker network, tmpfs TimescaleDB `2.28.3-pg15`와 Java 21 container를 사용했다.
+
+```text
+Backend full test with ephemeral TimescaleDB=PASS, 79/79 at first lifecycle revision
+Project lifecycle unit tests after existing-project issue lock=PASS, 11/11
+Backend final full test after shared project-lock issuance=PASS, 82/82
+initial list=ACTIVE 1
+last active revoke refusal=PASS
+existing-project replacement issue=PASS
+old key revoke=REVOKED, active_after=1
+repeated old key revoke=ALREADY_REVOKED
+final inventory=ACTIVE 1 / REVOKED 1
+lifecycle output atr_/secret_hash/provisioned key_id matches=0
+project_api_key_lifecycle_acceptance=PASS
+project_api_key_lifecycle_final_acceptance=PASS
+```
+
+테스트 컨테이너는 port, production volume과 production network를 사용하지 않았다. 종료 전 label, tmpfs와 network 연결을 확인했고 tmpfs DB container와 빈 전용 network만 제거했다.
+
+PR #9 initial head `77b85ed`의 GitHub Actions 결과는 다음과 같다.
+
+```text
+Backend Tests run #8=PASS
+Frontend Tests run #3=PASS
+Notification Pipeline Tests run #20=PASS
+Backend job log bytes=60,420
+raw API Key matches=0
+lookup key_id matches=0
+API Key row UUID output matches=0
+```
+
+Backend job은 전체 test 다음에 ephemeral TimescaleDB의 bootstrap, missing-project issue 거부, last-active 보호, existing-project replacement, revoke와 repeated revoke acceptance까지 완료했다. Credential을 담은 mode 0600 임시 파일은 trap으로 제거했고 log나 artifact에 업로드하지 않았다.
+
+### 운영·문서 경계
+
+Production tenant/project/Key, secret file, Docker service와 systemd는 변경하지 않았다. Backblaze B2는 provider/빈 private bucket 준비까지만 current state로 기록하고 application key, client-side encryption key와 실제 backup transfer는 사용자 data 수집 전 checkpoint로 보류한다. 기존 untracked PostgreSQL 분석 script 세 개는 수정하거나 stage하지 않는다.

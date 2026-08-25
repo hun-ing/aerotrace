@@ -8,6 +8,7 @@ AeroTrace는 OpenTelemetry trace를 수집·저장·조회하고 운영 알림�
 
 - OTLP/gRPC·OTLP/HTTP 수신과 OpenTelemetry Collector persistent queue
 - JSON OTLP trace ingest, Project API Key 인증과 tenant/project 격리
+- 기존 project 전용 Project API Key 조회·replacement·폐기 operator lifecycle
 - TimescaleDB 저장, Flyway migration, JDBC batch insert와 중복 억제
 - 시간·service·error·최소 duration filter와 cursor 기반 trace 조회
 - Next.js BFF를 통한 trace 목록과 span timeline UI
@@ -126,6 +127,8 @@ Java 21이 설치된 host에서 `.env`와 같은 DB 이름·사용자를 입력�
 
 출력의 `AEROTRACE_PROVISIONED_API_KEY` 원문을 즉시 `otel-collector.env`와 `frontend.env`의 `AEROTRACE_API_KEY`에 각각 저장한다. 다른 출력 ID는 진단용 metadata이며 Key 원문을 별도 문서나 shell history에 복사하지 않는다. 같은 tenant/project slug는 같은 이름일 때 재사용하지만, 같은 이름의 활성 API Key가 있으면 중복 발급하지 않고 실패한다.
 
+기존 project의 Key 목록, 무중단 replacement 발급, 이전 Key 폐기와 긴급 폐기는 [Project API Key Lifecycle Runbook](PROJECT_API_KEY_RUNBOOK.md)을 따른다. Rotation용 `manageProjectApiKeys`는 기존 tenant/project만 허용하며 새 tenant/project를 만들지 않는다.
+
 ### 3. 구성 검사와 시작
 
 ```bash
@@ -229,7 +232,9 @@ npm run db:migrate:local
 | [Project Context](AEROTRACE_CONTEXT.md) | 현재 단계, architecture와 다음 작업 |
 | [Decisions](DECISIONS.md) | 채택한 기술·운영 결정과 trade-off |
 | [Engineering Log](ENGINEERING_LOG.md) | 구현·실험·검증 evidence |
+| [Career Log](CAREER_LOG.md) | 검증된 성과와 과장하지 않을 범위 |
 | [Local Runbook](LOCAL_RUNBOOK.md) | 로컬/통합 runtime과 데이터 보존 |
+| [Project API Key Lifecycle Runbook](PROJECT_API_KEY_RUNBOOK.md) | 기존 project의 Key 조회, 교체, 폐기와 침해 대응 |
 | [Database Backup/Restore Runbook](DATABASE_BACKUP_RESTORE_RUNBOOK.md) | TimescaleDB backup, 빈 target 복원과 DR 경계 |
 | [Webhook Receiver Contract](WEBHOOK_RECEIVER_CONTRACT.md) | Payload, HMAC, HTTP, dedup 계약 |
 | [Notification SLO](NOTIFICATION_SLO.md) | Delivery 경계, threshold와 error budget |
@@ -243,7 +248,7 @@ npm run db:migrate:local
 ## 알려진 제한
 
 - Frontend는 server-side Project API Key 하나를 사용하며 사용자 로그인·세션이 없다.
-- Project/API Key self-service onboarding과 rotation UI가 없다.
+- Project/API Key self-service onboarding, rotation UI와 expiry alert가 없으며 lifecycle은 operator task로 수행한다.
 - 기본 Compose는 개발 편의를 위해 서비스 port를 host에 게시하므로 firewall, TLS와 접근 제어 없이 public network에 배포하면 안 된다.
 - Slack delivery는 at-least-once이며 provider timeout에서 사용자-visible duplicate가 가능하다.
 - Notification 운영은 단일 owner 구조이며 24x7 SLA가 아니다.
