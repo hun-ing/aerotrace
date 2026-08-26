@@ -1,6 +1,6 @@
 # Security Policy
 
-> Last updated: 2026-08-24
+> Last updated: 2026-08-26
 
 ## Supported versions
 
@@ -37,7 +37,7 @@ Reports involving an actively exposed secret, unauthorized access, or ongoing da
 ## In scope
 
 - Authentication or tenant isolation bypass
-- Exposure of project API keys, HMAC secrets, Slack Webhook URLs, database credentials, telemetry payloads, or notification checker output
+- Exposure of Project API Keys, onboarding invite tokens, OAuth/session credentials, HMAC secrets, Slack Webhook URLs, database credentials, telemetry payloads, or notification checker output
 - Notification signature bypass, replay-window bypass, or event conflict overwrite
 - Unauthorized D1/Queue mutation or receiver requeue
 - Remote code execution, SQL injection, SSRF, path traversal, or unsafe file handling
@@ -56,6 +56,6 @@ Reports involving an actively exposed secret, unauthorized access, or ongoing da
 - Use synthetic data and isolated environments whenever possible.
 - Do not test against another tenant, Slack workspace, Cloudflare account, or production endpoint without explicit authorization.
 - Stop testing if it risks data loss, duplicate production notifications, or service disruption.
-- Retain evidence only as long as required by [the data retention policy](DATA_RETENTION_POLICY.md).
+- Retain evidence only as long as required by the [Notification Data Retention Policy](DATA_RETENTION_POLICY.md) and [User Data Retention Policy](USER_DATA_RETENTION_POLICY.md).
 
 Good-faith research that follows this policy, avoids privacy violations and service disruption, and gives the maintainer a reasonable remediation period will not be intentionally pursued as abuse by the project owner.

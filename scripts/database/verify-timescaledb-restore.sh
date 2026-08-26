@@ -85,7 +85,14 @@ WITH application_tables AS (
         (to_regclass('public.tenants')),
         (to_regclass('public.projects')),
         (to_regclass('public.project_api_keys')),
-        (to_regclass('public.spans'))
+        (to_regclass('public.spans')),
+        (to_regclass('public.app_users')),
+        (to_regclass('public.user_identities')),
+        (to_regclass('public.tenant_memberships')),
+        (to_regclass('public.onboarding_invites')),
+        (to_regclass('public.security_audit_events')),
+        (to_regclass('public.aerotrace_session')),
+        (to_regclass('public.aerotrace_session_attributes'))
     ) AS required(table_oid)
     WHERE table_oid IS NOT NULL
 ),
@@ -125,8 +132,8 @@ IFS='|' read -r \
     spans_scheduled_policy_count \
     <<<"${summary}"
 
-[[ "${required_table_count}" == "4" ]] ||
-    fail "Expected four AeroTrace application tables; found ${required_table_count}."
+[[ "${required_table_count}" == "11" ]] ||
+    fail "Expected eleven AeroTrace application tables; found ${required_table_count}."
 [[ "${spans_hypertable_count}" == "1" ]] ||
     fail "public.spans is not a TimescaleDB hypertable."
 [[ "${spans_compression_enabled_count}" == "1" ]] ||
@@ -151,6 +158,13 @@ SELECT
     (SELECT COUNT(*) FROM public.projects),
     (SELECT COUNT(*) FROM public.project_api_keys),
     (SELECT COUNT(*) FROM public.spans),
+    (SELECT COUNT(*) FROM public.app_users),
+    (SELECT COUNT(*) FROM public.user_identities),
+    (SELECT COUNT(*) FROM public.tenant_memberships),
+    (SELECT COUNT(*) FROM public.onboarding_invites),
+    (SELECT COUNT(*) FROM public.security_audit_events),
+    (SELECT COUNT(*) FROM public.aerotrace_session),
+    (SELECT COUNT(*) FROM public.aerotrace_session_attributes),
     md5(
         COALESCE(
             (SELECT jsonb_agg(to_jsonb(t) ORDER BY id)::TEXT FROM public.tenants t),
@@ -181,6 +195,55 @@ SELECT
                 FROM public.spans s
             ),
             '[]'
+        ) ||
+        COALESCE(
+            (SELECT jsonb_agg(to_jsonb(u) ORDER BY id)::TEXT FROM public.app_users u),
+            '[]'
+        ) ||
+        COALESCE(
+            (
+                SELECT jsonb_agg(to_jsonb(i) ORDER BY id)::TEXT
+                FROM public.user_identities i
+            ),
+            '[]'
+        ) ||
+        COALESCE(
+            (
+                SELECT jsonb_agg(to_jsonb(m) ORDER BY tenant_id, user_id)::TEXT
+                FROM public.tenant_memberships m
+            ),
+            '[]'
+        ) ||
+        COALESCE(
+            (
+                SELECT jsonb_agg(to_jsonb(i) ORDER BY id)::TEXT
+                FROM public.onboarding_invites i
+            ),
+            '[]'
+        ) ||
+        COALESCE(
+            (
+                SELECT jsonb_agg(to_jsonb(a) ORDER BY id)::TEXT
+                FROM public.security_audit_events a
+            ),
+            '[]'
+        ) ||
+        COALESCE(
+            (
+                SELECT jsonb_agg(to_jsonb(s) ORDER BY primary_id)::TEXT
+                FROM public.aerotrace_session s
+            ),
+            '[]'
+        ) ||
+        COALESCE(
+            (
+                SELECT jsonb_agg(
+                    to_jsonb(a)
+                    ORDER BY session_primary_id, attribute_name
+                )::TEXT
+                FROM public.aerotrace_session_attributes a
+            ),
+            '[]'
         )
     )
 ;
@@ -192,6 +255,13 @@ IFS='|' read -r \
     project_count \
     project_api_key_count \
     span_count \
+    app_user_count \
+    user_identity_count \
+    tenant_membership_count \
+    onboarding_invite_count \
+    security_audit_event_count \
+    session_count \
+    session_attribute_count \
     application_data_fingerprint \
     <<<"${data_summary}"
 
@@ -206,4 +276,11 @@ echo "tenant_count=${tenant_count}"
 echo "project_count=${project_count}"
 echo "project_api_key_count=${project_api_key_count}"
 echo "span_count=${span_count}"
+echo "app_user_count=${app_user_count}"
+echo "user_identity_count=${user_identity_count}"
+echo "tenant_membership_count=${tenant_membership_count}"
+echo "onboarding_invite_count=${onboarding_invite_count}"
+echo "security_audit_event_count=${security_audit_event_count}"
+echo "session_count=${session_count}"
+echo "session_attribute_count=${session_attribute_count}"
 echo "application_data_fingerprint=${application_data_fingerprint}"

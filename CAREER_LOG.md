@@ -5672,3 +5672,52 @@ managed secret store와 자동 client rollout은 없음
 - 마지막 활성 Key 폐기를 기본 거부하면서 긴급 override를 둔 이유는 무엇인가?
 - Key 이름을 raw text가 아니라 Base64URL로 출력한 이유는 무엇인가?
 - DB schema migration 없이 lifecycle을 구현할 수 있었던 이유는 무엇인가?
+
+---
+
+## Portfolio Checkpoint — User Authentication Phase A Foundation
+
+### 실제로 완료한 것
+
+```text
+Flyway V9 user/identity/membership/invite/audit/JDBC session schema
+active user + membership + project tenant join authorization
+OWNER/ADMIN/VIEWER exhaustive default-deny permission matrix
+256-bit hash-only first-owner bootstrap invite issue/revoke operator
+same-invite concurrent consume exactly-one 보장
+tenant row lock 기반 last active OWNER 보호
+auth/session fixture를 포함한 11-table backup/restore fingerprint
+Java 21 + tmpfs TimescaleDB Backend 98/98
+```
+
+사람의 로그인과 Collector Project API Key를 분리하는 설계에서 첫 구현 단계만 완료했다. URL의 tenant/project ID를 신뢰하지 않고 active user, active membership과 project 소속을 한 authorization query에서 확인한다. 관계가 없으면 resource 존재를 숨기는 `NOT_FOUND`, role 부족은 `FORBIDDEN`, explicit permission matrix가 허용할 때만 `ALLOWED`를 반환한다.
+
+Bootstrap invite 원문은 32-byte CSPRNG로 생성해 한 번만 표시하고 DB에는 SHA-256만 저장한다. Invite와 tenant row lock을 사용해 동일 token 동시 consume에서 정확히 한 membership만 생성하고, 두 OWNER가 동시에 강등을 시도해도 한 OWNER를 보존했다. Production OAuth app, session runtime과 user data는 만들지 않았다.
+
+### 이력서 성과 문장 초안
+
+> GitHub OAuth 기반 SaaS 인증의 Phase A로 user·identity·tenant membership·hash-only invite·audit·JDBC session schema와 default-deny authorization을 구현하고, invite/last-owner 동시성 불변식을 ephemeral PostgreSQL E2E 및 full backup/restore acceptance로 검증
+
+짧은 버전:
+
+> Multi-tenant 사용자 인증 기반의 default-deny RBAC, single-use invite와 last-owner 동시성 보호를 구현하고 격리 DB 테스트로 검증
+
+### 과장하지 않을 범위
+
+```text
+GitHub OAuth authorization/callback은 아직 없음
+Spring Security와 Spring Session runtime은 아직 연결하지 않음
+Browser login/logout, CSRF/cookie와 Frontend 전환은 아직 없음
+Production V9 migration과 사용자 data 수집은 수행하지 않음
+자동 retention purge와 account export/delete는 아직 없음
+Public self-signup, quota와 abuse protection은 없음
+```
+
+### 예상 면접 질문
+
+- Project API Key와 사람의 session 인증을 분리한 이유는 무엇인가?
+- Cross-tenant resource를 `403`이 아니라 `404` 성격의 `NOT_FOUND`로 숨기는 이유는 무엇인가?
+- Role enum과 exhaustive permission switch가 default-deny에 어떤 도움을 주는가?
+- Invite 원문 대신 hash만 저장하면 어떤 공격 범위를 줄일 수 있는가?
+- 동일 invite consume와 두 OWNER 동시 demotion을 어떤 lock 순서로 직렬화했는가?
+- Session table을 backup에 포함하면서 실제 DR activation에서는 왜 모두 삭제하는가?

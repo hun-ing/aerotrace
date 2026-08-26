@@ -52,3 +52,17 @@ tasks.register('manageProjectApiKeys', JavaExec) {
     classpath = sourceSets.main.runtimeClasspath
     mainClass = 'com.huning.aerotrace.auth.infrastructure.ProjectApiKeyLifecycleOperator'
 }
+
+tasks.register('issueBootstrapInvite', JavaExec) {
+    group = 'application'
+    description = 'Issue a one-time OWNER bootstrap invite for an existing tenant.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.huning.aerotrace.auth.infrastructure.BootstrapInviteOperator'
+}
+
+tasks.register('revokeBootstrapInvite', JavaExec) {
+    group = 'application'
+    description = 'Revoke an unused operator bootstrap invite by row UUID.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.huning.aerotrace.auth.infrastructure.BootstrapInviteRevocationOperator'
+}
