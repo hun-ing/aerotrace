@@ -15885,3 +15885,75 @@ Slack Webhook URL matches=0
 ```
 
 Backend와 Database path는 바뀌지 않아 해당 workflow를 실행 완료로 과장하지 않는다. 첫 log scan command는 0-match `rg`의 exit code 1을 `set -euo pipefail`이 실패로 처리해 결과 출력 전에 종료됐다. 0-match를 명시적으로 정상 처리하도록 수정한 재실행에서 세 job 모두 위 결과를 반환했다.
+
+---
+
+## V-7B-4-22 Notification D+5 운영 점검
+
+### 범위와 시각
+
+2026-08-26 10:57 KST부터 production notification host, sender Boundary A, receiver Boundary B, D1 data hygiene와 독립 monitor를 읽기 전용으로 점검했다. Secret, Worker endpoint, account ID, exact event ID와 payload는 문서에 기록하지 않았다.
+
+### Host와 Sender Boundary A
+
+```text
+collector alert timer=active
+notification timer=active
+두 timer next run=present
+latest service Result=success
+latest service ExecMainCode=exited (numeric 1)
+latest service ExecMainStatus=0
+installed Webhook unit matches repository=yes
+pending_events=0
+pending_bytes=0
+active_failure=false
+failure_count=0
+sender SLI status=NO_DATA
+eligible_events=0
+accepted_events=0
+pending_with_receipt=0
+clock_anomaly_events=0
+```
+
+`ExecMainCode=1`은 systemd의 `exited` 분류이고 실제 process exit status는 `ExecMainStatus=0`이다. Eligible production event가 없으므로 `NO_DATA`를 PASS 또는 100% compliance로 표현하지 않는다.
+
+### Receiver Boundary B와 D1
+
+Tracked `npm run sli:remote` wrapper와 별도 aggregate SELECT는 다음을 확인했다.
+
+```text
+receiver_claim_rows=0
+durably_accepted_events=0
+missing_queue_durable_evidence=0
+missing_enqueued_at=0
+delivered_events=0
+failed_permanent_events=0
+failed_exhausted_events=0
+clock_anomaly_events=0
+slack_delivery_compliance_percent=N/A
+total D1 rows=2
+delivered D1 rows=2
+unredacted delivered rows=0
+database size bytes=36864
+changed_db=false
+rows_written=0
+```
+
+첫 remote SLI call은 Cloudflare API code `7403`으로 SQL 실행 전에 거부됐다. 같은 session의 Wrangler OAuth login, D1 permission, D1 목록 접근과 대상 database 존재를 읽기 전용으로 확인하고 동일 tracked wrapper를 정확히 한 번 재시도해 성공했다. Endpoint, credential, config와 resource는 변경하지 않았으며 성공 query와 data hygiene aggregate 모두 row를 쓰지 않았다. 단발성 오류 뒤 즉시 복구되고 D1 failure aggregate도 0이므로 receiver incident로 분류하지 않는다.
+
+### Health와 판정
+
+Normal user가 root 전용 `/etc/aerotrace/notification.env`를 읽을 수 없는 경계를 우회하지 않았고 shell history에서도 endpoint를 복구하지 않았다. 따라서 direct `/health` 응답은 오늘 별도로 capture하지 않았다. 운영자가 UptimeRobot의 현재 상태가 `Up`임을 확인했다.
+
+```text
+host pipeline=OK
+receiver durable state=OK
+production SLI=NO_DATA
+known incident=none
+UptimeRobot current Up=operator confirmed
+D+5 review=COMPLETE
+```
+
+### 안전 경계
+
+Systemd start/stop, sudo, remote deploy, D1 mutation, Queue action, secret 변경과 synthetic notification을 수행하지 않았다. 문서 외 production 상태는 변경하지 않았고 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않는다.
