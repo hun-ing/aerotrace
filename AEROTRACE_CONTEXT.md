@@ -3,7 +3,7 @@
 > 마지막 업데이트: 2026-08-26
 > 현재 상태: Notification 운영·Project API Key lifecycle 검증 완료, 인증 Phase A schema·authorization·bootstrap 기반 구현, 실제 OAuth/login/session route와 Frontend 전환은 미구현
 > 현재 Phase: Phase 9 — 공개 MVP 사용자 인증 Phase B 준비
-> 다음 작업: Phase A PR/CI 통합 후 GitHub OAuth + JDBC session Phase B를 시작하고 D+6~D+7 notification review를 병행한다. Production-sized/off-host backup은 실제 사용자 data 수집 전 필수 checkpoint다.
+> 다음 작업: GitHub OAuth + JDBC session Phase B를 시작하고 D+6~D+7 notification review를 병행한다. Production-sized/off-host backup은 실제 사용자 data 수집 전 필수 checkpoint다.
 
 이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
 
@@ -35,6 +35,9 @@ PR #10 authentication/onboarding design initial head=e89189b
 PR #10 Frontend/Notification CI=PASS
 PR #10 job logs raw API Key/Slack Webhook matches=0
 PR #11 notification D+5 review=merged, 79e751b
+PR #12 authentication Phase A validated head=aff4161
+PR #12 Backend/Frontend/Backup-Restore/Notification CI=PASS
+PR #12 Backend job raw invite/API Key/Slack/GitHub token matches=0
 ```
 
 Slack receiver와 후속 문서·자동 검증 범위:
