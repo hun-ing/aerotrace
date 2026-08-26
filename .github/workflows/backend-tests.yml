@@ -326,8 +326,11 @@ jobs:
             "$invite_file"
 
           if grep -Eiq \
-            'token_hash|secret_hash|https?://' \
-            "$invite_file"; then
+            'token_hash|secret_hash' \
+            "$invite_file" || \
+            grep -E '^AEROTRACE_BOOTSTRAP_' \
+              "$invite_file" | \
+              grep -Eiq 'https?://'; then
             echo 'bootstrap output exposed stored hash or URL material' >&2
             exit 1
           fi
@@ -374,8 +377,11 @@ jobs:
             "$revoke_file"
 
           if grep -Eiq \
-            'ati_[A-Za-z0-9_-]{43}|token_hash|https?://' \
-            "$revoke_file"; then
+            'ati_[A-Za-z0-9_-]{43}|token_hash' \
+            "$revoke_file" || \
+            grep -E '^AEROTRACE_BOOTSTRAP_' \
+              "$revoke_file" | \
+              grep -Eiq 'https?://'; then
             echo 'bootstrap revoke output exposed credential material' >&2
             exit 1
           fi

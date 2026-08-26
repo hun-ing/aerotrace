@@ -16048,3 +16048,5 @@ temporary test container/network cleanup=PASS
 ```
 
 첫 최종 재실행은 전용 DB의 실제 계정명·DB명 대신 `postgres/aerotrace`를 가정해 연결 인증 단계에서 실패했다. 비밀값을 출력하지 않고 label로 확인한 전용 container 설정을 사용해 즉시 재실행한 결과 98/98이 통과했으며, 첫 실패는 product/migration/test body 오류가 아니다. 검증 후 `auth-phase-a-final` label의 tmpfs DB container와 전용 network만 삭제했고 두 resource가 모두 0건임을 확인했다.
+
+PR #12의 첫 Backend CI는 Backend test와 기존 Project API Key lifecycle은 통과했지만 bootstrap output scan에서 Gradle 자체 안내 URL을 application invite URL로 오인해 실패했다. Job log의 raw invite/API Key/Slack/GitHub credential pattern은 모두 0건이었다. Hash와 raw token scan은 전체 output에 유지하고 URL scan만 `AEROTRACE_BOOTSTRAP_*` application output으로 제한해 도구 안내 URL 오탐을 제거했다.
