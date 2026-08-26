@@ -1,9 +1,9 @@
 # AeroTrace 프로젝트 컨텍스트
 
 > 마지막 업데이트: 2026-08-26
-> 현재 상태: Notification 운영·Project API Key lifecycle 검증 완료, 사용자 인증·invite-only onboarding 구현 계약 채택, 실제 login/session/RBAC는 아직 미구현
-> 현재 Phase: Phase 9 — 공개 MVP 사용자 인증과 tenant authorization 구현 준비
-> 다음 작업: 인증 Phase A의 schema·default-deny authorization test를 시작하고 D+6~D+7 notification review를 병행한다. Production-sized/off-host backup은 실제 사용자 data 수집 전 필수 checkpoint다.
+> 현재 상태: Notification 운영·Project API Key lifecycle 검증 완료, 인증 Phase A schema·authorization·bootstrap 기반 구현, 실제 OAuth/login/session route와 Frontend 전환은 미구현
+> 현재 Phase: Phase 9 — 공개 MVP 사용자 인증 Phase B 준비
+> 다음 작업: Phase A PR/CI 통합 후 GitHub OAuth + JDBC session Phase B를 시작하고 D+6~D+7 notification review를 병행한다. Production-sized/off-host backup은 실제 사용자 data 수집 전 필수 checkpoint다.
 
 이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
 
@@ -34,6 +34,7 @@ Project API Key main job log raw credential matches=0
 PR #10 authentication/onboarding design initial head=e89189b
 PR #10 Frontend/Notification CI=PASS
 PR #10 job logs raw API Key/Slack Webhook matches=0
+PR #11 notification D+5 review=merged, 79e751b
 ```
 
 Slack receiver와 후속 문서·자동 검증 범위:
@@ -178,7 +179,7 @@ production mutation=수행하지 않음
 
 격리 Java 21과 tmpfs TimescaleDB에서 Backend 전체 test와 발급·조회·마지막 Key 보호·existing-project replacement·폐기·반복 폐기 acceptance를 수행한다. 실제 production tenant/project/Key와 secret file은 변경하지 않는다.
 
-사용자 인증과 onboarding 경계는 `USER_AUTH_ONBOARDING_DESIGN.md`에 구현 전 계약으로 채택했다.
+사용자 인증과 onboarding 경계는 `USER_AUTH_ONBOARDING_DESIGN.md`에 계약으로 채택했고 Phase A 기반을 구현했다.
 
 ```text
 initial identity provider=GitHub OAuth Web Application Flow
@@ -192,10 +193,12 @@ authorization=Backend default-deny + 매 요청 active membership 확인
 BFF=allowlisted same-origin proxy, universal Project API Key 제거 목표
 Project API Key=Collector workload credential로 유지
 public self-signup=rate limit/quota/abuse 방어 전까지 보류
-implementation status=미구현
+implementation status=Phase A schema/authorization/bootstrap 구현, OAuth/session runtime 미구현
 ```
 
-첫 구현은 user/identity/membership/invite/audit/session schema, permission service, bootstrap invite task와 concurrency/last-owner test다. OAuth app 생성, client secret 배치, production route/session table 변경은 이 설계 작업에 포함하지 않는다.
+Phase A는 Flyway V9의 user/identity/membership/invite/audit/JDBC session table, active user/membership/project join authorization, explicit role matrix, first-owner bootstrap issue/revoke task와 concurrency/last-owner test를 구현했다. Invite 원문은 `ati_` 256-bit token으로 한 번만 반환하고 32-byte SHA-256만 저장한다. 같은 invite의 동시 consume는 정확히 한 건만 성공하며 두 OWNER의 동시 demotion 뒤 한 OWNER를 보존한다. `AUTHENTICATION_OPERATIONS_RUNBOOK.md`와 `USER_DATA_RETENTION_POLICY.md`가 구현·보존·DR 경계를 설명한다.
+
+격리 Java 21 + TimescaleDB에서 Backend 전체 98개 test가 통과했고 V1~V9 auth/session fixture를 포함한 full logical backup/restore fingerprint가 일치했다. OAuth app 생성, client secret 배치, Spring Security/Session runtime dependency, login route, Production migration과 runtime 변경은 수행하지 않았다.
 
 현재 서버에 설치된 production runtime은 Webhook 기준선이다.
 
@@ -220,7 +223,7 @@ Activation acceptance에서는 isolated synthetic 한 건과 controlled producti
 
 2026-08-26 D+5 review에서도 두 timer와 최근 sender service가 정상이고 pending/failure가 0이었다. Production SLI 대상 event가 없어 Boundary A와 B는 계속 `NO_DATA`다. Remote D1은 activation row 2개가 모두 `delivered`이고 permanent/exhausted failure와 unredacted delivered payload가 0이며 read-only aggregate가 row를 쓰지 않았음을 확인했다. 첫 remote SLI query의 단발성 API `7403`은 OAuth·D1 접근 확인 후 동일 session의 정확히 한 번 재시도에서 성공했다. Direct `/health` snapshot은 별도로 확보하지 않았고 운영자가 UptimeRobot의 현재 `Up`을 확인했다. Production runtime과 remote resource는 변경하지 않았다.
 
-TimescaleDB logical backup/restore 도구는 production과 분리된 `2.28.3-pg15` tmpfs container 두 개에서 검증했다. Full migration과 fixture를 custom-format archive로 만들고 새 빈 DB에 TimescaleDB 공식 pre/post restore 순서로 복원한 뒤 hypertable, columnstore, 두 policy, row count와 application data fingerprint가 일치했다. Existing target overwrite, corrupted archive와 version mismatch는 target DB 생성 전에 거부한다. Production DB read-only size는 약 1.35 GB이며 Backblaze B2 US West private bucket, provider-side encryption과 Object Lock까지 준비했지만 bucket은 비어 있다. B2 application key, client-side `age` key, production dump/upload/download/restore는 실제 사용자 data 수집 전까지 보류했으므로 재해복구 완료로 표현하지 않는다.
+TimescaleDB logical backup/restore 도구는 production과 분리된 `2.28.3-pg15` tmpfs container 두 개에서 검증했다. V1~V9 migration과 telemetry/auth/session fixture를 custom-format archive로 만들고 새 빈 DB에 TimescaleDB 공식 pre/post restore 순서로 복원한 뒤 11개 필수 table, hypertable, columnstore, 두 policy, row count와 application data fingerprint가 일치했다. Existing target overwrite, corrupted archive와 version mismatch는 target DB 생성 전에 거부한다. Production DB read-only size는 약 1.35 GB이며 Backblaze B2 US West private bucket, provider-side encryption과 Object Lock까지 준비했지만 bucket은 비어 있다. B2 application key, client-side `age` key, production dump/upload/download/restore는 실제 사용자 data 수집 전까지 보류했으므로 재해복구 완료로 표현하지 않는다.
 
 ---
 

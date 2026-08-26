@@ -1,6 +1,6 @@
 # AeroTrace Database Backup and Restore Runbook
 
-> 마지막 업데이트: 2026-08-25
+> 마지막 업데이트: 2026-08-26
 > 상태: Ephemeral full-database backup/restore acceptance 완료, production-sized/off-host upload·restore rehearsal 보류
 > 범위: Self-hosted TimescaleDB `2.28.3-pg15`의 AeroTrace application database
 
@@ -17,7 +17,7 @@ PostgreSQL custom archive 생성
 -> exact PostgreSQL major와 TimescaleDB version target 준비
 -> 빈 database에 restore 성공
 -> hypertable, columnstore, retention/columnstore policy 확인
--> tenant/project/API Key metadata/span count와 data fingerprint 일치
+-> tenant/project/API Key/span/auth/session aggregate와 data fingerprint 일치
 ```
 
 ## 2. 보장 범위와 제외 범위
@@ -25,6 +25,8 @@ PostgreSQL custom archive 생성
 포함:
 
 - `tenants`, `projects`, `project_api_keys`, `spans`
+- `app_users`, `user_identities`, `tenant_memberships`, `onboarding_invites`, `security_audit_events`
+- `aerotrace_session`, `aerotrace_session_attributes`
 - TimescaleDB hypertable와 internal catalog metadata
 - Columnstore 설정과 scheduled columnstore/retention policy
 - Flyway schema history가 source DB에 있으면 해당 table과 row
@@ -39,7 +41,7 @@ PostgreSQL custom archive 생성
 - Docker image, Compose file, Worker D1과 Slack notification data
 - Point-in-time recovery용 WAL archive
 
-DB에는 Project API Key hash만 있으므로 DB를 복원해도 분실한 원문 Key를 복구할 수 없다. Collector와 Frontend secret file이 함께 유실되면 별도 Key 폐기·재발급 절차가 필요하다.
+DB에는 Project API Key와 onboarding invite의 hash만 있으므로 DB를 복원해도 분실한 원문을 복구할 수 없다. Collector와 Frontend secret file이 함께 유실되면 별도 Key 폐기·재발급 절차가 필요하다. 복원된 session과 미사용 invite는 traffic 재개 전에 반드시 무효화한다.
 
 ## 3. Tracked 도구
 
@@ -151,11 +153,11 @@ metadata_credential_scan=PASS
 Acceptance는 현재 migration 전체와 synthetic fixture를 적용하고 다음을 비교한다.
 
 - PostgreSQL과 TimescaleDB version
-- 필수 application table 4개
+- 필수 application table 11개
 - `public.spans` hypertable
 - Columnstore enabled
 - Scheduled columnstore/retention policy 2개
-- Tenant/project/API Key/span count
+- Tenant/project/API Key/span과 user/identity/membership/invite/audit/session count
 - Row 원문을 출력하지 않는 one-way application data fingerprint
 
 ## 8. 빈 target 복원
@@ -208,12 +210,16 @@ Restore 도중 실패하면 partial target DB를 자동 삭제하지 않는다. 
 6. verify script와 Backend read-only query로 검증
 7. Collector queue와 마지막 backup 시각을 이용해 예상 data gap 산정
 8. Secret file/API Key 원문 가용성 확인
-9. 승인 후 Backend connection을 restored DB로 전환
-10. Health, ingest, trace query와 notification을 확인
-11. Incident timeline, 실제 RPO와 RTO 기록
+9. 모든 restored session 삭제와 미사용 invite 일괄 revoke
+10. Disabled user, revoked membership과 account deletion 기준점 확인
+11. 승인 후 Backend connection을 restored DB로 전환
+12. Health, ingest, trace query와 notification을 확인
+13. Incident timeline, 실제 RPO와 RTO 기록
 ```
 
 손상된 기존 DB 위에 `--clean` restore를 실행하지 않는다. 새 target에서 검증을 마친 뒤 connection을 전환해야 rollback과 forensic evidence가 남는다.
+
+Session 삭제, invite revoke와 zero aggregate 확인 SQL은 [Authentication Operations Runbook](AUTHENTICATION_OPERATIONS_RUNBOOK.md)의 DR 절차를 따른다. Backup/restore fingerprint 일치는 archive 충실성의 증거이지 과거 authentication state를 다시 활성화해도 된다는 뜻이 아니다.
 
 ## 10. Off-host와 encryption
 

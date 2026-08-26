@@ -1,6 +1,6 @@
 # AeroTrace Notification Data Retention Policy
 
-> 마지막 업데이트: 2026-08-24
+> 마지막 업데이트: 2026-08-26
 > 상태: Production 초기 정책, 자동 purge 도입 전 manual enforcement
 > 첫 정식 검토일: 2026-09-20 KST
 
@@ -8,7 +8,7 @@
 
 이 문서는 notification pipeline이 만드는 sender outbox, receipt, failure-state, Cloudflare D1 row, Queue/DLQ message, Worker log, Slack message와 incident evidence의 보존·redaction 원칙을 정한다.
 
-Telemetry trace 본문의 30일 retention은 별도 데이터 수명주기 결정이며 이 문서의 범위가 아니다.
+Telemetry trace 본문의 30일 retention과 사람의 identity, membership, invite, audit, session metadata는 별도 데이터 수명주기 결정이며 이 문서의 범위가 아니다. 사용자 관련 경계는 [User Data Retention Policy](USER_DATA_RETENTION_POLICY.md)를 따른다.
 
 관련 문서:
 

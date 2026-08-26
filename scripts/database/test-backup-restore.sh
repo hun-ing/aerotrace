@@ -294,7 +294,7 @@ version_target_exists="$(
 [[ -z "${version_target_exists}" ]]
 
 if grep -Eq \
-    'aerotrace-ci-only|atr_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}' \
+    'aerotrace-ci-only|atr_[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{43}|ati_[A-Za-z0-9_-]{43}' \
     "${metadata_path}" \
     "${checksum_path}"; then
     echo "Backup metadata or checksum exposed a credential." >&2

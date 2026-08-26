@@ -15660,8 +15660,6 @@ D+4 review=COMPLETE
 
 Systemd start/stop, sudo, remote deploy, D1 mutation, Queue action, secret 변경과 synthetic notification을 수행하지 않았다. 문서 외 production 상태는 변경하지 않았고 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않는다.
 
----
-
 ## V-7B-4-19 TimescaleDB Backup/Restore Ephemeral Acceptance
 
 ### 목적과 공식 기준
@@ -15957,3 +15955,96 @@ D+5 review=COMPLETE
 ### 안전 경계
 
 Systemd start/stop, sudo, remote deploy, D1 mutation, Queue action, secret 변경과 synthetic notification을 수행하지 않았다. 문서 외 production 상태는 변경하지 않았고 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않는다.
+
+---
+
+## V-7B-4-23 User Authentication Phase A 기반 구현
+
+### 목적과 범위
+
+`USER_AUTH_ONBOARDING_DESIGN.md`에서 채택한 사람의 identity, tenant membership, invite-only onboarding과 Backend default-deny 경계 중 Phase A를 구현했다.
+
+```text
+base=main 79e751b
+branch=feature/auth-phase-a
+포함=schema, permission, bootstrap invite, concurrency, backup/restore, runbook/retention
+제외=GitHub OAuth app/client, Spring Security/session runtime, route, Frontend 전환, Production migration
+```
+
+### Flyway V9와 authorization
+
+`V9__create_user_auth_foundation.sql`에 `app_users`, `user_identities`, `tenant_memberships`, `onboarding_invites`, `security_audit_events`와 `aerotrace_session*` 두 table을 추가했다. User/membership/role 상태, invite 32-byte hash와 terminal state, identity provider subject uniqueness를 DB constraint로 제한한다. Audit에는 free-form payload column이 없고 Spring Session 4.1 official PostgreSQL column 계약은 `AEROTRACE_SESSION` prefix로 옮겼다. Phase A에는 Spring Session dependency와 runtime filter를 추가하지 않으며 Flyway만 schema owner다.
+
+`MembershipPermissionService`와 JDBC store는 다음 관계를 한 query에서 확인한다.
+
+```text
+app_users.status=ACTIVE
+AND tenant_memberships.status=ACTIVE
+AND requested project.id exists
+AND projects.tenant_id=membership.tenant_id
+```
+
+관계가 없으면 `NOT_FOUND`, role이 부족하면 `FORBIDDEN`, exhaustive permission switch가 허용할 때만 `ALLOWED`다. Unit test는 OWNER/ADMIN/VIEWER의 모든 permission 값을 순회하고 integration은 cross-tenant guessed project, disabled user와 revoked membership을 거부했다.
+
+### Bootstrap invite와 OWNER 보호
+
+`OnboardingInviteTokenService`는 32 random byte를 `ati_<43 Base64URL>` 원문으로 한 번만 반환하고 SHA-256만 저장한다.
+
+```text
+issueBootstrapInvite=existing tenant + ISSUE, default 24h, max 168h
+active OWNER 또는 usable bootstrap 존재=발급 거부
+revokeBootstrapInvite=tenant + invite row UUID + REVOKE
+repeated revoke=ALREADY_REVOKED
+revoke output raw token/hash=없음
+```
+
+Issue/revoke는 tenant row를, consume은 token-hash invite row를 잠근 transaction에서 처리한다. 동일 invite의 두-thread consume는 한 건만 성공했고 membership/consumed/audit row도 각각 한 건이었다. Membership role change/revoke는 tenant와 membership rows를 잠근다. Active OWNER 두 명의 동시 demotion은 한 transaction만 성공해 OWNER 1명, ADMIN 1명을 보존했다.
+
+### 테스트 수정과 최종 결과
+
+첫 격리 test는 compile과 V1~V9 migration, 새 test body를 실행했지만 네 test의 cleanup이 기존 `projects -> tenants` RESTRICT FK 순서를 어겨 실패했다.
+
+```text
+first run tests=95
+product/migration failure=0
+fixture cleanup failure=4
+cause=tenant를 project보다 먼저 삭제
+```
+
+Fixture project를 먼저 삭제하도록 순서만 수정한 다음 95/95가 통과했다. Bootstrap revoke, 만료 invite와 active-owner bootstrap refusal test를 추가한 뒤 최종 Backend 전체는 98/98 PASS다.
+
+Restore verifier는 auth/session 7개 table과 fixture/fingerprint를 포함해 필수 application table을 4개에서 11개로 확장했다.
+
+```text
+V1~V9 full logical backup/restore=PASS
+source_target_summary_match=yes
+required application tables=11
+hypertable/columnstore/policies=PASS
+existing/production target refusal=PASS
+corrupt archive/version mismatch refusal=PASS
+metadata credential scan=PASS
+```
+
+별도 synthetic tenant의 실제 Gradle operator 발급·폐기·반복 폐기 뒤 aggregate는 invite 1, revoked 1, consumed 0, issue audit 1, revoke audit 1이었다. 원문은 mode 0600 임시 output에서 형식만 검사하고 도구 출력과 문서에는 표시하지 않았다.
+
+### 문서와 안전 경계
+
+`AUTHENTICATION_OPERATIONS_RUNBOOK.md`는 Phase A 비활성 경계, bootstrap issue/revoke, last-owner와 DR session/invite 무효화를 설명한다. `USER_DATA_RETENTION_POLICY.md`는 수집하지 않는 email/OAuth token, invite 30일·audit 180일 초기 목표, account deletion FK 순서와 backup 잔존 한계를 구분한다. 자동 purge와 self-service export/delete는 아직 구현되지 않았다.
+
+격리 검증은 label이 있는 전용 Docker network, tmpfs TimescaleDB와 ephemeral Java 21 container만 사용했다. Production DB/container/volume, OAuth app, secret, Frontend, systemd, Cloudflare, notification과 B2 resource는 변경하지 않았다. 기존 untracked PostgreSQL 분석 script 세 개도 수정하거나 stage하지 않는다.
+
+### 최종 코드·문서 전면 검토
+
+모든 Phase A 소스, migration, CI, backup fixture·verifier와 연관 문서를 다시 읽고 현재/미구현 경계, 오류, 중복과 secret 노출 가능성을 대조했다. Invite 원문을 보유하는 두 record의 기본 `toString()`이 원문을 노출할 수 있는 결함을 찾아 `rawToken=<redacted>`로 override하고 회귀 test를 추가했다. Frontend README의 Phase A 상태, Security Policy의 invite/OAuth/session 노출·user retention 경계와 구현 전 문서 문구도 현재 상태로 교정했다.
+
+```text
+post-review Backend tests=98/98 PASS
+git diff --check=PASS
+shell syntax=PASS
+changed Markdown fences=PASS
+changed Markdown local links=PASS
+changed/new files credential patterns=0
+temporary test container/network cleanup=PASS
+```
+
+첫 최종 재실행은 전용 DB의 실제 계정명·DB명 대신 `postgres/aerotrace`를 가정해 연결 인증 단계에서 실패했다. 비밀값을 출력하지 않고 label로 확인한 전용 container 설정을 사용해 즉시 재실행한 결과 98/98이 통과했으며, 첫 실패는 product/migration/test body 오류가 아니다. 검증 후 `auth-phase-a-final` label의 tmpfs DB container와 전용 network만 삭제했고 두 resource가 모두 0건임을 확인했다.

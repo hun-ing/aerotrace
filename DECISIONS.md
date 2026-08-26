@@ -1,6 +1,6 @@
 # AeroTrace 설계 결정 기록
 
-> 마지막 업데이트: 2026-08-25
+> 마지막 업데이트: 2026-08-26
 > 상태: 채택 / 보류 / 재검토 필요
 
 이 문서는 AeroTrace의 주요 설계 결정, 검토한 대안, 선택 이유, 위험, 재검토 조건을 시간순으로 기록한다. 과거 결정의 상태 문장은 당시 근거이며, 같은 주제의 최신 ADR이 현재 기준선이다.
@@ -8381,7 +8381,7 @@ PostgreSQL major와 TimescaleDB version은 metadata와 exact match해야 한다.
 
 ### 검증
 
-Production container, network와 volume을 공유하지 않는 source/target tmpfs TimescaleDB `2.28.3-pg15`에서 migration V1~V8과 fixture를 사용했다.
+Production container, network와 volume을 공유하지 않는 source/target tmpfs TimescaleDB `2.28.3-pg15`에서 migration V1~V9와 telemetry/auth/session fixture를 사용했다.
 
 ```text
 full custom archive create=PASS
@@ -8492,7 +8492,7 @@ production credential mutation=none
 
 ### 상태
 
-채택 — 2026-08-25, 구현 전 설계 계약
+채택 — 2026-08-25, Phase A 기반 구현 2026-08-26 완료
 
 ### 해결하려는 문제
 
@@ -8552,7 +8552,7 @@ Public self-signup과 자동 tenant 생성은 rate limit, quota, abuse monitorin
 - Invite 전달은 별도 안전한 out-of-band channel이 필요하다.
 - OAuth app/client secret, session incident와 provider outage runbook이 새로 필요하다.
 - User identity, invite, session과 audit metadata의 보존·삭제 정책이 새로 필요하다.
-- 설계만 채택된 상태이며 현재 Frontend는 여전히 로그인 없이 단일 Project API Key를 사용한다.
+- Phase A schema·authorization·bootstrap 기반만 구현됐으며 현재 Frontend는 여전히 로그인 없이 단일 Project API Key를 사용한다.
 
 ### 검증 계약
 
@@ -8573,6 +8573,10 @@ BFF path/header allowlist
 existing OTLP API Key regression
 restored session/invite invalidation
 ```
+
+2026-08-26 Phase A에서는 Flyway V9, active membership/project join authorization, role matrix, bootstrap invite issue/revoke, hash-only single-use consume와 last-owner transaction 보호를 구현했다. 격리 TimescaleDB에서 concurrent same-invite consume가 한 건만 성공하고 두 OWNER의 concurrent demotion 뒤 한 OWNER가 남는 것을 확인했다. Backup/restore acceptance는 새 auth/session table까지 포함한 11개 필수 table과 source/target fingerprint 일치를 확인했다.
+
+GitHub OAuth, Spring Security/session runtime, callback identity 생성, CSRF/cookie와 Frontend 전환은 아직 구현되지 않았다. Phase A table이 존재한다는 이유로 login이 활성화된 것으로 보지 않으며 Production migration과 auth runtime 변경도 수행하지 않았다.
 
 ### 재검토 조건
 

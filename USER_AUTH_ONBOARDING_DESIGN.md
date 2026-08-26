@@ -1,9 +1,9 @@
 # AeroTrace User Authentication and Onboarding Design
 
-> 상태: 채택 — 구현 전 설계 계약
+> 상태: 채택 — Phase A 기반 구현 완료, Phase B OAuth/session 미구현
 > 결정일: 2026-08-25
 > 적용 범위: 공개 Web UI의 사용자 로그인, tenant membership, project 선택과 Project API Key self-service 경계
-> 현재 구현 여부: 미구현. 현재 Frontend는 계속 server-only Project API Key 하나를 사용한다.
+> 현재 구현 여부: V9 schema, authorization, bootstrap invite와 concurrency 보호 구현. 현재 Frontend는 계속 server-only Project API Key 하나를 사용하며 login/session은 없다.
 
 ## 1. 목적
 
@@ -27,6 +27,17 @@
 Collector -> Project API Key -> POST /v1/traces
 Browser -> Next.js BFF -> server-only Project API Key -> GET /api/v1/traces
 Project API Key -> tenant_id + project_id
+```
+
+2026-08-26 Phase A에서 다음 기반을 추가했다. 이 변경은 login route나 session runtime을 활성화하지 않는다.
+
+```text
+Flyway V9=user/identity/membership/invite/audit/AEROTRACE_SESSION schema
+authorization=active user + active membership + project tenant join
+permission=OWNER / ADMIN / VIEWER explicit default-deny matrix
+onboarding=first OWNER bootstrap issue/revoke operator
+concurrency=single-use invite + last active OWNER transaction lock
+backup=auth/session table aggregate + fingerprint restore acceptance
 ```
 
 이번 결정에서도 다음은 유지한다.
@@ -286,7 +297,7 @@ POST /api/v1/projects/{projectId}/api-keys/{keyRowId}/revoke
 
 ## 9. 구현 순서
 
-### Phase A — Domain과 authorization 기반
+### Phase A — Domain과 authorization 기반 — 구현 완료
 
 1. User/identity/membership/invite/audit와 JDBC session migration
 2. Membership permission service와 default-deny test
@@ -295,6 +306,21 @@ POST /api/v1/projects/{projectId}/api-keys/{keyRowId}/revoke
 5. 사용자 identity/audit/session의 보존·삭제 계약 초안
 
 이 단계는 production login을 열지 않는다.
+
+Phase A 구현 evidence:
+
+```text
+Backend full test=98 tests PASS in isolated TimescaleDB
+permission role matrix/default deny=PASS
+disabled user/revoked membership/cross-tenant project refusal=PASS
+concurrent same-invite consume=exactly one success
+concurrent two-owner demotion=one OWNER preserved
+bootstrap revoke/idempotency=PASS
+expired invite / active-owner bootstrap refusal=PASS
+Spring Session JDBC schema shape=PASS
+V1~V9 backup/restore source-target fingerprint=PASS
+Production auth/runtime mutation=none
+```
 
 ### Phase B — GitHub OAuth와 server session
 
@@ -332,12 +358,12 @@ POST /api/v1/projects/{projectId}/api-keys/{keyRowId}/revoke
 - Production-sized encrypted off-host backup/restore
 - Incident session revoke와 provider outage runbook
 
-### 구현과 함께 추가할 문서
+### 구현과 함께 유지할 문서
 
 - `AUTHENTICATION_OPERATIONS_RUNBOOK.md`: OAuth app/callback, secret rotation, bootstrap invite, session revoke, provider outage와 rollback
 - `USER_DATA_RETENTION_POLICY.md`: user identity, login/audit, invite와 session metadata의 보존, export와 account deletion
 
-두 문서는 실제 schema와 운영 명령이 확정되는 구현 PR에서 작성한다. 수동 test 절차만 별도 문서로 복제하지 않고 이 문서의 acceptance를 tracked automated test와 CI로 만든다.
+Phase A에서 두 문서의 초기 버전을 작성했다. Phase B에서 OAuth app/callback, secret rotation, session revoke와 provider outage의 실제 설정·명령이 확정되면 관련 절차를 확장한다. 수동 test 절차만 별도 문서로 복제하지 않고 acceptance를 tracked automated test와 CI로 유지한다.
 
 ## 10. Acceptance criteria
 
@@ -399,7 +425,7 @@ POST /api/v1/projects/{projectId}/api-keys/{keyRowId}/revoke
 - API Key를 Browser session이나 사용자 token으로 재사용
 - GitHub repository/organization data 접근
 - OAuth access token의 장기 저장 또는 refresh
-- 구현 전 production OAuth app, secret, session table과 route 변경
+- Phase B activation 전 production OAuth app, secret, session runtime과 route 변경
 
 ## 12. 재검토 조건
 
