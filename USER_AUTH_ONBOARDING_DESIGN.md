@@ -1,9 +1,9 @@
 # AeroTrace User Authentication and Onboarding Design
 
-> 상태: 채택 — Phase A 기반 구현 완료, Phase B OAuth/session 미구현
+> 상태: 채택 — Phase A 기반과 Phase B Backend OAuth/session 구현 완료, Production 비활성·Phase C Frontend 미구현
 > 결정일: 2026-08-25
 > 적용 범위: 공개 Web UI의 사용자 로그인, tenant membership, project 선택과 Project API Key self-service 경계
-> 현재 구현 여부: V9 schema, authorization, bootstrap invite와 concurrency 보호 구현. 현재 Frontend는 계속 server-only Project API Key 하나를 사용하며 login/session은 없다.
+> 현재 구현 여부: V9 schema·authorization·bootstrap과 opt-in GitHub OAuth/JDBC session Backend 구현 및 격리 검증 완료. 기본·Production runtime은 인증 비활성이며 현재 Frontend는 계속 server-only Project API Key 하나를 사용한다.
 
 ## 1. 목적
 
@@ -29,7 +29,7 @@ Browser -> Next.js BFF -> server-only Project API Key -> GET /api/v1/traces
 Project API Key -> tenant_id + project_id
 ```
 
-2026-08-26 Phase A에서 다음 기반을 추가했다. 이 변경은 login route나 session runtime을 활성화하지 않는다.
+2026-08-26 Phase A에서 다음 기반을 추가했고 2026-09-04 Phase B에서 opt-in login/session runtime을 구현했다. 기본 설정은 인증 비활성이므로 repository 변경만으로 Production login이 열리지 않는다.
 
 ```text
 Flyway V9=user/identity/membership/invite/audit/AEROTRACE_SESSION schema
@@ -322,7 +322,7 @@ V1~V9 backup/restore source-target fingerprint=PASS
 Production auth/runtime mutation=none
 ```
 
-### Phase B — GitHub OAuth와 server session
+### Phase B — GitHub OAuth와 server session — Backend 구현 완료
 
 1. Spring Security OAuth2 Client와 Spring Session JDBC
 2. State, PKCE, exact callback와 minimal provider scope
@@ -331,6 +331,30 @@ Production auth/runtime mutation=none
 5. `/api/v1/me`와 auth failure contract
 6. Local과 Production OAuth app/callback/client secret 분리
 7. Login initiation, callback failure와 onboarding intent rate limit
+
+Phase B repository evidence:
+
+```text
+auth disabled default + enabled Local/Production profile validation=PASS
+GitHub state + PKCE S256 + exact callback + exact read:user scope=PASS
+provider authorized client=request scope only, refresh token refused=PASS
+new identity without invite=refused
+invite consume + user/identity/membership/audit callback transaction=PASS
+existing identity login + second-tenant invite=PASS
+same identity/invite concurrent callback=one user and membership
+session fixation rotation + old cookie rejection=PASS
+JDBC session content=local user UUID/authenticated-at principal only
+Production __Host cookie attributes=PASS
+CSRF + exact Origin + safe redirect + generic failure=PASS
+session-bound auth attempt limit=10 attempts/10 minutes
+idle 8h + absolute 7d + disabled-user rejection=PASS
+POST logout + user/global JDBC session revoke service=PASS
+legacy OTLP and Project API Key paths=regression PASS
+2026-09-04 Backend full test=130/130 PASS in isolated TimescaleDB
+Production OAuth app/secret/profile/runtime mutation=none
+```
+
+이 완료 표시는 Backend repository 범위다. 실제 GitHub OAuth App 생성·secret 배치, Production profile 활성화, public traffic 전환과 Frontend session/BFF 연결은 포함하지 않는다. 인증 시도 제한은 현재 anonymous session 단위의 방어이며 공개 배포 전에 edge/IP 기반 분산 제한과 abuse monitoring을 별도로 둔다. 사용자별/global revoke는 application service로 구현됐지만 운영자 CLI/API는 아직 없으므로 장애 시 승인된 DB 절차를 사용한다.
 
 ### Phase C — Project query와 Frontend 전환
 
@@ -363,7 +387,7 @@ Production auth/runtime mutation=none
 - `AUTHENTICATION_OPERATIONS_RUNBOOK.md`: OAuth app/callback, secret rotation, bootstrap invite, session revoke, provider outage와 rollback
 - `USER_DATA_RETENTION_POLICY.md`: user identity, login/audit, invite와 session metadata의 보존, export와 account deletion
 
-Phase A에서 두 문서의 초기 버전을 작성했다. Phase B에서 OAuth app/callback, secret rotation, session revoke와 provider outage의 실제 설정·명령이 확정되면 관련 절차를 확장한다. 수동 test 절차만 별도 문서로 복제하지 않고 acceptance를 tracked automated test와 CI로 유지한다.
+Phase A에서 두 문서의 초기 버전을 작성했고 Phase B repository 구현에 맞춰 profile, callback, secret rotation, session revoke, provider outage와 rollback 경계를 확장했다. 실제 Production hostname과 OAuth App 값은 secret으로 문서화하지 않으며 activation 때 운영자가 확정한다. 수동 test 절차만 별도 문서로 복제하지 않고 acceptance를 tracked automated test와 CI로 유지한다.
 
 ## 10. Acceptance criteria
 
@@ -425,7 +449,7 @@ Phase A에서 두 문서의 초기 버전을 작성했다. Phase B에서 OAuth a
 - API Key를 Browser session이나 사용자 token으로 재사용
 - GitHub repository/organization data 접근
 - OAuth access token의 장기 저장 또는 refresh
-- Phase B activation 전 production OAuth app, secret, session runtime과 route 변경
+- 별도 activation 승인 전 Production OAuth app, secret, auth profile과 public route 변경
 
 ## 12. 재검토 조건
 

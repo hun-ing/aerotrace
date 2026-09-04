@@ -144,6 +144,80 @@ public class OnboardingInviteService {
                             this::invalidInvite
                     );
 
+    return consumeLockedInvite(
+            invite,
+            userId,
+            correlationId,
+            consumedAt
+    );
+  }
+
+  @Transactional(readOnly = true)
+  public UUID resolveUsableInviteId(
+          String rawToken
+  ) {
+    byte[] tokenHash =
+            tokenService.hash(rawToken)
+                    .orElseThrow(
+                            this::invalidInvite
+                    );
+
+    Instant checkedAt = Instant.now();
+
+    return inviteStore.findUsableByTokenHash(
+                    tokenHash,
+                    checkedAt
+            )
+            .map(
+                    OnboardingInviteStore.StoredOnboardingInvite::id
+            )
+            .orElseThrow(this::invalidInvite);
+  }
+
+  @Transactional
+  public ConsumedOnboardingInvite consumeById(
+          UUID inviteId,
+          UUID userId,
+          UUID correlationId
+  ) {
+    Objects.requireNonNull(
+            inviteId,
+            "Invite ID must not be null"
+    );
+
+    Objects.requireNonNull(
+            userId,
+            "User ID must not be null"
+    );
+
+    Objects.requireNonNull(
+            correlationId,
+            "Correlation ID must not be null"
+    );
+
+    Instant consumedAt = Instant.now();
+
+    OnboardingInviteStore.StoredOnboardingInvite invite =
+            inviteStore.findByIdForUpdate(inviteId)
+                    .orElseThrow(
+                            this::invalidInvite
+                    );
+
+    return consumeLockedInvite(
+            invite,
+            userId,
+            correlationId,
+            consumedAt
+    );
+  }
+
+  private ConsumedOnboardingInvite consumeLockedInvite(
+          OnboardingInviteStore.StoredOnboardingInvite invite,
+          UUID userId,
+          UUID correlationId,
+          Instant consumedAt
+  ) {
+
     if (
             invite.consumedAt() != null
                     || invite.revokedAt() != null

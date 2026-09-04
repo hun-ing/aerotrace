@@ -164,6 +164,59 @@ public class JdbcOnboardingInviteStore
   }
 
   @Override
+  public Optional<StoredOnboardingInvite> findUsableByTokenHash(
+          byte[] tokenHash,
+          Instant now
+  ) {
+    return queryOneForUpdate(
+            """
+            SELECT id,
+                   tenant_id,
+                   role,
+                   created_by_user_id,
+                   created_at,
+                   expires_at,
+                   consumed_at,
+                   consumed_by_user_id,
+                   revoked_at
+            FROM onboarding_invites
+            WHERE token_hash = ?
+              AND consumed_at IS NULL
+              AND revoked_at IS NULL
+              AND expires_at > ?
+            """,
+            tokenHash,
+            OffsetDateTime.ofInstant(
+                    now,
+                    ZoneOffset.UTC
+            )
+    );
+  }
+
+  @Override
+  public Optional<StoredOnboardingInvite> findByIdForUpdate(
+          UUID inviteId
+  ) {
+    return queryOneForUpdate(
+            """
+            SELECT id,
+                   tenant_id,
+                   role,
+                   created_by_user_id,
+                   created_at,
+                   expires_at,
+                   consumed_at,
+                   consumed_by_user_id,
+                   revoked_at
+            FROM onboarding_invites
+            WHERE id = ?
+            FOR UPDATE
+            """,
+            inviteId
+    );
+  }
+
+  @Override
   public Optional<StoredOnboardingInvite> findByIdForUpdate(
           UUID tenantId,
           UUID inviteId

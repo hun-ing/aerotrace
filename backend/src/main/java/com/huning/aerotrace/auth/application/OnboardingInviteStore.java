@@ -28,6 +28,15 @@ public interface OnboardingInviteStore {
           byte[] tokenHash
   );
 
+  Optional<StoredOnboardingInvite> findUsableByTokenHash(
+          byte[] tokenHash,
+          Instant now
+  );
+
+  Optional<StoredOnboardingInvite> findByIdForUpdate(
+          UUID inviteId
+  );
+
   Optional<StoredOnboardingInvite> findByIdForUpdate(
           UUID tenantId,
           UUID inviteId

@@ -66,6 +66,6 @@ BFF는 허용된 query parameter만 전달하고 Backend 요청에 `Authorizatio
 
 현재 Frontend에는 사용자 로그인과 session이 없다. 정상 운영에서는 서버가 하나의 runtime Project API Key를 사용하고, [operator rotation](../PROJECT_API_KEY_RUNBOOK.md) 중에만 기존·신규 Key를 짧게 겹쳐 허용한다. 따라서 local 개발, private deployment 또는 접근이 제한된 PoC에만 적합하며 공개 SaaS 인증·tenant 선택 구조로 사용하지 않는다.
 
-GitHub OAuth, PostgreSQL server session, invite-only onboarding, tenant role과 Project API Key의 workload-only 경계는 [User Authentication and Onboarding Design](../USER_AUTH_ONBOARDING_DESIGN.md)에 채택했다. Backend의 Phase A schema·authorization·bootstrap 기반만 구현됐으며, 현재 Frontend가 인증됐다는 의미가 아니다.
+GitHub OAuth, PostgreSQL server session, invite-only onboarding, tenant role과 Project API Key의 workload-only 경계는 [User Authentication and Onboarding Design](../USER_AUTH_ONBOARDING_DESIGN.md)에 채택했다. Backend Phase B까지 opt-in auth runtime과 자동 검증은 구현됐지만 Production profile은 활성화하지 않았고 이 Frontend에는 login, CSRF/session proxy, tenant/project selector가 없다. 따라서 Backend 구현 완료를 현재 Frontend가 인증됐다는 의미로 해석하지 않는다.
 
 전체 runtime과 운영 문서는 [repository root README](../README.md)를 따른다.

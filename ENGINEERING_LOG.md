@@ -16063,3 +16063,110 @@ Frontend Tests run 10=PASS
 Notification Pipeline Tests run 26=PASS
 Backend job raw invite/API Key/Slack/GitHub token matches=0
 ```
+
+---
+
+## V-7B-4-24 User Authentication Phase B Backend OAuth/JDBC session 구현
+
+- 날짜: 2026-09-04
+- 환경: branch `feature/auth-phase-b-oauth-session`, Java 21 ephemeral container, 전용 Docker network와 tmpfs TimescaleDB `2.28.3-pg15`
+- Production 변경: 없음
+
+### 목적과 배포 경계
+
+Phase A의 user/identity/membership/invite/audit/session schema 위에 GitHub OAuth login과 Backend server session을 구현했다. Source와 test만 변경하며 기본 설정은 `aerotrace.auth.enabled=false`로 유지했다.
+
+```text
+포함=OAuth authorization/callback, invite-only provisioning, JDBC session, /api/v1/me, POST logout
+제외=Production OAuth App/secret, Production migration/deploy/profile activation, Frontend Phase C
+legacy workload auth=Project API Key ingest/query 유지
+```
+
+### OAuth와 local identity
+
+Spring Security OAuth2 Client registration은 GitHub 하나만 허용하고 scope를 exact `read:user`, callback을 `<public-origin>/login/oauth2/code/github`, PKCE를 required로 고정했다. `AeroTraceAuthProperties`는 HTTPS Production origin, loopback-only local HTTP, cookie 이름, safe relative success redirect와 30일 이하 absolute lifetime을 startup에서 fail-closed 검증한다. 설정 record의 `toString()`은 client ID와 secret을 redaction한다.
+
+OAuth authorized client repository는 provider access token을 callback request attribute에만 보관한다. Success handler는 refresh token과 scope 불일치를 거부하고 authorized client를 제거한 뒤 GitHub numeric ID를 local provider subject로 사용한다. JDBC session에는 provider principal/token 대신 `userId`와 `authenticatedAt`만 직렬화한 `AeroTracePrincipal`을 저장한다.
+
+Identity provisioning은 `(provider, provider_subject)`에서 파생한 PostgreSQL transaction advisory lock으로 concurrent first login을 직렬화한다. 신규 identity는 invite row UUID가 필수고 user/identity/invite membership/audit를 한 transaction으로 처리한다. 기존 active identity는 invite 없이 로그인할 수 있고 다른 tenant invite가 있으면 동일 user에 membership을 추가한다. Disabled user, invalid invite와 metadata update 불일치는 전체 transaction을 rollback한다.
+
+### Browser/session 경계
+
+구현 endpoint:
+
+```text
+GET  /api/v1/auth/csrf
+POST /api/v1/onboarding/intents
+GET  /oauth2/authorization/github
+GET  /login/oauth2/code/github
+GET  /api/v1/me
+POST /api/v1/logout
+```
+
+Onboarding과 logout POST는 Spring CSRF와 exact single Origin을 모두 요구한다. Invite 원문은 POST body에서 hash 검증한 뒤 버리고 session에는 row UUID만 둔다. Malformed retry 전에 기존 intent를 제거해 과거 유효 invite가 다음 OAuth login에 재사용되지 않게 했다. 모든 auth response는 `no-store`이고 success redirect는 same-origin relative path만 허용한다.
+
+로그인 성공은 session fixation 보호로 anonymous session ID를 회전한다. Spring Session JDBC는 Flyway-owned `AEROTRACE_SESSION` table, idle 8시간과 매분 cleanup을 사용한다. Local principal의 absolute lifetime은 기본 7일이며 active-user 상태와 함께 `/api/v1/me`에서 검증한다. User/global session revoke service는 `principal_name=user UUID`로 JDBC row를 삭제한다. Logout validation은 user-status/DB filter와 분리해 disabled user나 user lookup 장애에서도 cookie 폐기가 가능하다.
+
+Authentication 시작과 onboarding은 한 session에서 10분 동안 최대 10회로 제한한다. OAuth start marker가 있는 실제 시도 실패만 audit하고 임의 invalid callback은 DB audit row를 만들지 않아 unauthenticated write amplification을 줄였다. 이 제한은 session-bound defense이며 edge/IP 분산 제한을 대신하지 않는다.
+
+### 구현 중 발견하고 수정한 문제
+
+1. Spring Boot servlet cookie property만 설정했을 때 Spring Session JDBC cookie가 `SESSION` 이름과 누락된 security attribute로 발급됐다. `DefaultCookieSerializer`를 명시해 Production `__Host-aerotrace_session; Secure; HttpOnly; SameSite=Lax; Path=/; no Domain` 계약을 직접 검증했다.
+2. OAuth failure handler가 login start 여부와 무관하게 callback마다 audit row를 쓸 수 있었다. Session marker가 있는 시도만 audit하고 실패 session을 항상 invalidate하도록 제한했다.
+3. 유효 onboarding intent 뒤 malformed JSON 재시도 시 MVC body parsing 전에 controller가 실행되지 않아 오래된 intent가 남을 수 있었다. Rate-limit filter 단계에서 POST마다 기존 intent를 먼저 제거했다.
+4. OTLP의 전역 exception advice가 malformed auth request까지 OTLP 오류로 변환할 수 있었다. Advice 범위를 OTLP controller로 제한하고 auth controller 전용 generic error contract를 추가했다.
+5. Authenticated-session 검사를 모든 request에 적용하면 DB 장애·disabled user 상태가 logout과 기존 API Key workload path에 영향을 줄 수 있었다. 현재 session route인 `/api/v1/me`로 범위를 제한하고 Phase C route 추가 시 확장하도록 runbook에 checkpoint를 남겼다.
+6. CSRF response record의 기본 문자열 표현이 token을 노출할 수 있어 `token=<redacted>`로 고정했다.
+
+### 자동 검증
+
+Provider의 token/user-info network call은 test stub으로 대체하되 Spring Security authorization request와 callback/session machinery는 실제 MockMvc/JDBC 경로로 실행했다.
+
+```text
+auth infrastructure selected tests=39/39 PASS
+Backend clean test suites=29
+Backend clean tests=130/130 PASS
+failures=0
+errors=0
+skipped=0
+state/PKCE/exact callback/read:user redirect=PASS
+invalid state before provider call=PASS
+session ID rotation + old cookie rejection=PASS
+local-principal-only JDBC session=PASS
+new/existing/second-tenant/concurrent provisioning=PASS
+CSRF/Origin/rate-limit/generic failure=PASS
+Production cookie contract=PASS
+legacy ingest/query security regression=PASS
+```
+
+첫 선택 실행은 실제 package가 `com.huning.aerotrace`인데 `com.aerotrace.auth.*` filter를 사용해 `No tests found`로 종료됐다. Compile은 통과했지만 검증으로 세지 않았고 정확한 `com.huning.aerotrace.auth.infrastructure.*` filter로 재실행해 39/39를 확인했다. 그 뒤 filter 없는 `clean test`로 최종 130/130을 확정했다.
+
+### 문서 정합화
+
+Root/Frontend README, Project Context, 인증 설계, 인증 운영 Runbook, user retention, Security Policy와 ADR을 전면 대조했다. Phase A-only 문구를 Phase B repository 완료로 갱신하면서 다음 미완료 범위를 별도로 유지했다.
+
+```text
+Production OAuth App/secret/profile activation=미실시
+Frontend session/BFF/tenant selector=Phase C
+edge/IP distributed rate limit=미구현
+user/global revoke operator CLI/API=미구현, application service와 승인 SQL만 존재
+account export/delete + invite/audit purge=미구현
+production-sized encrypted off-host backup=미실시, B2 bucket만 준비
+```
+
+운영 절차는 여러 문서에 복제하지 않고 `AUTHENTICATION_OPERATIONS_RUNBOOK.md`를 명령·장애·rollback의 canonical 문서로 두고, 설계 문서는 invariants와 acceptance, retention 문서는 data lifecycle만 담당하도록 정리했다.
+
+### 최종 검토와 격리 자원 정리
+
+```text
+git diff --check=PASS
+changed Markdown fences=PASS
+changed Markdown local links=PASS
+changed diff GitHub/Slack credential pattern scan=PASS
+auth-phase-b labeled container after cleanup=0
+auth-phase-b dedicated network after cleanup=0
+production aerotrace-timescaledb=healthy, 변경 없음
+ignored PostgreSQL analysis scripts=수정/stage 대상 제외
+```
+
+별도 `AUTH_API_CONTRACT.md`를 지금 추가하면 설계와 Runbook의 endpoint 설명을 중복하게 되므로 만들지 않았다. Phase C에서 Frontend가 실제로 소비하는 session-authenticated trace/project API가 확정될 때 OpenAPI 또는 executable contract test를 canonical 계약으로 추가하는 편이 낫다. Public activation 전에는 privacy notice/account request 절차와 edge rate-limit/monitoring 문서가 실제 운영 설정에 맞게 필요하다.

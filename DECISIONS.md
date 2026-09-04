@@ -8492,7 +8492,7 @@ production credential mutation=none
 
 ### 상태
 
-채택 — 2026-08-25, Phase A 기반 구현 2026-08-26 완료
+채택 — 2026-08-25, Phase A 기반 2026-08-26·Phase B Backend 2026-09-04 구현 완료
 
 ### 해결하려는 문제
 
@@ -8550,9 +8550,9 @@ Public self-signup과 자동 tenant 생성은 rate limit, quota, abuse monitorin
 - Full database backup에 session/invite table이 포함되므로 DR activation에 명시적 무효화 단계가 필요하다.
 - Tenant-level role은 같은 tenant 안의 project별 접근 제한을 제공하지 않는다.
 - Invite 전달은 별도 안전한 out-of-band channel이 필요하다.
-- OAuth app/client secret, session incident와 provider outage runbook이 새로 필요하다.
-- User identity, invite, session과 audit metadata의 보존·삭제 정책이 새로 필요하다.
-- Phase A schema·authorization·bootstrap 기반만 구현됐으며 현재 Frontend는 여전히 로그인 없이 단일 Project API Key를 사용한다.
+- OAuth App/client secret, session incident와 provider outage 운영 부담이 추가된다.
+- User identity, invite, session과 audit metadata의 보존·삭제 자동화가 필요하다.
+- Phase B Backend는 opt-in으로 구현됐지만 현재 Production과 Frontend는 여전히 로그인 없이 단일 Project API Key를 사용한다.
 
 ### 검증 계약
 
@@ -8576,7 +8576,9 @@ restored session/invite invalidation
 
 2026-08-26 Phase A에서는 Flyway V9, active membership/project join authorization, role matrix, bootstrap invite issue/revoke, hash-only single-use consume와 last-owner transaction 보호를 구현했다. 격리 TimescaleDB에서 concurrent same-invite consume가 한 건만 성공하고 두 OWNER의 concurrent demotion 뒤 한 OWNER가 남는 것을 확인했다. Backup/restore acceptance는 새 auth/session table까지 포함한 11개 필수 table과 source/target fingerprint 일치를 확인했다.
 
-GitHub OAuth, Spring Security/session runtime, callback identity 생성, CSRF/cookie와 Frontend 전환은 아직 구현되지 않았다. Phase A table이 존재한다는 이유로 login이 활성화된 것으로 보지 않으며 Production migration과 auth runtime 변경도 수행하지 않았다.
+2026-09-04 Phase B에서는 Spring Security OAuth2 Client, Spring Session JDBC, exact GitHub callback, state+PKCE, exact `read:user` scope, request-only authorized client, invite callback transaction, local minimal principal, secure cookie profile, fixation/expiry/logout/revoke, CSRF·Origin·safe redirect·session rate limit과 `/api/v1/me`를 구현했다. 격리 TimescaleDB와 stub provider client를 사용한 Backend 전체 130/130 test가 통과했다.
+
+이 구현은 default-disabled opt-in profile이다. Production OAuth App/client secret, Production DB migration/deploy/profile activation과 Frontend session/BFF 전환은 수행하지 않았다. Session rate limit은 단일 anonymous session 단위이므로 public activation 전 edge/IP 분산 방어가 필요하고, application의 user/global revoke service에는 아직 운영자 CLI/API가 없다. 따라서 Phase B source가 존재한다는 이유로 Production login이 활성화된 것으로 보지 않는다.
 
 ### 재검토 조건
 
