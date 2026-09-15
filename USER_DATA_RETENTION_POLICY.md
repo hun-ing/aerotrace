@@ -1,14 +1,14 @@
 # AeroTrace User Data Retention Policy
 
-> 마지막 업데이트: 2026-08-26
-> 상태: Phase A schema 기준 초기 정책, 자동 purge와 사용자 self-service export/delete는 미구현
+> 마지막 업데이트: 2026-09-04
+> 상태: Phase B Backend 데이터 흐름 구현, Production 수집 비활성. 자동 domain-data purge와 사용자 self-service export/delete는 미구현
 > 범위: 사람의 identity, tenant membership, onboarding invite, security audit와 server session metadata
 
 ## 1. 목적과 다른 정책과의 경계
 
 이 문서는 AeroTrace에 로그인하는 사람과 관련된 metadata의 최소 수집, 보존, 삭제와 복원 후 처리를 정한다. Trace payload, Project API Key와 Cloudflare notification data의 보존은 각각 기존 database/notification 정책과 runbook을 따른다.
 
-Phase A에는 OAuth login이 없어 실제 사용자 data를 수집하지 않는다. 아래 보존 목표는 Phase B activation 전 구현과 운영 acceptance로 전환해야 하며, 자동 purge가 없는 값을 이미 보장되는 retention으로 표현하지 않는다.
+Phase B Backend에는 OAuth login과 JDBC session 데이터 흐름이 구현됐지만 기본·Production auth profile은 비활성이고 실제 GitHub OAuth App/secret도 배치하지 않았다. 따라서 현재 Production은 이 흐름으로 사용자 data를 수집하지 않는다. 아래 보존 목표 중 자동 purge가 없는 값은 이미 보장되는 retention으로 표현하지 않는다.
 
 ## 2. 수집하는 데이터
 
@@ -20,6 +20,7 @@ Phase A에는 OAuth login이 없어 실제 사용자 data를 수집하지 않는
 | Invite | tenant, role, 32-byte token hash, creator/consumer UUID, 만료·소비·폐기 시각 | Invite-only onboarding과 재사용 방지 | Invite 원문, URL, provider token |
 | Security audit | actor/tenant/project UUID, 제한된 action/result, 시각, correlation UUID | 인증·권한 incident 조사 | 자유 형식 payload, cookie, session ID, token, API Key, trace payload |
 | JDBC session | 불투명 session 식별자, expiry/index metadata, 최소 authentication attribute | Server-side login session | OAuth token, role/membership snapshot, trace payload |
+| Anonymous auth attempt | session 안의 10분 window 시작 시각·시도 횟수와 OAuth 시작 marker | onboarding/login abuse 완화와 callback audit 구분 | IP profile, provider token, invite 원문 |
 
 GitHub login과 display name은 변경 가능한 표시 metadata다. Authorization identity key는 numeric provider subject이며 email/login을 권한 key로 사용하지 않는다.
 
@@ -28,6 +29,7 @@ GitHub login과 display name은 변경 가능한 표시 metadata다. Authorizati
 - GitHub repository, organization과 email scope를 요청하지 않는다.
 - OAuth token은 identity 확인 직후 폐기하고 DB, session, log와 audit에 저장하지 않는다.
 - Session에는 local `user_id`와 최소 authentication marker만 두고 role/membership은 요청마다 DB에서 다시 확인한다.
+- OAuth authorization request의 state/PKCE와 onboarding intent의 invite row UUID는 anonymous server session에만 두며 invite 원문은 저장하지 않는다.
 - Audit table에는 JSON/text metadata payload column을 두지 않아 임의 비밀정보 저장을 구조적으로 막는다.
 - Invite code는 URL query/path, session attribute와 audit에 넣지 않는다.
 - 운영 조회는 aggregate와 필요한 metadata만 출력하고 token hash, session attribute bytes와 provider response 원문을 조회하지 않는다.
@@ -41,9 +43,9 @@ GitHub login과 display name은 변경 가능한 표시 metadata다. Authorizati
 | 미사용 invite | 만료 또는 폐기까지, 최대 7일 | 만료·폐기 후 30일 | 미구현 |
 | 소비된 invite | 소비 증거 30일 | 이후 제거 대상, audit는 별도 유지 | 미구현 |
 | Security audit | Incident 조사와 권한 변경 추적 | 180일 | 미구현 |
-| JDBC session | Idle 8시간, absolute 7일 이내 | 만료 cleanup 또는 즉시 revoke | Phase B 미구현 |
+| JDBC session과 anonymous auth state | Idle 8시간, authenticated session absolute 7일 이내; auth attempt window 10분 | 매분 expiry cleanup 또는 즉시 revoke | Repository 구현, Production 비활성; user/global revoke operator entry point 미구현 |
 
-기본 invite 유효기간은 24시간이고 operator가 설정할 수 있는 상한은 7일이다. 위 표의 30일·180일은 Phase B activation 전 purge job과 acceptance가 있어야 실제 보장이 된다.
+기본 invite 유효기간은 24시간이고 operator가 설정할 수 있는 상한은 7일이다. 위 표의 invite 30일·audit 180일은 purge job과 acceptance가 있어야 실제 보장이 된다. Spring Session expiry cleanup은 auth profile이 실행 중일 때만 작동하며 off-host backup 안의 copy를 삭제하지 않는다.
 
 Audit 180일은 초기 MVP 기준이다. 법적·계약상 요구, incident 조사 기간과 저장량을 30일 운영 review에서 재검토하되 필요 이상 연장하지 않는다.
 
@@ -71,7 +73,7 @@ Account 삭제 전 순서:
 
 ## 6. Export와 사용자 요청
 
-Phase A에는 사용자 self-service export/delete endpoint가 없다. Phase B/공개 MVP 전 다음을 구현한다.
+현재 사용자 self-service export/delete endpoint가 없다. 실제 사용자 data를 받는 공개 MVP 전 다음을 구현한다.
 
 - 본인 identity와 membership metadata export
 - 자신이 actor인 audit event의 안전한 요약 범위 결정
@@ -85,7 +87,7 @@ Phase A에는 사용자 self-service export/delete endpoint가 없다. Phase B/�
 
 Full logical database backup에는 user, identity, membership, invite, audit와 session table이 포함된다. Live DB에서 삭제해도 기존 backup archive 안에는 삭제 전 data가 남을 수 있다.
 
-현재 production-sized encrypted off-host backup, backup retention 기간과 자동 만료는 아직 확정·가동되지 않았다. 따라서 실제 사용자 data 수집 전에 다음을 완료해야 한다.
+Backblaze B2 US West private bucket, provider-side encryption과 Object Lock은 준비했지만 bucket은 비어 있다. B2 application key, client-side `age` key, production dump upload/download/restore, backup retention 기간과 자동 만료는 아직 확정·가동하지 않았다. 따라서 실제 사용자 data 수집 전에 다음을 완료해야 한다.
 
 - 암호화된 off-host backup 보존 기간과 삭제 schedule 확정
 - Account deletion 뒤 backup 잔존 기간을 사용자 문서에 공개
@@ -127,9 +129,10 @@ Traffic 전 필수 순서:
 
 ## 10. 구현 checkpoint
 
-Phase B activation 전 자동화해야 할 항목:
+현재 구현 상태와 Production activation 전 남은 항목:
 
-- Expired session cleanup과 user/global revoke
+- Expired JDBC session cleanup: repository 구현, auth profile 실행 중 매분
+- User/global session revoke application service: 구현; operator CLI/API 또는 승인된 SQL rehearsal은 미완료
 - Expired/revoked/consumed invite purge
 - Audit 180일 purge와 aggregate evidence
 - Account export/delete 및 last-owner 보호

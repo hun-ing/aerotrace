@@ -1,12 +1,12 @@
 # AeroTrace Authentication Operations Runbook
 
-> 마지막 업데이트: 2026-08-26
-> 상태: Phase A schema·authorization·bootstrap invite 구현, OAuth login과 JDBC session runtime은 아직 비활성
-> 범위: 사용자 인증 기반 schema, 첫 OWNER bootstrap invite, invite 폐기와 DR security-state 무효화
+> 마지막 업데이트: 2026-09-04
+> 상태: Phase A 기반과 Phase B Backend OAuth/JDBC session 구현 완료, 기본·Production runtime 비활성, Frontend 미전환
+> 범위: 인증 profile과 endpoint, 첫 OWNER invite, activation·rollback·session 폐기, provider/DB 장애와 DR security-state 무효화
 
 ## 1. 현재 운영 경계
 
-Phase A는 인증과 onboarding의 데이터·권한 기반만 구현한다.
+Repository에는 인증과 onboarding의 데이터·권한 기반 및 opt-in Backend runtime이 구현돼 있다.
 
 ```text
 구현됨
@@ -16,16 +16,24 @@ Phase A는 인증과 onboarding의 데이터·권한 기반만 구현한다.
 - 첫 OWNER bootstrap invite 발급·폐기 operator task
 - invite hash-only 저장과 single-use consume transaction
 - 마지막 active OWNER revoke/demotion 보호
+- Spring Security GitHub OAuth2 Client + Spring Session JDBC
+- state + PKCE S256 + exact callback + exact read:user scope
+- request-only OAuth authorized client + local minimal principal
+- onboarding intent, callback provisioning, /api/v1/me와 POST logout
+- Secure/HttpOnly/SameSite=Lax cookie와 session fixation 방어
+- idle 8시간, absolute 7일, user/global session revoke service
+- CSRF, exact Origin, safe redirect와 session-bound auth rate limit
 
-아직 구현되지 않음
-- GitHub OAuth authorization/callback
-- Browser login/logout endpoint
-- Spring Security와 Spring Session JDBC runtime 연결
-- session cookie 생성·폐기
+아직 운영에 적용되지 않음 또는 Phase C 이후
+- Local/Production GitHub OAuth App 생성과 client secret 배치
+- Production `auth-production` profile 활성화와 public traffic 전환
 - Frontend login, invite 입력과 tenant/project selector
+- Session-authenticated trace query와 Frontend `AEROTRACE_API_KEY` 제거
+- User/global session revoke operator CLI/API
+- Edge/IP 기반 분산 login rate limit, account export/delete와 retention purge
 ```
 
-따라서 Phase A migration이나 bootstrap invite가 존재해도 사용자가 로그인할 수 없다. Production OAuth app/client secret을 만들거나 Frontend를 공개 인증 상태로 전환하지 않는다.
+기본값은 `aerotrace.auth.enabled=false`이며 이때 auth route는 default-deny되고 ingest/query API Key 경로만 기존대로 동작한다. Phase B source가 배포되거나 V9 table이 존재하는 것만으로 사용자가 로그인할 수 없다. Production OAuth App/secret/profile과 Frontend를 별도 승인 없이 활성화하지 않는다.
 
 Codex는 Production migration, bootstrap invite 발급·폐기, session 삭제와 invite 일괄 폐기를 자동 실행하지 않는다. 운영자가 대상 DB와 영향 범위를 확인한 뒤 명시적으로 실행한다.
 
@@ -111,7 +119,7 @@ AEROTRACE_BOOTSTRAP_INVITE=ati_<43 Base64URL characters>
 - Operator bootstrap은 `OWNER` role만 발급하고 `created_by_user_id`는 `NULL`이다.
 - DB insert와 `BOOTSTRAP_INVITE_ISSUED` audit 성공 뒤에만 원문을 반환한다.
 
-Phase B callback이 구현되기 전에는 이 token을 입력하거나 소비할 public route가 없다. 실제 사용자에게 전달하는 작업은 Phase B activation 직전에 수행한다.
+Phase B에는 token을 same-origin POST body로 검증하고 callback에서 소비하는 route가 구현돼 있다. 다만 auth profile이 비활성인 환경에는 route가 없으므로 실제 사용자 전달은 해당 환경의 activation 직전에 수행한다.
 
 ## 5. 미사용 bootstrap invite 폐기
 
@@ -159,9 +167,129 @@ Role 변경과 revoke는 tenant row와 membership row를 잠근다. 마지막 ac
 -> 기존 OWNER를 ADMIN/VIEWER로 강등하거나 revoke
 ```
 
-Phase A에는 membership을 변경하는 public API와 operator task가 없다. DB row를 수동으로 수정해 이 보호를 우회하지 않는다.
+현재 membership을 변경하는 public API와 operator task가 없다. DB row를 수동으로 수정해 이 보호를 우회하지 않는다.
 
-## 7. DR restore 뒤 security state 무효화
+## 7. Profile, OAuth App과 secret 경계
+
+인증은 명시적 Spring profile로만 켠다.
+
+| 환경 | profile | public origin | cookie |
+|---|---|---|---|
+| Local loopback HTTP | `auth-local` | 기본 `http://127.0.0.1:8080`, loopback만 허용 | `aerotrace_session`, `Secure=false`, `HttpOnly`, `SameSite=Lax`, `Path=/` |
+| Production HTTPS | `auth-production` | `AEROTRACE_PUBLIC_ORIGIN` 필수 | `__Host-aerotrace_session`, `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain` |
+
+Production origin은 lowercase scheme/host의 HTTPS origin 하나여야 하며 userinfo, path, query와 fragment를 허용하지 않는다. Local의 insecure 예외도 `localhost`, `127.0.0.1` 또는 `::1`만 허용한다. Cookie profile, scope, redirect와 lifetime이 계약과 다르면 startup이 실패한다.
+
+Local과 Production은 서로 다른 GitHub OAuth App과 client secret을 사용한다. 각 App의 callback은 다음 한 개와 정확히 일치해야 한다.
+
+```text
+<AEROTRACE_PUBLIC_ORIGIN>/login/oauth2/code/github
+```
+
+Repository나 운영 문서에 client ID/secret의 실제 값을 기록하지 않는다. Client ID도 환경 구성을 통해 넣어 배포 환경 혼동을 줄이고 client secret은 승인된 secret store 또는 mode 0600 환경 파일에서만 주입한다.
+
+```text
+SPRING_PROFILES_ACTIVE=auth-local|auth-production
+AEROTRACE_PUBLIC_ORIGIN=<exact origin>
+AEROTRACE_GITHUB_CLIENT_ID=<environment-specific client ID>
+AEROTRACE_GITHUB_CLIENT_SECRET=<secret>
+```
+
+명령 인자, shell history, CI log, screenshot과 GitHub issue에 secret을 넣지 않는다. Profile 활성화 전에는 DB backup/rollback 승인, exact callback, TLS termination, trusted proxy/header 정책과 Frontend same-origin 구성을 함께 확인한다.
+
+## 8. Endpoint와 정상 로그인 흐름
+
+Phase B Backend contract:
+
+| method/path | 인증 | 목적 | 중요 조건 |
+|---|---|---|---|
+| `GET /api/v1/auth/csrf` | anonymous 허용 | CSRF token과 anonymous JDBC session 준비 | `no-store` |
+| `POST /api/v1/onboarding/intents` | anonymous 허용 | invite 원문을 검증하고 row UUID만 session에 연결 | CSRF + exact `Origin`, `no-store` |
+| `GET /oauth2/authorization/github` | anonymous 허용 | GitHub authorization 시작 | state + PKCE S256, session rate limit |
+| `GET /login/oauth2/code/github` | OAuth callback | code 교환, identity 확인과 local principal 전환 | exact callback, generic failure |
+| `GET /api/v1/me` | local session 필수 | active user와 active tenant membership 조회 | idle/absolute expiry와 user status 확인, `no-store` |
+| `POST /api/v1/logout` | local session 필수 | 현재 session 폐기 | CSRF + exact `Origin`, `204`, `no-store` |
+
+신규 사용자의 순서는 다음과 같다.
+
+```text
+GET /api/v1/auth/csrf
+-> 응답 token과 session cookie 보관
+-> POST /api/v1/onboarding/intents
+   body={"invite":"ati_<redacted>"}
+   Origin=<exact public origin>
+   <응답이 지정한 CSRF header>=<token>
+-> GET /oauth2/authorization/github with same cookie
+-> GitHub callback
+-> session ID rotation + invite row lock/revalidation/consume
+-> local user/identity/membership/audit commit
+-> safe same-origin relative path로 302
+-> GET /api/v1/me
+```
+
+기존 active identity는 invite 없이 로그인할 수 있다. 다른 tenant의 유효한 invite를 먼저 등록하면 기존 user가 callback transaction에서 그 membership을 추가할 수 있다. 신규 identity는 유효한 invite 없이는 user나 membership을 만들지 않는다. Invite가 만료·폐기·소비됐거나 user가 disabled이면 callback 전체를 rollback한다.
+
+OAuth authorized client는 callback request attribute에만 존재한다. Refresh token, scope 불일치와 예상하지 않은 registration은 거부하고 provider access token은 local identity 확인 뒤 제거한다. JDBC session에는 provider principal/token이 아니라 `userId`와 `authenticatedAt`만 가진 local principal을 저장한다.
+
+Onboarding과 OAuth 시작은 한 anonymous session에서 10분 동안 최대 10회다. 11번째 요청은 `429`와 `Retry-After`를 반환한다. 이는 단일 session abuse 완화일 뿐 IP를 바꾸거나 cookie를 버리는 공격의 분산 제한이 아니므로 public activation에는 edge/IP rate limit과 monitoring이 별도로 필요하다.
+
+## 9. Session 수명과 폐기
+
+Spring Session JDBC의 idle timeout은 8시간이고 만료 cleanup은 매분 실행한다. Local principal의 `authenticatedAt`부터 7일이 지나면 `/api/v1/me` 요청에서 session을 무효화한다. Phase C에서 session-authenticated API를 추가할 때 같은 active-user/absolute-expiry 검사를 그 route에도 적용해야 한다.
+
+정상 logout은 Browser가 CSRF token과 exact Origin을 포함해 `POST /api/v1/logout`을 호출하는 방식이다. Disabled user나 현재 사용자 조회용 DB 접근이 실패해도 logout route는 남아 있는 cookie를 폐기할 수 있다.
+
+Application에는 user별/global revoke service가 있지만 operator CLI/API는 아직 없다. 긴급 폐기는 승인된 target DB에서 다음 SQL을 transaction으로 실행한다. `principal_name`에는 공개된 username이 아니라 local user UUID 문자열을 사용한다. Attribute row는 foreign key cascade로 삭제된다.
+
+```sql
+BEGIN;
+
+DELETE FROM aerotrace_session
+WHERE principal_name = '<local-user-uuid>';
+
+COMMIT;
+```
+
+전체 session 폐기는 모든 로그인 사용자를 즉시 로그아웃시키는 파괴적 운영 작업이다. 대상 환경, 영향과 재로그인 가능 여부를 확인하고 승인한 뒤에만 실행한다.
+
+```sql
+BEGIN;
+DELETE FROM aerotrace_session;
+COMMIT;
+```
+
+사후에는 session ID나 attribute bytes를 출력하지 않고 aggregate만 확인한다.
+
+```sql
+SELECT COUNT(*) AS session_rows
+FROM aerotrace_session;
+```
+
+## 10. Provider·DB 장애와 secret rotation
+
+| 증상 | 사용자 영향 | 운영 판단 |
+|---|---|---|
+| GitHub authorization/token/user-info 장애 | 신규 login callback은 generic `401`; tracked login attempt만 제한된 failure audit | 기존 JDBC session과 `/api/v1/me`가 정상인지 분리 확인하고 provider 응답/token을 log에 붙이지 않는다. |
+| Invalid/missing state 또는 임의 callback flood | generic `401`, session 폐기 | login-start marker 없는 callback은 audit row를 만들지 않아 DB 증폭을 제한한다. |
+| Application DB 장애 | `/api/v1/me`는 fail-closed `503`; ingest/query도 각 DB 의존성에 따라 영향 | logout은 계속 허용한다. DB 복구 전 auth를 우회하거나 user를 active로 가정하지 않는다. |
+| Disabled user | `/api/v1/me` `401`과 session 폐기 | 필요하면 user별 session SQL로 잔여 session을 삭제한다. |
+| Callback 설정 불일치 | provider 또는 callback 단계 실패 | public origin, App callback과 active profile을 exact string으로 비교한다. Wildcard callback을 추가하지 않는다. |
+
+Secret rotation은 별도 maintenance change로 수행한다.
+
+```text
+새 client secret 생성
+-> 승인된 secret store에 저장
+-> 한 Backend instance 또는 staging에서 새 secret으로 callback acceptance
+-> 전체 instance rollout
+-> 신규 login과 기존 session 확인
+-> rollback window 종료 뒤 이전 secret 폐기
+-> 실제 값을 제외한 변경 시각·승인·결과 기록
+```
+
+Provider가 old/new secret overlap을 지원하지 않는 시점에는 신규 login 중단 시간을 먼저 공지하고 rollback 자료를 준비한다. Existing JDBC session은 client secret rotation만으로 자동 폐기되지 않는다. Secret 유출이면 rotation과 별도로 전체 session 폐기 필요성을 incident 범위에 따라 판단한다.
+
+## 11. DR restore 뒤 security state 무효화
 
 Full logical backup에는 session과 invite table도 포함된다. 복원이 성공했다는 이유만으로 과거 security state를 다시 활성화하지 않는다. 격리 target 검증 후 실제 traffic을 열기 전에 다음 목표 상태를 만든다.
 
@@ -226,9 +354,9 @@ SELECT
 
 세 값이 모두 0이 아니면 traffic을 열지 않는다.
 
-## 8. Rollback과 장애 처리
+## 12. Rollback과 장애 처리
 
-Phase A는 login route와 session runtime을 활성화하지 않으므로 repository 배포만으로 사용자의 인증 흐름이 바뀌지 않는다. Flyway V9가 DB에 적용된 뒤에는 table을 임의로 drop하거나 Flyway history를 되돌리지 않는다. 문제가 있으면 애플리케이션 revision을 이전 것으로 되돌리고 추가 migration으로 교정한다.
+기본 profile에서는 login route와 session runtime을 활성화하지 않으므로 repository 배포만으로 사용자의 인증 흐름이 바뀌지 않는다. Flyway V9가 DB에 적용된 뒤에는 table을 임의로 drop하거나 Flyway history를 되돌리지 않는다. 문제가 있으면 먼저 Production에서 auth profile을 비활성화하고 기존 API Key ingest/query 경계를 확인한 뒤 애플리케이션 revision을 이전 것으로 되돌리거나 추가 migration으로 교정한다.
 
 | 증상 | 조치 |
 |---|---|
@@ -237,10 +365,11 @@ Phase A는 login route와 session runtime을 활성화하지 않으므로 reposi
 | usable bootstrap already exists | 기존 출력의 row UUID를 확인해 전달하거나 폐기한다. 원문을 잃었다면 폐기 후 재발급한다. |
 | wrong confirmation | `ISSUE`/`REVOKE`를 의도한 작업에만 정확히 설정한다. |
 | consumed invite revoke refusal | membership/user incident로 전환한다. Invite row를 삭제하거나 consumed state를 되돌리지 않는다. |
-| provider outage | Phase B login 활성화 전에는 영향 없음. Phase B에서 기존 session 유지와 신규 login 실패 대응을 추가한다. |
-| session compromise | Phase A runtime에는 session 없음. Phase B activation 전에 user별/global revoke operator를 구현한다. |
+| provider outage | 신규 login과 기존 JDBC session을 분리해 확인한다. 기존 session을 임의로 전부 삭제하지 않는다. |
+| session compromise | 대상 user UUID가 확정되면 user별 폐기를 우선하고 범위를 모르면 승인 후 global 폐기를 수행한다. |
+| auth activation regression | `auth-production` profile을 제거해 default-disabled 경계로 rollback하고 API Key ingest/query 회귀를 확인한다. |
 
-## 9. 자동 검증
+## 13. 자동 검증
 
 Backend unit/integration suite는 다음을 확인한다.
 
@@ -257,25 +386,48 @@ invite domain object `toString()` 원문·hash redaction
 bootstrap revoke와 ALREADY_REVOKED
 두 OWNER concurrent demotion에서 active OWNER 1명 보존
 Spring Session JDBC table column 호환성
+auth disabled default와 unknown route default-deny
+Local/Production origin·cookie·scope·redirect fail-closed validation
+state + PKCE S256 + exact callback + read:user authorization redirect
+invalid state provider 호출 전 거부와 callback audit flood 제한
+request-only OAuth token, refresh/scope mismatch 거부와 local principal-only session
+callback session ID rotation과 old cookie 거부
+invite-only 신규 identity transaction과 기존 identity 재로그인/추가 tenant join
+disabled user, invalid invite와 concurrent same identity/invite rollback·직렬화
+CSRF + exact Origin + malformed onboarding stale-intent 제거
+10분 10회 session rate limit과 Retry-After
+idle/absolute expiry, /api/v1/me, POST logout과 user/global session revoke
+Production __Host cookie의 Secure/HttpOnly/SameSite/Path/no Domain
+기존 OTLP ingest와 Project API Key query 경계 회귀
 ```
+
+2026-09-04 격리 Java 21 + tmpfs TimescaleDB에서 auth infrastructure 선택 테스트 39/39와 Backend 전체 29 suite, 130/130이 통과했다. Provider token과 user-info network call은 test stub으로 대체했고 Production OAuth App, secret, DB와 runtime은 변경하지 않았다.
 
 Database backup/restore acceptance는 V1~V9와 auth/session fixture를 full archive로 복원하고 11개 필수 table, aggregate count와 one-way fingerprint가 source/target에서 일치하는지 확인한다.
 
-## 10. Phase B activation checkpoint
+## 14. Production activation checkpoint
 
-다음 항목이 구현·검증되기 전에는 GitHub OAuth app과 Production login을 활성화하지 않는다.
+Repository 구현만으로 아래 운영 checkpoint가 완료된 것은 아니다. Production login은 각 항목의 evidence와 rollback 승인을 확보한 뒤 별도 change로 활성화한다.
 
-- Spring Security OAuth2 Client와 Spring Session JDBC dependency/config
-- Runtime schema initialization `never`와 table prefix `AEROTRACE_SESSION`
-- `state`, PKCE `S256`, exact callback와 minimal scope
-- Invite 검증부터 user identity/membership 생성까지 한 callback transaction
-- Production/Local cookie profile fail-closed acceptance
-- Session fixation, idle/absolute expiry, user disable와 global/user revoke
-- CSRF, Origin, safe redirect와 rate limit
-- OAuth token/session ID non-persistence scan
-- 사용자 데이터 export/delete와 backup 잔존 경계 검토
+- [x] Spring Security OAuth2 Client와 Spring Session JDBC dependency/config
+- [x] Runtime schema initialization `never`와 table prefix `AEROTRACE_SESSION`
+- [x] `state`, PKCE `S256`, exact callback와 exact `read:user` scope
+- [x] Invite 검증부터 user identity/membership 생성까지 한 callback transaction
+- [x] Production/Local cookie profile fail-closed acceptance
+- [x] Session fixation, idle/absolute expiry, user disable와 global/user revoke service
+- [x] CSRF, Origin, safe redirect와 session-bound rate limit
+- [x] OAuth token/session attribute non-persistence test
+- [ ] Production hostname/TLS/trusted proxy와 exact origin 확정
+- [ ] Local/Production GitHub OAuth App 분리 생성과 secret custody/rotation rehearsal
+- [ ] Production DB backup 승인 뒤 V9 migration 및 auth profile deployment
+- [ ] Edge/IP 분산 rate limit과 auth monitoring/alert
+- [ ] Frontend Phase C same-origin session/CSRF proxy와 API Key 제거
+- [ ] User/global revoke의 안전한 operator entry point 또는 승인된 SQL rehearsal
+- [ ] 사용자 export/delete, purge와 backup 잔존 기간 확정
+- [ ] Production-sized encrypted off-host backup/upload/download/restore rehearsal
+- [ ] Activation canary, legacy ingest/query 회귀와 default-disabled rollback rehearsal
 
-## 11. 관련 문서
+## 15. 관련 문서
 
 - [User Authentication and Onboarding Design](USER_AUTH_ONBOARDING_DESIGN.md)
 - [User Data Retention Policy](USER_DATA_RETENTION_POLICY.md)

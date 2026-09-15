@@ -5721,3 +5721,56 @@ Public self-signup, quota와 abuse protection은 없음
 - Invite 원문 대신 hash만 저장하면 어떤 공격 범위를 줄일 수 있는가?
 - 동일 invite consume와 두 OWNER 동시 demotion을 어떤 lock 순서로 직렬화했는가?
 - Session table을 backup에 포함하면서 실제 DR activation에서는 왜 모두 삭제하는가?
+
+---
+
+## Portfolio Checkpoint — User Authentication Phase B Backend
+
+### 실제로 완료한 것
+
+```text
+GitHub OAuth state + PKCE S256 + exact callback + exact read:user scope
+request-only provider authorized client와 OAuth token 비보존
+numeric GitHub subject 기반 local identity + invite-only callback transaction
+Spring Session JDBC와 local minimal principal
+Production __Host Secure/HttpOnly/SameSite=Lax/no-Domain cookie 계약
+session fixation rotation, idle 8시간, absolute 7일과 POST logout
+CSRF + exact Origin + safe redirect + session-bound rate limit
+/api/v1/me active user/membership 조회와 user/global session revoke service
+Java 21 + tmpfs TimescaleDB Backend 130/130
+```
+
+Spring Security의 authorization request와 callback/session machinery는 실제로 통과시키고 provider token·user-info network call만 test stub으로 대체했다. Callback 뒤 anonymous session ID가 회전되고 old cookie가 거부되는지, JDBC session에는 GitHub principal/token 없이 local user UUID와 인증 시각만 남는지 확인했다.
+
+Concurrent first login은 provider subject advisory transaction lock으로 직렬화하고 invite 소비, user/identity/membership/audit를 한 transaction에 묶었다. Invalid invite와 disabled user는 전체 rollback하며 기존 identity는 invite 없이 재로그인하거나 유효한 다른 tenant invite로 membership을 추가할 수 있다.
+
+### 이력서 성과 문장 초안
+
+> GitHub OAuth와 PostgreSQL server session 기반 인증을 구현하고 state·PKCE·CSRF·session fixation·token 비보존·invite 동시성 경계를 실제 Spring Security/JDBC 통합 테스트로 검증
+
+짧은 버전:
+
+> Invite-only GitHub OAuth와 서버 세션 인증을 구현하고 130개 Backend 회귀 테스트로 보안·동시성 경계를 고정
+
+### 과장하지 않을 범위
+
+```text
+Production OAuth App/client secret/profile activation은 수행하지 않음
+실제 GitHub provider를 호출하는 staging/live acceptance는 아직 없음
+Frontend login, session/CSRF BFF와 tenant/project selector는 Phase C
+Session-authenticated trace query와 Frontend API Key 제거는 아직 없음
+Rate limit은 session 단위이며 edge/IP 분산 abuse 방어는 없음
+User/global revoke operator CLI/API는 없고 application service만 구현
+Account export/delete와 invite/audit retention purge는 아직 없음
+Production-sized encrypted off-host backup/restore는 아직 없음
+```
+
+### 예상 면접 질문
+
+- OAuth provider token을 JDBC session에 저장하지 않고 어떻게 local session으로 전환했는가?
+- `state`와 PKCE, CSRF와 exact Origin은 각각 어떤 공격 경계를 담당하는가?
+- GitHub login이 아니라 numeric subject를 identity key로 사용한 이유는 무엇인가?
+- 같은 identity와 invite의 concurrent callback을 advisory lock과 row lock으로 어떻게 직렬화했는가?
+- Spring Session cookie에 명시적 serializer가 필요했던 이유는 무엇인가?
+- Disabled user 상태 검사를 logout과 기존 workload API에 적용하지 않은 이유는 무엇인가?
+- Session-bound rate limit만으로 public abuse 방어가 충분하지 않은 이유는 무엇인가?

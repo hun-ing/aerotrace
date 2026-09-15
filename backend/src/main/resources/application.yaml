@@ -24,8 +24,25 @@ spring:
     validate-on-migrate: true
     clean-disabled: true
 
+  session:
+    timeout: 8h
+    jdbc:
+      initialize-schema: never
+      table-name: AEROTRACE_SESSION
+      cleanup-cron: "0 * * * * *"
+
 server:
   port: 8080
+
+  servlet:
+    session:
+      tracking-modes: cookie
+      cookie:
+        http-only: true
+        name: __Host-aerotrace_session
+        path: /
+        same-site: lax
+        secure: true
 
 management:
   endpoints:
@@ -36,6 +53,20 @@ management:
           - metrics
 
 aerotrace:
+  auth:
+    enabled: false
+    allow-insecure-local: false
+    secure-cookie: true
+    cookie-name: __Host-aerotrace_session
+    public-origin: ""
+    success-redirect-path: /
+    absolute-session-lifetime: 7d
+    allowed-oauth-scopes:
+      - read:user
+    github:
+      client-id: ""
+      client-secret: ""
+
   ingest:
     max-spans-per-request: 5000
     max-request-body-bytes: 10485760

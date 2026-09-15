@@ -1,15 +1,15 @@
 # AeroTrace 프로젝트 컨텍스트
 
-> 마지막 업데이트: 2026-08-26
-> 현재 상태: Notification 운영·Project API Key lifecycle 검증 완료, 인증 Phase A schema·authorization·bootstrap 기반 구현, 실제 OAuth/login/session route와 Frontend 전환은 미구현
-> 현재 Phase: Phase 9 — 공개 MVP 사용자 인증 Phase B 준비
-> 다음 작업: GitHub OAuth + JDBC session Phase B를 시작하고 D+6~D+7 notification review를 병행한다. Production-sized/off-host backup은 실제 사용자 data 수집 전 필수 checkpoint다.
+> 마지막 업데이트: 2026-09-04
+> 현재 상태: Notification 운영·Project API Key lifecycle 검증 완료, 사용자 인증 Phase B Backend 구현과 격리 검증 완료. 기본·Production runtime의 인증 활성화와 Frontend 전환은 미실시
+> 현재 Phase: Phase 9 — 공개 MVP 사용자 인증 Phase B repository 완료, Phase C 준비
+> 다음 작업: Phase B 변경을 review·merge한 뒤 Frontend/BFF session 전환을 별도 Phase C로 구현한다. Production OAuth app·secret·profile activation과 production-sized encrypted off-host backup은 실제 사용자 data 수집 전 별도 승인 checkpoint다.
 
 이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
 
 ---
 
-## 현재 작업 컨텍스트 — 2026-08-26
+## 현재 작업 컨텍스트 — 2026-09-04
 
 Repository 통합 상태:
 
@@ -38,6 +38,9 @@ PR #11 notification D+5 review=merged, 79e751b
 PR #12 authentication Phase A validated head=aff4161
 PR #12 Backend/Frontend/Backup-Restore/Notification CI=PASS
 PR #12 Backend job raw invite/API Key/Slack/GitHub token matches=0
+Phase B working branch=feature/auth-phase-b-oauth-session
+Phase B isolated Backend clean test=29 suites, 130/130 PASS
+Phase B Production OAuth/DB/runtime mutation=none
 ```
 
 Slack receiver와 후속 문서·자동 검증 범위:
@@ -182,7 +185,7 @@ production mutation=수행하지 않음
 
 격리 Java 21과 tmpfs TimescaleDB에서 Backend 전체 test와 발급·조회·마지막 Key 보호·existing-project replacement·폐기·반복 폐기 acceptance를 수행한다. 실제 production tenant/project/Key와 secret file은 변경하지 않는다.
 
-사용자 인증과 onboarding 경계는 `USER_AUTH_ONBOARDING_DESIGN.md`에 계약으로 채택했고 Phase A 기반을 구현했다.
+사용자 인증과 onboarding 경계는 `USER_AUTH_ONBOARDING_DESIGN.md`에 계약으로 채택했고 Phase A 기반과 Phase B Backend runtime을 구현했다.
 
 ```text
 initial identity provider=GitHub OAuth Web Application Flow
@@ -196,12 +199,14 @@ authorization=Backend default-deny + 매 요청 active membership 확인
 BFF=allowlisted same-origin proxy, universal Project API Key 제거 목표
 Project API Key=Collector workload credential로 유지
 public self-signup=rate limit/quota/abuse 방어 전까지 보류
-implementation status=Phase A schema/authorization/bootstrap 구현, OAuth/session runtime 미구현
+implementation status=Phase B Backend 구현·격리 검증 완료, 기본/Production 비활성, Frontend 전환 미구현
 ```
 
-Phase A는 Flyway V9의 user/identity/membership/invite/audit/JDBC session table, active user/membership/project join authorization, explicit role matrix, first-owner bootstrap issue/revoke task와 concurrency/last-owner test를 구현했다. Invite 원문은 `ati_` 256-bit token으로 한 번만 반환하고 32-byte SHA-256만 저장한다. 같은 invite의 동시 consume는 정확히 한 건만 성공하며 두 OWNER의 동시 demotion 뒤 한 OWNER를 보존한다. `AUTHENTICATION_OPERATIONS_RUNBOOK.md`와 `USER_DATA_RETENTION_POLICY.md`가 구현·보존·DR 경계를 설명한다.
+Phase A는 Flyway V9의 user/identity/membership/invite/audit/JDBC session table, active user/membership/project join authorization, explicit role matrix, first-owner bootstrap issue/revoke task와 concurrency/last-owner test를 구현했다. Invite 원문은 `ati_` 256-bit token으로 한 번만 반환하고 32-byte SHA-256만 저장한다. 같은 invite의 동시 consume는 정확히 한 건만 성공하며 두 OWNER의 동시 demotion 뒤 한 OWNER를 보존한다.
 
-격리 Java 21 + TimescaleDB에서 Backend 전체 98개 test가 통과했고 V1~V9 auth/session fixture를 포함한 full logical backup/restore fingerprint가 일치했다. OAuth app 생성, client secret 배치, Spring Security/Session runtime dependency, login route, Production migration과 runtime 변경은 수행하지 않았다.
+Phase B는 Spring Security OAuth2 Client와 Spring Session JDBC, exact GitHub callback, `state`+PKCE `S256`, exact `read:user` scope, request-only provider token, local minimal principal, invite-only callback transaction, session fixation 방어, 8시간 idle/7일 absolute expiry, POST logout, user/global session revoke service, CSRF·exact Origin·safe redirect, session-bound 인증 시도 제한과 `/api/v1/me`를 구현했다. Production cookie 계약은 `__Host-aerotrace_session; Secure; HttpOnly; SameSite=Lax; Path=/; no Domain`이고 local HTTP 예외는 loopback 전용 profile만 허용한다.
+
+격리 Java 21 + TimescaleDB에서 2026-09-04 Backend 전체 130/130 test가 통과했다. 실제 OAuth redirect/callback은 provider token·user-info client를 test stub으로 대체해 state/PKCE/scope/callback, session ID 회전, old cookie 거부와 JDBC session의 local principal-only 저장을 검증했다. Phase B 소스는 opt-in이며 기본값은 `aerotrace.auth.enabled=false`다. Production OAuth app 생성, client secret 배치, Production DB migration/deploy/profile activation과 Frontend 변경은 수행하지 않았다. V1~V9 auth/session fixture를 포함한 full logical backup/restore fingerprint도 기존 검증에서 일치했다. `AUTHENTICATION_OPERATIONS_RUNBOOK.md`와 `USER_DATA_RETENTION_POLICY.md`가 구현·활성화·보존·DR 경계를 설명한다.
 
 현재 서버에 설치된 production runtime은 Webhook 기준선이다.
 

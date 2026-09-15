@@ -1,0 +1,17 @@
+server:
+  servlet:
+    session:
+      cookie:
+        name: aerotrace_session
+        secure: false
+
+aerotrace:
+  auth:
+    enabled: true
+    allow-insecure-local: true
+    secure-cookie: false
+    cookie-name: aerotrace_session
+    public-origin: ${AEROTRACE_PUBLIC_ORIGIN:http://127.0.0.1:8080}
+    github:
+      client-id: ${AEROTRACE_GITHUB_CLIENT_ID}
+      client-secret: ${AEROTRACE_GITHUB_CLIENT_SECRET}

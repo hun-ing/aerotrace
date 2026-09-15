@@ -1,0 +1,17 @@
+server:
+  servlet:
+    session:
+      cookie:
+        name: __Host-aerotrace_session
+        secure: true
+
+aerotrace:
+  auth:
+    enabled: true
+    allow-insecure-local: false
+    secure-cookie: true
+    cookie-name: __Host-aerotrace_session
+    public-origin: ${AEROTRACE_PUBLIC_ORIGIN}
+    github:
+      client-id: ${AEROTRACE_GITHUB_CLIENT_ID}
+      client-secret: ${AEROTRACE_GITHUB_CLIENT_SECRET}

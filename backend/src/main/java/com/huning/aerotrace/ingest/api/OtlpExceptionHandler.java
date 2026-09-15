@@ -14,7 +14,9 @@ import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.RecoverableDataAccessException;
 import org.springframework.dao.TransientDataAccessException;
 
-@RestControllerAdvice
+@RestControllerAdvice(
+        assignableTypes = OtlpTraceController.class
+)
 public class OtlpExceptionHandler {
 
   @ExceptionHandler(

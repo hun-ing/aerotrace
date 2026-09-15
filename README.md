@@ -2,13 +2,14 @@
 
 AeroTrace는 OpenTelemetry trace를 수집·저장·조회하고 운영 알림까지 연결하는 소규모 서비스용 APM 프로젝트다. 복잡한 분산 시스템을 먼저 도입하기보다 filesystem queue, PostgreSQL/TimescaleDB와 측정 가능한 운영 절차로 신뢰성을 단계적으로 검증한다.
 
-> 현재 단계: self-hosted MVP와 단일 운영자 production 검증 단계다. 사용자 로그인, 공개 SaaS tenant onboarding과 API Key 관리 UI는 아직 없으므로 인터넷에 그대로 공개하는 완성형 SaaS가 아니다.
+> 현재 단계: self-hosted MVP와 단일 운영자 production 검증 단계다. GitHub OAuth·invite-only onboarding·JDBC session Backend는 opt-in profile로 구현했지만 Production에서 활성화하지 않았고 Frontend도 아직 전환하지 않았다. 따라서 인터넷에 그대로 공개하는 완성형 SaaS가 아니다.
 
 ## 현재 구현 범위
 
 - OTLP/gRPC·OTLP/HTTP 수신과 OpenTelemetry Collector persistent queue
 - JSON OTLP trace ingest, Project API Key 인증과 tenant/project 격리
 - 기존 project 전용 Project API Key 조회·replacement·폐기 operator lifecycle
+- GitHub OAuth, invite-only onboarding, PostgreSQL server session과 현재 사용자 Backend API
 - TimescaleDB 저장, Flyway migration, JDBC batch insert와 중복 억제
 - 시간·service·error·최소 duration filter와 cursor 기반 trace 조회
 - Next.js BFF를 통한 trace 목록과 span timeline UI
@@ -31,6 +32,11 @@ Browser
      -> server-only BFF + Project API Key
      -> Spring Boot /api/v1/traces
 
+Opt-in Backend auth profile (Production 비활성)
+  -> invite POST + GitHub OAuth state/PKCE
+  -> Spring Session JDBC + opaque HttpOnly cookie
+  -> /api/v1/me + POST logout
+
 Collector queue evaluator
   -> filesystem notification outbox
   -> HMAC Webhook sender
@@ -44,7 +50,7 @@ Notification receiver의 HTTP 2xx는 D1 claim과 Queue write 완료를 뜻하며
 
 | 영역 | 구성 |
 |---|---|
-| Backend | Java 21, Spring Boot 4.1, Spring Web MVC, Virtual Threads, JDBC, Flyway |
+| Backend | Java 21, Spring Boot 4.1, Spring Web MVC, Spring Security/OAuth2 Client, Spring Session JDBC, Virtual Threads, JDBC, Flyway |
 | Storage | PostgreSQL 15, TimescaleDB 2.28 |
 | Telemetry | OpenTelemetry Collector Contrib 0.157, OTLP/gRPC, OTLP/HTTP |
 | Frontend | Next.js 16, React 19, TypeScript, Tailwind CSS 4 |
@@ -236,7 +242,7 @@ npm run db:migrate:local
 | [Local Runbook](LOCAL_RUNBOOK.md) | 로컬/통합 runtime과 데이터 보존 |
 | [Project API Key Lifecycle Runbook](PROJECT_API_KEY_RUNBOOK.md) | 기존 project의 Key 조회, 교체, 폐기와 침해 대응 |
 | [User Authentication and Onboarding Design](USER_AUTH_ONBOARDING_DESIGN.md) | GitHub OAuth, server session, invite-only onboarding과 tenant RBAC 구현 계약 |
-| [Authentication Operations Runbook](AUTHENTICATION_OPERATIONS_RUNBOOK.md) | Phase A schema, 첫 OWNER bootstrap invite, 폐기와 DR security-state 무효화 |
+| [Authentication Operations Runbook](AUTHENTICATION_OPERATIONS_RUNBOOK.md) | OAuth/session profile, 첫 OWNER invite, activation·rollback·session revoke와 DR 절차 |
 | [User Data Retention Policy](USER_DATA_RETENTION_POLICY.md) | 사용자 identity, membership, invite, audit와 session metadata 보존·삭제 경계 |
 | [Database Backup/Restore Runbook](DATABASE_BACKUP_RESTORE_RUNBOOK.md) | TimescaleDB backup, 빈 target 복원과 DR 경계 |
 | [Webhook Receiver Contract](WEBHOOK_RECEIVER_CONTRACT.md) | Payload, HMAC, HTTP, dedup 계약 |
@@ -250,7 +256,7 @@ npm run db:migrate:local
 
 ## 알려진 제한
 
-- Frontend는 현재 server-side Project API Key 하나를 사용하며 사용자 로그인·세션이 없다. [User Authentication and Onboarding Design](USER_AUTH_ONBOARDING_DESIGN.md)의 Phase A schema·authorization·bootstrap 기반은 구현됐지만 GitHub OAuth/session runtime과 Frontend 전환은 아직 적용되지 않았다.
+- Backend의 GitHub OAuth·invite onboarding·JDBC session Phase B는 repository에 구현됐지만 기본 설정은 `aerotrace.auth.enabled=false`다. Production OAuth app/secret/profile activation과 Frontend 로그인·tenant/project 선택 전환은 아직 수행하지 않았다.
 - Project/API Key self-service onboarding, rotation UI와 expiry alert가 없으며 lifecycle은 operator task로 수행한다.
 - 기본 Compose는 개발 편의를 위해 서비스 port를 host에 게시하므로 firewall, TLS와 접근 제어 없이 public network에 배포하면 안 된다.
 - Slack delivery는 at-least-once이며 provider timeout에서 사용자-visible duplicate가 가능하다.
