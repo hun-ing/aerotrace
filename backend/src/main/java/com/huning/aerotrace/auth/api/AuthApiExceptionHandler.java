@@ -14,7 +14,8 @@ import com.huning.aerotrace.auth.application.CurrentUserService;
 @RestControllerAdvice(
         assignableTypes = {
                 OnboardingIntentController.class,
-                CurrentUserController.class
+                CurrentUserController.class,
+                WorkspaceController.class
         }
 )
 @ConditionalOnProperty(
@@ -22,6 +23,13 @@ import com.huning.aerotrace.auth.application.CurrentUserService;
         havingValue = "true"
 )
 public class AuthApiExceptionHandler {
+
+  @ExceptionHandler(org.springframework.dao.DataAccessException.class)
+  public ResponseEntity<AuthErrorResponse> temporarilyUnavailable() {
+    return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+            .cacheControl(CacheControl.noStore())
+            .body(new AuthErrorResponse("Service is temporarily unavailable"));
+  }
 
   @ExceptionHandler(IllegalArgumentException.class)
   public ResponseEntity<AuthErrorResponse> invalidRequest() {

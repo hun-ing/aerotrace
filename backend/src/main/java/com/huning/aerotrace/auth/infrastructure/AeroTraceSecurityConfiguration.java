@@ -8,6 +8,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.oauth2.client.registration.ClientRegistration;
 import org.springframework.security.oauth2.client.registration.ClientRegistrationRepository;
 import org.springframework.security.oauth2.client.registration.ClientRegistration.ClientSettings;
@@ -176,6 +177,13 @@ public class AeroTraceSecurityConfiguration {
                                     "/api/v1/auth/csrf",
                                     "/api/v1/onboarding/intents"
                             ).permitAll()
+                            .requestMatchers(HttpMethod.GET,
+                                    "/api/v1/tenants",
+                                    "/api/v1/tenants/*/projects",
+                                    "/api/v1/projects/*",
+                                    "/api/v1/projects/*/traces",
+                                    "/api/v1/projects/*/traces/*"
+                            ).authenticated()
                             .requestMatchers(
                                     "/api/v1/me",
                                     "/api/v1/logout"

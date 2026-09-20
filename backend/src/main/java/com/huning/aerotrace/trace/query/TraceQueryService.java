@@ -1,7 +1,7 @@
 package com.huning.aerotrace.trace.query;
 
 import com.huning.aerotrace.auth.application
-        .AuthenticatedProject;
+        .ProjectScope;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -31,7 +31,7 @@ public class TraceQueryService {
   }
 
   public List<TraceListItem> findTraceList(
-          AuthenticatedProject authenticatedProject,
+          ProjectScope authenticatedProject,
           Instant from,
           Instant to,
           int limit
@@ -53,7 +53,7 @@ public class TraceQueryService {
   }
 
   public TraceListPage findTracePage(
-          AuthenticatedProject authenticatedProject,
+          ProjectScope authenticatedProject,
           Instant from,
           Instant to,
           TraceListCursor cursor,
@@ -72,7 +72,7 @@ public class TraceQueryService {
   }
 
   public TraceListPage findTracePage(
-          AuthenticatedProject authenticatedProject,
+          ProjectScope authenticatedProject,
           Instant from,
           Instant to,
           TraceListCursor cursor,
@@ -92,7 +92,7 @@ public class TraceQueryService {
   }
 
   public TraceListPage findTracePage(
-          AuthenticatedProject authenticatedProject,
+          ProjectScope authenticatedProject,
           Instant from,
           Instant to,
           TraceListCursor cursor,
@@ -113,7 +113,7 @@ public class TraceQueryService {
   }
 
   public TraceListPage findTracePage(
-          AuthenticatedProject authenticatedProject,
+          ProjectScope authenticatedProject,
           Instant from,
           Instant to,
           TraceListCursor cursor,
@@ -135,7 +135,7 @@ public class TraceQueryService {
   }
 
   private TraceListPage findTracePageInternal(
-          AuthenticatedProject authenticatedProject,
+          ProjectScope authenticatedProject,
           Instant from,
           Instant to,
           TraceListCursor cursor,
@@ -389,7 +389,7 @@ public class TraceQueryService {
   }
 
   private static void validateQuery(
-          AuthenticatedProject authenticatedProject,
+          ProjectScope authenticatedProject,
           Instant from,
           Instant to,
           int limit

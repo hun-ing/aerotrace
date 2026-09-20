@@ -1,8 +1,8 @@
 # AeroTrace Career Log
 
-> 마지막 업데이트: 2026-08-25
-> 현재 Portfolio 단계: 수집·저장·조회 MVP, notification production 운영, TimescaleDB 격리 restore와 Project API Key operator lifecycle acceptance
-> 다음 Checkpoint: notification D+5~D+7 review와 사용자 인증·onboarding 설계. Production-sized/off-host backup은 사용자 data 수집 전 필수 checkpoint
+> 마지막 업데이트: 2026-09-21
+> 현재 Portfolio 단계: 수집·운영 기반과 사용자 인증 Phase C — session-only UI·Backend project authorization의 격리 검증
+> 다음 Checkpoint: Phase C review/merge와 실제 Local OAuth E2E, 이후 Phase D credential self-service. Production activation/off-host backup은 사용자 data 수집 전 별도 필수 checkpoint
 
 이 문서는 checkpoint를 시간순으로 누적한다. 과거 항목의 `현재`와 `다음 검증`은 당시 상태이며 마지막 checkpoint가 최신 범위다.
 
@@ -5774,3 +5774,17 @@ Production-sized encrypted off-host backup/restore는 아직 없음
 - Spring Session cookie에 명시적 serializer가 필요했던 이유는 무엇인가?
 - Disabled user 상태 검사를 logout과 기존 workload API에 적용하지 않은 이유는 무엇인가?
 - Session-bound rate limit만으로 public abuse 방어가 충분하지 않은 이유는 무엇인가?
+
+---
+
+## Portfolio Checkpoint — User Authentication Phase C Frontend/Project Query
+
+기준일: 2026-09-21. 기존 Production runtime은 변경하지 않았다.
+
+공용 Project API Key dashboard를 session-only BFF와 Backend 사용자 권한 조회로 전환했다. 로그인·초대 입력·조직/프로젝트 선택·logout을 연결하고, API Key와 session이 공통 query scope를 사용하되 인증 종류는 섞지 않도록 분리했다.
+
+Backend 30 suite, 140 test로 role별 read·cross-tenant/project 격리·cursor 재사용 거부·membership 회수·disabled/absolute expiry와 기존 ingest/query를 검증했다. Frontend는 실제 Next.js HTTP route에서 Host/Origin/CSRF·Cookie 회전/삭제·redirect allowlist·cross-user SSR·safe error를 검증한다. 별도 Chromium fixture smoke에서는 프로젝트 전환 후 이전 Trace/detail/cursor 제거, 조직 전환, logout과 보호 화면 재접근을 확인했다.
+
+특히 BFF의 사전 body validation이 Backend의 stale invite 제거를 건너뛸 수 있음을 발견하고, CSRF가 유효한 요청만 invalid sentinel로 기존 intent를 비우도록 연결했다. Native HTTP 기반 테스트로 Host를 직접 제어하고, 실제 standalone 서버로 배포 형태도 검증한다.
+
+실제 GitHub provider E2E, Production OAuth/TLS/edge 활성화와 encrypted off-host backup은 완료한 것으로 주장하지 않는다. API Key self-service 관리 UI는 Phase D다.

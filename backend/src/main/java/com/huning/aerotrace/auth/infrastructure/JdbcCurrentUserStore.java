@@ -86,7 +86,9 @@ public class JdbcCurrentUserStore
             FROM tenant_memberships memberships
             JOIN tenants
               ON tenants.id = memberships.tenant_id
+            JOIN app_users ON app_users.id = memberships.user_id
             WHERE memberships.user_id = ?
+              AND app_users.status = 'ACTIVE'
               AND memberships.status = 'ACTIVE'
             ORDER BY tenants.slug,
                      tenants.id

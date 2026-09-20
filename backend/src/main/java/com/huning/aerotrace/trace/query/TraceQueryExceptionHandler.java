@@ -11,7 +11,7 @@ import org.springframework.web.bind.annotation
         .RestControllerAdvice;
 
 @RestControllerAdvice(
-        assignableTypes = TraceQueryController.class
+        assignableTypes = {TraceQueryController.class, SessionTraceQueryController.class}
 )
 public class TraceQueryExceptionHandler {
 

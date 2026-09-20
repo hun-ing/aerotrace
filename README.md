@@ -2,7 +2,7 @@
 
 AeroTrace는 OpenTelemetry trace를 수집·저장·조회하고 운영 알림까지 연결하는 소규모 서비스용 APM 프로젝트다. 복잡한 분산 시스템을 먼저 도입하기보다 filesystem queue, PostgreSQL/TimescaleDB와 측정 가능한 운영 절차로 신뢰성을 단계적으로 검증한다.
 
-> 현재 단계: self-hosted MVP와 단일 운영자 production 검증 단계다. GitHub OAuth·invite-only onboarding·JDBC session Backend는 opt-in profile로 구현했지만 Production에서 활성화하지 않았고 Frontend도 아직 전환하지 않았다. 따라서 인터넷에 그대로 공개하는 완성형 SaaS가 아니다.
+> 현재 단계: 사용자 인증 Phase C — GitHub 로그인·초대·조직/프로젝트 선택과 session-authenticated Trace UI를 repository에 구현했다. Production OAuth 활성화와 새 Frontend 배포는 미실시다. 인터넷에 그대로 공개하는 완성형 SaaS가 아니다.
 
 ## 현재 구현 범위
 
@@ -12,7 +12,7 @@ AeroTrace는 OpenTelemetry trace를 수집·저장·조회하고 운영 알림�
 - GitHub OAuth, invite-only onboarding, PostgreSQL server session과 현재 사용자 Backend API
 - TimescaleDB 저장, Flyway migration, JDBC batch insert와 중복 억제
 - 시간·service·error·최소 duration filter와 cursor 기반 trace 조회
-- Next.js BFF를 통한 trace 목록과 span timeline UI
+- Session-only Next.js BFF, GitHub 로그인·초대·조직/프로젝트 선택과 span timeline UI
 - Collector queue 상태 평가와 filesystem notification outbox
 - HMAC Webhook → Cloudflare Worker/D1/Queue → private Slack 알림
 - Retry/DLQ, receiver health, UptimeRobot email fallback과 rolling SLI
@@ -29,8 +29,9 @@ OTLP client
 
 Browser
   -> Next.js :3000
-     -> server-only BFF + Project API Key
-     -> Spring Boot /api/v1/traces
+     -> server-only BFF + opaque session cookie
+     -> Spring Boot /api/v1/projects/{projectId}/traces
+        -> active user/membership/project authorization
 
 Opt-in Backend auth profile (Production 비활성)
   -> invite POST + GitHub OAuth state/PKCE
@@ -76,6 +77,7 @@ benchmark-results/           Reproducible measurement evidence
 - Docker Engine과 Docker Compose plugin
 - 전체 host 개발을 할 때 Java 21과 Node.js 22 이상
 - 실제로 발급된 `atr_` 형식의 Project API Key
+- UI 사용에는 Local GitHub OAuth App·인증 Backend·첫 OWNER invite도 필요하다. [인증 Runbook](AUTHENTICATION_OPERATIONS_RUNBOOK.md)의 7·8·14절을 따른다.
 
 ### 1. 환경 파일 준비
 
@@ -98,10 +100,10 @@ otel-collector.env
   Backend endpoint and Project API Key
 
 frontend.env
-  Next.js BFF가 사용할 같은 Project API Key
+  Next.js BFF public origin과 명시적 local HTTP 설정 (API Key 없음)
 ```
 
-Collector와 Frontend에는 DB에 등록된 동일 Project API Key를 넣어야 한다. 원문 Key는 발급 시 한 번만 표시되고 DB에는 hash만 저장된다. Secret 파일과 발급 결과는 Git, issue, terminal command argument에 남기지 않는다.
+Collector에는 DB에 등록된 Project API Key를 넣는다. Phase C Frontend는 사용자 session만 사용한다. 원문 Key는 발급 시 한 번만 표시되고 DB에는 hash만 저장된다. Secret 파일과 발급 결과는 Git, issue, terminal command argument에 남기지 않는다.
 
 ### 2. 최초 Project API Key 발급
 
@@ -131,7 +133,7 @@ Java 21이 설치된 host에서 `.env`와 같은 DB 이름·사용자를 입력�
 )
 ```
 
-출력의 `AEROTRACE_PROVISIONED_API_KEY` 원문을 즉시 `otel-collector.env`와 `frontend.env`의 `AEROTRACE_API_KEY`에 각각 저장한다. 다른 출력 ID는 진단용 metadata이며 Key 원문을 별도 문서나 shell history에 복사하지 않는다. 같은 tenant/project slug는 같은 이름일 때 재사용하지만, 같은 이름의 활성 API Key가 있으면 중복 발급하지 않고 실패한다.
+출력의 `AEROTRACE_PROVISIONED_API_KEY` 원문을 즉시 `otel-collector.env`의 `AEROTRACE_API_KEY`에 저장한다. Frontend에는 넣지 않는다. 다른 출력 ID는 진단용 metadata이며 Key 원문을 별도 문서나 shell history에 복사하지 않는다. 같은 tenant/project slug는 같은 이름일 때 재사용하지만, 같은 이름의 활성 API Key가 있으면 중복 발급하지 않고 실패한다.
 
 기존 project의 Key 목록, 무중단 replacement 발급, 이전 Key 폐기와 긴급 폐기는 [Project API Key Lifecycle Runbook](PROJECT_API_KEY_RUNBOOK.md)을 따른다. Rotation용 `manageProjectApiKeys`는 기존 tenant/project만 허용하며 새 tenant/project를 만들지 않는다.
 
@@ -151,7 +153,9 @@ docker compose \
   up -d --build --remove-orphans
 ```
 
-Windows PowerShell에서는 다음 helper를 사용할 수 있다.
+위 기본 Compose는 인증을 활성화하지 않는다. UI 로그인은 [인증 Runbook](AUTHENTICATION_OPERATIONS_RUNBOOK.md) 14절의 `auth.env` 준비와 명시적 `docker-compose.auth.yaml` overlay를 추가해야 한다. 기존 Production에 아래 개발 명령을 그대로 적용하지 않는다.
+
+Windows PowerShell의 기존 helper도 기본 runtime용이며 인증 overlay를 자동 추가하지 않는다.
 
 ```powershell
 .\scripts\runtime\aerotrace.ps1 Up
@@ -161,7 +165,7 @@ Windows PowerShell에서는 다음 helper를 사용할 수 있다.
 
 | 대상 | 주소 |
 |---|---|
-| Trace dashboard | <http://localhost:3000> |
+| Trace dashboard (auth 설정 후) | <http://127.0.0.1:3000> |
 | Backend health | <http://localhost:8080/actuator/health> |
 | OTLP/gRPC | `localhost:4317` |
 | OTLP/HTTP | <http://localhost:4318> |
@@ -209,6 +213,7 @@ cd frontend
 npm ci
 npm run lint
 npm run build
+npm test
 ```
 
 Notification sender와 SLI:
@@ -256,7 +261,7 @@ npm run db:migrate:local
 
 ## 알려진 제한
 
-- Backend의 GitHub OAuth·invite onboarding·JDBC session Phase B는 repository에 구현됐지만 기본 설정은 `aerotrace.auth.enabled=false`다. Production OAuth app/secret/profile activation과 Frontend 로그인·tenant/project 선택 전환은 아직 수행하지 않았다.
+- 인증 Phase C 구현은 완료했지만 기본 Backend 설정은 `aerotrace.auth.enabled=false`다. Production OAuth app/secret/profile activation과 새 Frontend 배포는 미실시다. 새 Frontend를 단독 배포하면 기존 공용 API Key dashboard로 fallback하지 않는다.
 - Project/API Key self-service onboarding, rotation UI와 expiry alert가 없으며 lifecycle은 operator task로 수행한다.
 - 기본 Compose는 개발 편의를 위해 서비스 port를 host에 게시하므로 firewall, TLS와 접근 제어 없이 public network에 배포하면 안 된다.
 - Slack delivery는 at-least-once이며 provider timeout에서 사용자-visible duplicate가 가능하다.

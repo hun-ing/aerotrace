@@ -8587,3 +8587,27 @@ restored session/invite invalidation
 - 공개 self-signup, billing과 automated provisioning 도입
 - JDBC session storage가 scale/availability 병목이 될 때
 - Managed 또는 self-hosted OIDC provider의 운영 이점이 커질 때
+
+---
+
+## ADR — 사용자 Trace 조회는 Backend 권한 scope와 session-only BFF로 연결한다
+
+### 상태
+
+채택·repository 구현 — 2026-09-21. Phase B PR #13 merge `7064c98` 위에서 Phase C를 구현했다. Production 활성화는 별도 승인이다.
+
+### 결정
+
+- API Key 인증 결과와 사용자 session의 조회 권한은 공통 `ProjectScope(tenantId, projectId)`로 query service에 전달한다. 사용자 session을 가짜 API Key로 만들지 않는다.
+- Backend는 active user/membership/project join으로 project scope를 결정한다. Browser tenant/role header는 권한 근거로 쓰지 않는다. 관계 없는 resource는 `404`, 세션 없음/만료/disabled user는 `401`이다.
+- 기존 query parser·project-scoped cursor fingerprint·repository를 재사용한다. Backend legacy `/api/v1/traces`는 API Key 호환용으로 유지하지만 Frontend `/api/traces`와 공용 Key 환경변수는 제거한다.
+- Next.js는 server-only DAL과 explicit method/path/header/query allowlist를 공유한다. Cookie와 redirect도 검증하고 POST는 exact Origin과 Backend CSRF를 모두 요구한다.
+- 잘못된 초대 POST를 BFF에서 거절해도 invalid sentinel을 Backend에 보내 CSRF 확인 후 기존 intent를 제거한다. 원문 초과 body·malformed input은 중계하지 않는다.
+- 조직/프로젝트 전환은 전체 문서 이동으로 이전 cursor·선택·client state를 버린다. SSR은 Backend를 직접 조회하며 cross-request 권한 cache는 두지 않는다.
+- Executable contract는 Backend `AuthPhaseCWebIntegrationTest`와 Frontend HTTP suite로 관리한다. Endpoint 설명은 인증 Runbook에 모아 별도 중복 API 설명서를 만들지 않는다.
+
+### 비용과 배포 경계
+
+전체 문서 이동은 client-only 전환보다 비용이 있지만 권한 재검증과 상태 초기화가 명확하다. 추후 client navigation을 최적화하더라도 project/user 경계와 cache invalidation 회귀를 먼저 확보한다.
+
+새 Frontend는 인증 Backend가 준비되지 않으면 기존 Key dashboard로 fallback하지 않는다. 따라서 Frontend 단독 배포를 금지하고 OAuth App·정확한 public origin·TLS/edge 정책·rollback을 함께 승인한다. `/health`는 프로세스 liveness이며 로그인 readiness가 아니다. DB migration은 추가하지 않았고 production-sized encrypted off-host backup 보류 상태도 변경하지 않는다.

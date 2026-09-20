@@ -36,6 +36,7 @@ http-client.private.env.json
 /.env
 /otel-collector.env
 /frontend.env
+/auth.env
 
 # Temporary Phase 9 snapshots
 /phase9-*.zip

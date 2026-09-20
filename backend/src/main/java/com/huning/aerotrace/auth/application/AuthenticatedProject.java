@@ -8,7 +8,7 @@ public record AuthenticatedProject(
         UUID tenantId,
         UUID projectId,
         String keyId
-) {
+) implements ProjectScope {
 
   public AuthenticatedProject {
     Objects.requireNonNull(

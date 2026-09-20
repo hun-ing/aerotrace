@@ -6,6 +6,8 @@ import {
     useState,
 } from "react";
 
+import { sessionFetch } from "@/features/auth/session-client";
+
 type TraceSpan = Readonly<{
     spanId: string;
     parentSpanId: string | null;
@@ -28,6 +30,7 @@ type TraceDetailResponse = Readonly<{
 }>;
 
 type TraceDetailPanelProps = Readonly<{
+    projectId: string;
     traceId: string;
     activeQuery: string;
     onClose: () => void;
@@ -454,6 +457,7 @@ function getStatusClassName(
 }
 
 export default function TraceDetailPanel({
+                                             projectId,
                                              traceId,
                                              activeQuery,
                                              onClose,
@@ -482,8 +486,8 @@ export default function TraceDetailPanel({
                 const query =
                     createDetailQuery(activeQuery);
 
-                const response = await fetch(
-                    `/api/traces/${encodeURIComponent(
+                const response = await sessionFetch(
+                    `/api/v1/projects/${projectId}/traces/${encodeURIComponent(
                         traceId,
                     )}?${query.toString()}`,
                     {
@@ -545,7 +549,7 @@ export default function TraceDetailPanel({
         return () => {
             abortController.abort();
         };
-    }, [activeQuery, traceId]);
+    }, [activeQuery, traceId, projectId]);
 
     const timeline = useMemo(() => {
         if (

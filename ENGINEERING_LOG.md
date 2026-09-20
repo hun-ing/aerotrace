@@ -16170,3 +16170,50 @@ ignored PostgreSQL analysis scripts=수정/stage 대상 제외
 ```
 
 별도 `AUTH_API_CONTRACT.md`를 지금 추가하면 설계와 Runbook의 endpoint 설명을 중복하게 되므로 만들지 않았다. Phase C에서 Frontend가 실제로 소비하는 session-authenticated trace/project API가 확정될 때 OpenAPI 또는 executable contract test를 canonical 계약으로 추가하는 편이 낫다. Public activation 전에는 privacy notice/account request 절차와 edge rate-limit/monitoring 문서가 실제 운영 설정에 맞게 필요하다.
+
+---
+
+## V-7B-4-25 User Authentication Phase C — Frontend와 사용자별 Project Query
+
+검증일: 2026-09-16, 최종 재검증 2026-09-21 KST. 기준은 Phase B PR #13 merge `7064c98`이며 작업 branch는 `feature/auth-phase-c-frontend`다.
+
+### 구현
+
+`ProjectScope`로 API Key의 인증 결과와 사용자 session의 권한 확인 결과가 같은 query service를 사용하도록 분리했다. 새 tenant/project metadata와 project Trace list/detail API는 Backend의 active user·active membership·project join을 통과해야 한다. 관계 없는 resource는 `404`, 세션 없음·absolute expiry·disabled user는 `401`이며 role은 session에 복사해 신뢰하지 않는다. Parser와 tenant/project query fingerprint를 재사용해 cursor의 project 간 재사용도 거부한다. DB migration은 추가하지 않았다.
+
+Next.js에는 로그인·초대 입력·조직/프로젝트 선택·logout UI와 server-only DAL/BFF를 추가했다. Frontend 공용 `AEROTRACE_API_KEY`와 `/api/traces`는 제거했고 Backend의 legacy Key query는 유지했다. 요청의 Host/Origin/CSRF, method/path/query/header allowlist, session cookie와 OAuth redirect를 공통 처리하며 인증·조회 응답은 `no-store`다. SSR은 Backend를 직접 읽고 프로젝트 변경은 전체 문서 이동으로 이전 filter/cursor/detail 상태를 버린다.
+
+`auth.env.example`·명시적 Compose auth overlay·Frontend env example을 추가했다. 실제 secret 파일이나 Production profile은 건드리지 않았다. Frontend `/health`는 process liveness로 분리했으며, 인증 Backend 없이 새 Frontend만 배포하면 기존 Key dashboard로 fallback하지 않는다는 경계를 문서에 명시했다.
+
+### 검토 중 보완한 사항
+
+- BFF의 사전 body validation이 Backend의 stale invite 제거를 우회할 수 있어, CSRF가 유효한 요청에서만 빈 invite sentinel로 이전 intent를 비운다. Oversized/malformed/invalid UTF-8 원문은 전달하지 않는다.
+- 범용 IllegalArgument advice가 UUID 변환 오류의 원인 예외를 먼저 처리해 `400`을 반환했다. Workspace의 명시적 hidden-resource handler 우선순위를 고정하고 `404` 회귀를 검증했다.
+- Node fetch가 테스트의 Host override를 실제 요청에 반영하지 않아 Host 검증 결과가 잘못 나왔다. Native HTTP client로 host를 직접 제어하고 Production/local cookie 계약을 다시 검증했다.
+- Frontend 테스트는 `next start` 대신 build 산출물의 standalone server를 실행한다. 기존 API Key canary가 upstream으로 전달되지 않는지도 확인한다.
+- 문서의 legacy API Key smoke에 필수 `from`/`to`가 빠져 있어 보완했고, Phase C 배포 전후의 rotation 대상도 분리했다.
+
+### 최종 검증 근거
+
+```text
+Backend Java 21 + isolated tmpfs TimescaleDB, test --rerun-tasks=PASS
+Backend suites=30, tests=140, failures/errors/skipped=0
+Frontend lint=PASS
+Frontend Webpack production build + TypeScript=PASS
+Frontend standalone HTTP contract=10 scenarios + parent, 11/11 PASS
+explicit auth Compose config with examples, no service env resolution=PASS
+Chromium fixture login/project/tenant/logout smoke=PASS
+project switch previous trace/detail/cursor reset=PASS
+mobile 390px document overflow=none
+browser pageerror=0
+```
+
+기본 Turbopack build는 이 실행 환경의 PostCSS 하위 프로세스 port binding 권한 제한으로 실패했다. Webpack으로 local production build를 검증했고 CI의 기본 build는 바꾸지 않았다. GitHub CI 결과는 PR에서 별도로 확인한다. Chromium smoke는 설치된 browser와 fake Backend만 사용했고 실제 GitHub provider login은 실행하지 않았다. Headless 환경의 한글 font 부재 때문에 screenshot의 한글 glyph는 제한이 있었으나 DOM text/interaction은 정상 확인했다.
+
+### 문서와 운영 경계
+
+README, Frontend README, Context, auth design/runbook, API Key runbook, user retention, Security Policy와 ADR을 대조했다. “Frontend 미구현”과 “Production 미배포”를 분리하고 callback/secret/profile·rollback 설명은 인증 Runbook에 모았다. 별도 API 설명서 대신 Backend/Frontend executable contract를 기준으로 사용해 중복을 줄였다.
+
+남은 출시 문서는 실제 활성화 설정이 정해질 때 작성할 privacy notice/account request 절차와 edge rate-limit/monitoring 운영 기준이다. 기존 activation checkpoint와 중복되는 범용 체크리스트는 추가하지 않았다.
+
+Production OAuth App/secret·DB·runtime·systemd·Cloudflare는 변경하지 않았다. 운영자 전용 후속 단계는 실제 Local OAuth E2E, Phase D self-service credential lifecycle와 별도 Production activation 승인이다. Production-sized encrypted off-host backup은 기존 보류 상태이며 실제 사용자 data 수집 전에 완료해야 한다. 분석 스크립트 3개는 수정하거나 stage하지 않는다.

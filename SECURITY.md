@@ -6,7 +6,7 @@
 
 AeroTrace has not published a stable release yet. Security fixes are made against the latest commit on `main`; older branches and untagged snapshots are not separately supported.
 
-The repository contains an opt-in GitHub OAuth and JDBC session Backend, but Production authentication and the Frontend login flow are not active yet. Reports about either the implemented auth code or the currently deployed API-key/notification boundaries are in scope; the inactive Production state is not a claim that the code is security-tested by public traffic.
+The repository contains an opt-in GitHub OAuth/JDBC session Backend and a session-only Frontend with invite login, tenant/project selection and per-request project authorization. Production authentication and deployment of that Frontend are not active yet. Reports about either the implemented auth code or the currently deployed API-key/notification boundaries are in scope; the inactive Production state is not a claim that the code is security-tested by public traffic.
 
 ## Reporting a vulnerability
 
