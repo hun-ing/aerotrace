@@ -48,6 +48,8 @@ Production은 `AEROTRACE_PUBLIC_ORIGIN=https://<approved-host>`, insecure flag�
 ## 자동 검증
 
 ```bash
+npm ci
+npm audit --audit-level=high
 npm run lint
 npm run build
 npm test

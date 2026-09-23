@@ -16217,3 +16217,21 @@ README, Frontend README, Context, auth design/runbook, API Key runbook, user ret
 남은 출시 문서는 실제 활성화 설정이 정해질 때 작성할 privacy notice/account request 절차와 edge rate-limit/monitoring 운영 기준이다. 기존 activation checkpoint와 중복되는 범용 체크리스트는 추가하지 않았다.
 
 Production OAuth App/secret·DB·runtime·systemd·Cloudflare는 변경하지 않았다. 운영자 전용 후속 단계는 실제 Local OAuth E2E, Phase D self-service credential lifecycle와 별도 Production activation 승인이다. Production-sized encrypted off-host backup은 기존 보류 상태이며 실제 사용자 data 수집 전에 완료해야 한다. 분석 스크립트 3개는 수정하거나 stage하지 않는다.
+
+### PR #14 Frontend 보안 검사 후속 조치 — 2026-09-22~23
+
+초기 구현 commit `44f75aa`의 Backend·Notification CI는 통과했지만 Frontend CI는 `npm audit --audit-level=high`에서 중단됐다. 당시 audit 결과는 Next.js critical 1개 package와 sharp·js-yaml high 2개 package였다. CI의 lint/build/test는 이 실패 뒤 실행되지 않았으므로 local 통과 결과와 구분한다.
+
+공식 보안 공지의 수정 범위에 맞춰 `next`와 `eslint-config-next`를 `16.3.2 → 16.3.3`, lockfile의 `sharp`를 `0.35.3 → 0.35.4`, `js-yaml`을 `4.3.1 → 4.3.2`로 갱신했다. Next.js/sharp 플랫폼별 binary와 libvips, resolver가 함께 갱신한 개발 의존성 `fastq 1.20.1 → 1.20.3`도 lockfile 비교에서 확인했다. React 버전·애플리케이션 코드·CI 차단 기준은 바꾸지 않았고 `npm audit fix --force`나 임의 override는 사용하지 않았다.
+
+근거: [Next.js 16.3.3 보안 패치](https://github.com/vercel/next.js/releases/tag/v16.3.3), [sharp 보안 공지](https://github.com/lovell/sharp/security/advisories/GHSA-rgj7-g3m4-5g8c), [js-yaml 보안 공지](https://github.com/nodeca/js-yaml/security/advisories/GHSA-2883-xcg3-v3hh).
+
+```text
+locked dependency install: npm ci=PASS
+npm audit --audit-level=high=PASS, 0 vulnerabilities (2026-09-23)
+npm run lint=PASS
+npm run build -- --webpack=PASS, TypeScript 포함
+npm test=11/11 PASS, failures/cancelled/skipped=0 (2026-09-23)
+```
+
+기본 Turbopack build와 전체 CI의 최종 상태는 [PR #14](https://github.com/hun-ing/aerotrace/pull/14)의 최신 commit checks에서 확인한다. 이번 변경은 repository 의존성 패치이며 기존 Production image의 갱신이나 보안 상태 확인을 의미하지 않는다. Production 배포 경계와 실제 OAuth E2E 미실시 상태는 위와 동일하다.

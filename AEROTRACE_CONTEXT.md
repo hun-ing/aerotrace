@@ -1,15 +1,15 @@
 # AeroTrace 프로젝트 컨텍스트
 
-> 마지막 업데이트: 2026-09-21
+> 마지막 업데이트: 2026-09-23
 > 현재 상태: 사용자 인증 Phase C — session-only Frontend와 사용자별 tenant/project/Trace 조회 구현. 기존 Production image·OAuth 설정·DB는 변경하지 않음
-> 현재 Phase: Phase 9 — Phase C repository 검증·review 준비
+> 현재 Phase: Phase 9 — Phase C PR #14 review, Frontend 보안 패치 검증 완료
 > 다음 작업: Phase C review/merge 후 실제 Local GitHub OAuth E2E를 확인하고 Phase D credential self-service를 구현한다. Production OAuth 활성화·새 Frontend 배포·production-sized encrypted off-host backup은 실제 사용자 data 수집 전 별도 승인 checkpoint다.
 
 이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
 
 ---
 
-## 현재 작업 컨텍스트 — 2026-09-21
+## 현재 작업 컨텍스트 — 2026-09-23
 
 Repository 통합 상태:
 
@@ -48,6 +48,12 @@ Phase C Frontend HTTP contract=10 scenarios + parent test PASS
 Phase C Frontend lint/TypeScript/Webpack build=PASS
 Phase C Chromium fixture smoke=project/tenant switch, detail reset, logout PASS
 Phase C Production OAuth/DB/runtime mutation=none
+PR #14 authentication Phase C=open, implementation head=44f75aa
+PR #14 initial Backend/Notification CI=PASS
+PR #14 initial Frontend CI=npm audit failed; patched locally, latest CI tracked in PR
+Phase C security patch=Next.js/eslint-config-next 16.3.3, sharp 0.35.4, js-yaml 4.3.2
+Phase C patched Frontend audit=0 vulnerabilities, 2026-09-23
+Phase C patched Frontend lint/TypeScript/Webpack build/HTTP contract=PASS
 ```
 
 Slack receiver와 후속 문서·자동 검증 범위:
