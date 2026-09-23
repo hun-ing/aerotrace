@@ -47,9 +47,9 @@ public class AuthenticatedSessionValidationFilter
   protected boolean shouldNotFilter(
           HttpServletRequest request
   ) {
-    return !"/api/v1/me".equals(
-            request.getRequestURI()
-    );
+    String path = request.getRequestURI();
+    return !(path.equals("/api/v1/me") || path.equals("/api/v1/tenants")
+            || path.startsWith("/api/v1/tenants/") || path.startsWith("/api/v1/projects/"));
   }
 
   @Override
@@ -62,12 +62,9 @@ public class AuthenticatedSessionValidationFilter
             SecurityContextHolder.getContext()
                     .getAuthentication();
 
-    if (
-            authentication == null
-                    || !(authentication.getPrincipal()
-                    instanceof AeroTracePrincipal principal)
-    ) {
-      filterChain.doFilter(request, response);
+    if (authentication == null || !authentication.isAuthenticated()
+            || !(authentication.getPrincipal() instanceof AeroTracePrincipal principal)) {
+      invalidateAuthentication(request, response);
       return;
     }
 

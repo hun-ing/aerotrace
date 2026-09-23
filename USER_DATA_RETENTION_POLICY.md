@@ -1,7 +1,7 @@
 # AeroTrace User Data Retention Policy
 
-> 마지막 업데이트: 2026-09-04
-> 상태: Phase B Backend 데이터 흐름 구현, Production 수집 비활성. 자동 domain-data purge와 사용자 self-service export/delete는 미구현
+> 마지막 업데이트: 2026-09-21
+> 상태: Phase C session-only Frontend까지 구현, Production 수집 비활성. 자동 domain-data purge와 사용자 self-service export/delete는 미구현
 > 범위: 사람의 identity, tenant membership, onboarding invite, security audit와 server session metadata
 
 ## 1. 목적과 다른 정책과의 경계
@@ -9,6 +9,8 @@
 이 문서는 AeroTrace에 로그인하는 사람과 관련된 metadata의 최소 수집, 보존, 삭제와 복원 후 처리를 정한다. Trace payload, Project API Key와 Cloudflare notification data의 보존은 각각 기존 database/notification 정책과 runbook을 따른다.
 
 Phase B Backend에는 OAuth login과 JDBC session 데이터 흐름이 구현됐지만 기본·Production auth profile은 비활성이고 실제 GitHub OAuth App/secret도 배치하지 않았다. 따라서 현재 Production은 이 흐름으로 사용자 data를 수집하지 않는다. 아래 보존 목표 중 자동 purge가 없는 값은 이미 보장되는 retention으로 표현하지 않는다.
+
+Phase C Frontend는 현재 사용자·membership·project metadata와 권한 있는 Trace를 표시한다. 별도 identity DB, localStorage/sessionStorage의 auth token, OAuth token 보관은 추가하지 않는다. Invite는 POST 처리에만 사용하고 application log·URL·browser storage에 남기지 않는다. Session/조회 응답은 `no-store`이며 raw Cookie와 callback query를 edge access log에서도 제외하는 것은 Production 활성화 전 검증 항목이다. 새 Frontend 배포만으로 보존·삭제 정책이 구현됐다고 보지 않는다.
 
 ## 2. 수집하는 데이터
 

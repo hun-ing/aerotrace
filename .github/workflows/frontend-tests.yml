@@ -52,3 +52,6 @@ jobs:
 
       - name: Build Frontend
         run: npm run build
+
+      - name: Test session BFF and SSR authorization
+        run: npm test

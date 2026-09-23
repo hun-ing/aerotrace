@@ -1,13 +1,13 @@
 # AeroTrace User Authentication and Onboarding Design
 
-> 상태: 채택 — Phase A 기반과 Phase B Backend OAuth/session 구현 완료, Production 비활성·Phase C Frontend 미구현
+> 상태: 채택 — Phase A/B와 Phase C session-authenticated query·Frontend 구현, Production 활성화 미실시
 > 결정일: 2026-08-25
 > 적용 범위: 공개 Web UI의 사용자 로그인, tenant membership, project 선택과 Project API Key self-service 경계
-> 현재 구현 여부: V9 schema·authorization·bootstrap과 opt-in GitHub OAuth/JDBC session Backend 구현 및 격리 검증 완료. 기본·Production runtime은 인증 비활성이며 현재 Frontend는 계속 server-only Project API Key 하나를 사용한다.
+> 현재 구현 여부: V9 기반·OAuth/JDBC session·project query와 로그인/초대/조직/프로젝트 UI를 repository에 구현했다. 기본 Backend와 기존 Production 인증은 비활성이다. 새 Frontend에는 Project API Key fallback이 없다.
 
 ## 1. 목적
 
-현재 AeroTrace는 Collector와 Next.js BFF가 같은 Project API Key로 Backend에 접근한다. 이 방식은 local 개발과 제한된 PoC에는 단순하지만, Frontend에 접근한 사람을 구분하지 못하고 서버당 한 project만 조회할 수 있다.
+이 설계 이전에는 Collector와 Next.js BFF가 같은 Project API Key로 Backend에 접근했다. 이 방식은 local 개발과 제한된 PoC에는 단순하지만, Frontend에 접근한 사람을 구분하지 못하고 서버당 한 project만 조회할 수 있었다. Phase C는 사용자 조회를 session과 현재 membership 기반으로 분리한다.
 
 이 문서는 공개 MVP 구현 전에 다음 경계를 고정한다.
 
@@ -21,11 +21,11 @@
 
 ## 2. 현재 상태와 변경하지 않는 것
 
-현재 구현은 다음과 같다.
+Phase C repository 구현의 경계는 다음과 같다. 기존 Production image는 이 전환과 별개다.
 
 ```text
 Collector -> Project API Key -> POST /v1/traces
-Browser -> Next.js BFF -> server-only Project API Key -> GET /api/v1/traces
+Browser -> Next.js BFF -> user session -> GET /api/v1/projects/{projectId}/traces
 Project API Key -> tenant_id + project_id
 ```
 
@@ -266,12 +266,13 @@ GitHub
 
 ### 7.2 API 경계
 
-구체 path는 구현 PR에서 OpenAPI/Controller test와 함께 확정하되 다음 resource shape를 사용한다.
+Phase C read API와 auth endpoint는 Backend Controller test와 `frontend/tests/session-bff.test.mjs`로 계약을 검증한다. 아래 API Key self-service 세 경로는 Phase D 계획이며 아직 허용하지 않는다.
 
 ```text
 GET  /api/v1/me
 GET  /api/v1/tenants
 GET  /api/v1/tenants/{tenantId}/projects
+GET  /api/v1/projects/{projectId}
 GET  /api/v1/projects/{projectId}/traces
 GET  /api/v1/projects/{projectId}/traces/{traceId}
 
@@ -363,6 +364,10 @@ Production OAuth app/secret/profile/runtime mutation=none
 3. Login, invite code 입력, tenant/project selector와 logout UI
 4. Frontend `AEROTRACE_API_KEY` 제거
 5. Existing local API Key query compatibility 확인
+
+2026-09-16 repository 구현: 위 5개 범위를 연결했다. Project metadata route를 추가해 직접 URL로 진입하는 SSR에도 같은 Backend 권한 검사를 적용한다. `ProjectScope`는 인증 종류와 무관한 query scope이며 session을 가짜 API Key로 변환하지 않는다. 공통 parser와 기존 query fingerprint로 cursor의 tenant/project 경계를 유지한다.
+
+Next.js는 server-only DAL·allowlisted proxy·exact Host/Origin·CSRF·검증된 Set-Cookie/redirect만 사용한다. 이전 Frontend `/api/traces`는 제거했다. 조직/프로젝트 변경은 전체 문서 이동으로 cursor·Trace 선택·client state를 초기화한다. 실제 GitHub OAuth E2E와 Production 활성화는 이 repository 완료와 분리한다.
 
 ### Phase D — Self-service credential lifecycle
 

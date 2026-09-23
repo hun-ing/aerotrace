@@ -1,15 +1,15 @@
 # AeroTrace 프로젝트 컨텍스트
 
-> 마지막 업데이트: 2026-09-04
-> 현재 상태: Notification 운영·Project API Key lifecycle 검증 완료, 사용자 인증 Phase B Backend 구현과 격리 검증 완료. 기본·Production runtime의 인증 활성화와 Frontend 전환은 미실시
-> 현재 Phase: Phase 9 — 공개 MVP 사용자 인증 Phase B repository 완료, Phase C 준비
-> 다음 작업: Phase B 변경을 review·merge한 뒤 Frontend/BFF session 전환을 별도 Phase C로 구현한다. Production OAuth app·secret·profile activation과 production-sized encrypted off-host backup은 실제 사용자 data 수집 전 별도 승인 checkpoint다.
+> 마지막 업데이트: 2026-09-23
+> 현재 상태: 사용자 인증 Phase C — session-only Frontend와 사용자별 tenant/project/Trace 조회 구현. 기존 Production image·OAuth 설정·DB는 변경하지 않음
+> 현재 Phase: Phase 9 — Phase C PR #14 review, Frontend 보안 패치 검증 완료
+> 다음 작업: Phase C review/merge 후 실제 Local GitHub OAuth E2E를 확인하고 Phase D credential self-service를 구현한다. Production OAuth 활성화·새 Frontend 배포·production-sized encrypted off-host backup은 실제 사용자 data 수집 전 별도 승인 checkpoint다.
 
 이 문서는 최신 요약 뒤에 Phase별 기록을 누적한다. 아래쪽의 `현재 Phase`와 `다음 작업` 표현은 각 기록 당시의 상태이며, 상충할 때는 이 최상단 작업 컨텍스트를 current truth로 사용한다.
 
 ---
 
-## 현재 작업 컨텍스트 — 2026-09-04
+## 현재 작업 컨텍스트 — 2026-09-23
 
 Repository 통합 상태:
 
@@ -41,6 +41,19 @@ PR #12 Backend job raw invite/API Key/Slack/GitHub token matches=0
 Phase B working branch=feature/auth-phase-b-oauth-session
 Phase B isolated Backend clean test=29 suites, 130/130 PASS
 Phase B Production OAuth/DB/runtime mutation=none
+PR #13 authentication Phase B=merged, 7064c98
+Phase C working branch=feature/auth-phase-c-frontend
+Phase C Backend test=140/140 PASS in isolated TimescaleDB
+Phase C Frontend HTTP contract=10 scenarios + parent test PASS
+Phase C Frontend lint/TypeScript/Webpack build=PASS
+Phase C Chromium fixture smoke=project/tenant switch, detail reset, logout PASS
+Phase C Production OAuth/DB/runtime mutation=none
+PR #14 authentication Phase C=open, implementation head=44f75aa
+PR #14 initial Backend/Notification CI=PASS
+PR #14 initial Frontend CI=npm audit failed; patched locally, latest CI tracked in PR
+Phase C security patch=Next.js/eslint-config-next 16.3.3, sharp 0.35.4, js-yaml 4.3.2
+Phase C patched Frontend audit=0 vulnerabilities, 2026-09-23
+Phase C patched Frontend lint/TypeScript/Webpack build/HTTP contract=PASS
 ```
 
 Slack receiver와 후속 문서·자동 검증 범위:
@@ -154,7 +167,7 @@ npm run db:migrate:local
 
 현재 Node test 17개, Wrangler 4.125.0 bundle dry-run과 fresh local D1 migration이 통과했다. GitHub Actions에는 Python 3.10 sender job과 Node.js 22 receiver job이 포함된다.
 
-Repository CI는 notification sender/receiver, Frontend와 Backend를 각각 독립 workflow로 검증한다. Frontend workflow는 Node.js 22에서 clean install, high severity dependency audit, lint와 production build를 수행한다. Backend workflow는 Java 21과 ephemeral TimescaleDB에서 전체 test와 Project API Key provisioning/lifecycle acceptance를 수행한다.
+Repository CI는 notification sender/receiver, Frontend와 Backend를 각각 독립 workflow로 검증한다. Frontend workflow는 Node.js 22에서 clean install, high severity dependency audit, lint, production build와 BFF/SSR HTTP contract를 수행한다. Backend workflow는 Java 21과 ephemeral TimescaleDB에서 전체 test와 Project API Key provisioning/lifecycle acceptance를 수행한다.
 
 최초 Project API Key bootstrap은 자동 startup이나 Compose hook이 아니라 운영자가 명시적으로 실행하는 Gradle task다.
 
@@ -167,7 +180,7 @@ duplicate policy=같은 이름의 active key 재발급 거부
 CI acceptance=ephemeral TimescaleDB 첫 발급 + duplicate 거부 PASS
 ```
 
-실행 순서는 root `README.md`에 있으며 원문 Key는 Collector와 Frontend의 local secret file에만 저장한다. Production tenant/project/key는 이번 CI 검증에서 생성하거나 변경하지 않았다.
+실행 순서는 root `README.md`에 있다. Phase C Frontend에는 Key를 넣지 않고 Collector workload secret만 유지한다. 기존 Production의 legacy Frontend가 아직 같은 Key를 사용하는 기간은 `PROJECT_API_KEY_RUNBOOK.md`의 전환 전 경계를 따른다. Production tenant/project/key는 변경하지 않았다.
 
 기존 project의 credential lifecycle은 `manageProjectApiKeys` Gradle task와 `PROJECT_API_KEY_RUNBOOK.md`로 관리한다.
 
@@ -196,15 +209,17 @@ session=Spring Security + Spring Session JDBC, opaque HttpOnly cookie
 onboarding=invite-only, raw invite one-time output + hash-only DB storage
 membership=tenant-level OWNER / ADMIN / VIEWER
 authorization=Backend default-deny + 매 요청 active membership 확인
-BFF=allowlisted same-origin proxy, universal Project API Key 제거 목표
+BFF=allowlisted same-origin session proxy, universal Project API Key 제거 구현
 Project API Key=Collector workload credential로 유지
 public self-signup=rate limit/quota/abuse 방어 전까지 보류
-implementation status=Phase B Backend 구현·격리 검증 완료, 기본/Production 비활성, Frontend 전환 미구현
+implementation status=Phase C Backend/Frontend 구현·격리 검증, 기본 Backend/기존 Production 비활성, 새 image 배포 미실시
 ```
 
 Phase A는 Flyway V9의 user/identity/membership/invite/audit/JDBC session table, active user/membership/project join authorization, explicit role matrix, first-owner bootstrap issue/revoke task와 concurrency/last-owner test를 구현했다. Invite 원문은 `ati_` 256-bit token으로 한 번만 반환하고 32-byte SHA-256만 저장한다. 같은 invite의 동시 consume는 정확히 한 건만 성공하며 두 OWNER의 동시 demotion 뒤 한 OWNER를 보존한다.
 
 Phase B는 Spring Security OAuth2 Client와 Spring Session JDBC, exact GitHub callback, `state`+PKCE `S256`, exact `read:user` scope, request-only provider token, local minimal principal, invite-only callback transaction, session fixation 방어, 8시간 idle/7일 absolute expiry, POST logout, user/global session revoke service, CSRF·exact Origin·safe redirect, session-bound 인증 시도 제한과 `/api/v1/me`를 구현했다. Production cookie 계약은 `__Host-aerotrace_session; Secure; HttpOnly; SameSite=Lax; Path=/; no Domain`이고 local HTTP 예외는 loopback 전용 profile만 허용한다.
+
+Phase C는 `ProjectScope`로 API Key와 사용자 session의 query 경계를 분리했다. Backend가 active user/membership/project join으로 scope를 결정하고 tenant/project metadata와 Trace 목록/상세를 제공한다. Next.js는 로그인·초대·선택·logout UI, exact Host/Origin·CSRF·cookie/redirect allowlist·server-only DAL을 사용한다. 프로젝트 전환은 전체 문서 이동으로 기존 query/cursor/detail 상태를 버린다. 이전 Frontend `/api/traces`는 제거됐고 Backend legacy API Key query만 호환 유지한다. 인증 Backend 없이 새 Frontend만 배포하면 기존 dashboard로 fallback하지 않는다.
 
 격리 Java 21 + TimescaleDB에서 2026-09-04 Backend 전체 130/130 test가 통과했다. 실제 OAuth redirect/callback은 provider token·user-info client를 test stub으로 대체해 state/PKCE/scope/callback, session ID 회전, old cookie 거부와 JDBC session의 local principal-only 저장을 검증했다. Phase B 소스는 opt-in이며 기본값은 `aerotrace.auth.enabled=false`다. Production OAuth app 생성, client secret 배치, Production DB migration/deploy/profile activation과 Frontend 변경은 수행하지 않았다. V1~V9 auth/session fixture를 포함한 full logical backup/restore fingerprint도 기존 검증에서 일치했다. `AUTHENTICATION_OPERATIONS_RUNBOOK.md`와 `USER_DATA_RETENTION_POLICY.md`가 구현·활성화·보존·DR 경계를 설명한다.
 

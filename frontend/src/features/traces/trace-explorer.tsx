@@ -8,6 +8,8 @@ import {
     useState,
 } from "react";
 
+import { sessionFetch } from "@/features/auth/session-client";
+
 import TraceDetailPanel from "@/features/traces/trace-detail-panel";
 
 type TraceListItem = Readonly<{
@@ -514,7 +516,7 @@ function formatDuration(
     ).toFixed(2)} s`;
 }
 
-export default function TraceExplorer() {
+export default function TraceExplorer({ projectId, projectName }: { projectId: string; projectName: string }) {
     const [filterDraft, setFilterDraft] =
         useState<TraceFilterDraft>(
             EMPTY_FILTER_DRAFT,
@@ -665,8 +667,8 @@ export default function TraceExplorer() {
             setErrorMessage("");
 
             try {
-                const response = await fetch(
-                    `/api/traces?${activeQuery}`,
+                const response = await sessionFetch(
+                    `/api/v1/projects/${projectId}/traces?${activeQuery}`,
                     {
                         method: "GET",
                         headers: {
@@ -716,7 +718,7 @@ export default function TraceExplorer() {
         return () => {
             abortController.abort();
         };
-    }, [activeQuery, reloadSequence]);
+    }, [activeQuery, reloadSequence, projectId]);
 
     const longestSpanDurationNano = useMemo(
         () =>
@@ -931,8 +933,8 @@ export default function TraceExplorer() {
         setPaginationErrorMessage("");
 
         try {
-            const response = await fetch(
-                `/api/traces?${query.toString()}`,
+            const response = await sessionFetch(
+                `/api/v1/projects/${projectId}/traces?${query.toString()}`,
                 {
                     method: "GET",
                     headers: {
@@ -1110,7 +1112,7 @@ export default function TraceExplorer() {
                     <div className="topbar-actions">
                         <div className="environment-badge">
                             <span aria-hidden="true"/>
-                            Local development
+                            {projectName}
                         </div>
 
                         <button
@@ -1556,6 +1558,7 @@ export default function TraceExplorer() {
                             ref={detailPanelRef}
                         >
                             <TraceDetailPanel
+                                projectId={projectId}
                                 activeQuery={activeQuery}
                                 onClose={() => {
                                     setSelectedTraceId(null);

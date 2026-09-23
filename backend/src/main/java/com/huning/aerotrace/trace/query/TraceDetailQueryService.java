@@ -1,7 +1,7 @@
 package com.huning.aerotrace.trace.query;
 
 import com.huning.aerotrace.auth.application
-        .AuthenticatedProject;
+        .ProjectScope;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -23,7 +23,7 @@ public class TraceDetailQueryService {
   }
 
   public List<TraceSpanDetail> findTraceSpans(
-          AuthenticatedProject authenticatedProject,
+          ProjectScope authenticatedProject,
           String traceId
   ) {
     Objects.requireNonNull(

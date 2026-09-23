@@ -1,7 +1,7 @@
 # AeroTrace Authentication Operations Runbook
 
-> 마지막 업데이트: 2026-09-04
-> 상태: Phase A 기반과 Phase B Backend OAuth/JDBC session 구현 완료, 기본·Production runtime 비활성, Frontend 미전환
+> 마지막 업데이트: 2026-09-21
+> 상태: Phase C session query·Frontend까지 repository 구현, 기본 Backend/기존 Production 인증은 비활성. 새 Frontend 배포 미실시
 > 범위: 인증 profile과 endpoint, 첫 OWNER invite, activation·rollback·session 폐기, provider/DB 장애와 DR security-state 무효화
 
 ## 1. 현재 운영 경계
@@ -23,17 +23,18 @@ Repository에는 인증과 onboarding의 데이터·권한 기반 및 opt-in Bac
 - Secure/HttpOnly/SameSite=Lax cookie와 session fixation 방어
 - idle 8시간, absolute 7일, user/global session revoke service
 - CSRF, exact Origin, safe redirect와 session-bound auth rate limit
+- Session-authenticated tenant/project metadata와 Trace list/detail API
+- Frontend login/invite/tenant/project/logout, server-only DAL와 session-only BFF
 
-아직 운영에 적용되지 않음 또는 Phase C 이후
+아직 운영에 적용되지 않음 또는 후속 단계
 - Local/Production GitHub OAuth App 생성과 client secret 배치
 - Production `auth-production` profile 활성화와 public traffic 전환
-- Frontend login, invite 입력과 tenant/project selector
-- Session-authenticated trace query와 Frontend `AEROTRACE_API_KEY` 제거
+- 새 Frontend image와 session-only 환경의 Production 전환
 - User/global session revoke operator CLI/API
 - Edge/IP 기반 분산 login rate limit, account export/delete와 retention purge
 ```
 
-기본값은 `aerotrace.auth.enabled=false`이며 이때 auth route는 default-deny되고 ingest/query API Key 경로만 기존대로 동작한다. Phase B source가 배포되거나 V9 table이 존재하는 것만으로 사용자가 로그인할 수 없다. Production OAuth App/secret/profile과 Frontend를 별도 승인 없이 활성화하지 않는다.
+기본값은 `aerotrace.auth.enabled=false`이며 이때 auth route는 default-deny되고 ingest/query API Key 경로만 기존대로 동작한다. V9 table이 존재하는 것만으로 로그인할 수 없다. **Phase C Frontend에는 공용 API Key fallback이 없으므로 단독 배포하면 기존 dashboard를 사용할 수 없다.** Production OAuth App/secret/profile과 Frontend를 별도 승인 없이 활성화하지 않는다.
 
 Codex는 Production migration, bootstrap invite 발급·폐기, session 삭제와 invite 일괄 폐기를 자동 실행하지 않는다. 운영자가 대상 DB와 영향 범위를 확인한 뒤 명시적으로 실행한다.
 
@@ -199,7 +200,7 @@ AEROTRACE_GITHUB_CLIENT_SECRET=<secret>
 
 ## 8. Endpoint와 정상 로그인 흐름
 
-Phase B Backend contract:
+Backend와 same-origin BFF의 현재 contract (API Key self-service는 아직 없음):
 
 | method/path | 인증 | 목적 | 중요 조건 |
 |---|---|---|---|
@@ -208,6 +209,11 @@ Phase B Backend contract:
 | `GET /oauth2/authorization/github` | anonymous 허용 | GitHub authorization 시작 | state + PKCE S256, session rate limit |
 | `GET /login/oauth2/code/github` | OAuth callback | code 교환, identity 확인과 local principal 전환 | exact callback, generic failure |
 | `GET /api/v1/me` | local session 필수 | active user와 active tenant membership 조회 | idle/absolute expiry와 user status 확인, `no-store` |
+| `GET /api/v1/tenants` | local session 필수 | 현재 active membership의 tenant 목록 | role은 응답 metadata이며 Browser가 권한을 지정하지 않음 |
+| `GET /api/v1/tenants/{tenantId}/projects` | local session 필수 | 소속 tenant의 project 목록 | 관계 없음 `404`, 프로젝트 없음 `[]` |
+| `GET /api/v1/projects/{projectId}` | local session 필수 | SSR용 project metadata | active user/membership/project join, 관계 없음 `404` |
+| `GET /api/v1/projects/{projectId}/traces` | local session 필수 | project trace 목록 | `from`/`to` 필수, 기존 query/filter/cursor 계약, `no-store` |
+| `GET /api/v1/projects/{projectId}/traces/{traceId}` | local session 필수 | project 내 trace detail | 타 project 데이터 비노출, `no-store` |
 | `POST /api/v1/logout` | local session 필수 | 현재 session 폐기 | CSRF + exact `Origin`, `204`, `no-store` |
 
 신규 사용자의 순서는 다음과 같다.
@@ -231,11 +237,13 @@ GET /api/v1/auth/csrf
 
 OAuth authorized client는 callback request attribute에만 존재한다. Refresh token, scope 불일치와 예상하지 않은 registration은 거부하고 provider access token은 local identity 확인 뒤 제거한다. JDBC session에는 provider principal/token이 아니라 `userId`와 `authenticatedAt`만 가진 local principal을 저장한다.
 
-Onboarding과 OAuth 시작은 한 anonymous session에서 10분 동안 최대 10회다. 11번째 요청은 `429`와 `Retry-After`를 반환한다. 이는 단일 session abuse 완화일 뿐 IP를 바꾸거나 cookie를 버리는 공격의 분산 제한이 아니므로 public activation에는 edge/IP rate limit과 monitoring이 별도로 필요하다.
+Onboarding과 OAuth 시작은 한 anonymous session에서 10분 동안 최대 10회다. 11번째 요청은 `429`와 `Retry-After`를 반환한다. BFF는 API의 bounded numeric Retry-After를 전달하고 OAuth 실패는 고정 로그인 오류로 변환한다. 이는 단일 session abuse 완화일 뿐 IP를 바꾸거나 cookie를 버리는 공격의 분산 제한이 아니므로 public activation에는 edge/IP rate limit과 monitoring이 별도로 필요하다.
+
+Frontend POST는 exact Origin과 CSRF를 공통 처리한다. Body 제한/형식 검증으로 초대 요청을 거절해도 빈 invite sentinel을 Backend에 보내 CSRF 검증 후 기존 intent를 제거한다. 잘못된 원문은 보내지 않는다. BFF는 Backend의 상세 오류를 노출하지 않고 지정한 session cookie만 전달하며, Cookie의 Path/HttpOnly/SameSite/Secure/no Domain 계약을 검사한다. Browser `Authorization`, `Forwarded`, `X-Forwarded-*`, 사용자 식별 header는 upstream에 전달하지 않는다.
 
 ## 9. Session 수명과 폐기
 
-Spring Session JDBC의 idle timeout은 8시간이고 만료 cleanup은 매분 실행한다. Local principal의 `authenticatedAt`부터 7일이 지나면 `/api/v1/me` 요청에서 session을 무효화한다. Phase C에서 session-authenticated API를 추가할 때 같은 active-user/absolute-expiry 검사를 그 route에도 적용해야 한다.
+Spring Session JDBC의 idle timeout은 8시간이고 만료 cleanup은 매분 실행한다. Local principal의 `authenticatedAt`부터 7일이 지나거나 user가 disabled이면 `/api/v1/me`, tenant/project metadata와 project trace 요청에서 session을 무효화한다. Membership 회수는 session에 저장된 role이 아니라 매 요청 DB join으로 반영한다. 향후 session route 추가 시 같은 검사를 빠뜨리지 않는다.
 
 정상 logout은 Browser가 CSRF token과 exact Origin을 포함해 `POST /api/v1/logout`을 호출하는 방식이다. Disabled user나 현재 사용자 조회용 DB 접근이 실패해도 logout route는 남아 있는 cookie를 폐기할 수 있다.
 
@@ -356,18 +364,18 @@ SELECT
 
 ## 12. Rollback과 장애 처리
 
-기본 profile에서는 login route와 session runtime을 활성화하지 않으므로 repository 배포만으로 사용자의 인증 흐름이 바뀌지 않는다. Flyway V9가 DB에 적용된 뒤에는 table을 임의로 drop하거나 Flyway history를 되돌리지 않는다. 문제가 있으면 먼저 Production에서 auth profile을 비활성화하고 기존 API Key ingest/query 경계를 확인한 뒤 애플리케이션 revision을 이전 것으로 되돌리거나 추가 migration으로 교정한다.
+기본 Backend profile은 인증 비활성이지만 Phase C Frontend는 session-only이므로 image 교체가 기존 dashboard에 영향을 준다. Rollback 시 먼저 외부 UI 접근을 제한하고 승인된 이전 Backend/Frontend image·환경 조합을 복원한다. 인증을 껐다는 이유로 예전 공용 API Key dashboard를 public에 열지 않는다. Flyway V9 table을 drop하거나 history를 되돌리지 않으며 Collector/API Key 경계는 별도로 확인한다.
 
 | 증상 | 조치 |
 |---|---|
 | tenant not found | slug와 대상 DB를 대조한다. Operator는 tenant를 만들지 않는다. |
-| active OWNER exists | operator bootstrap을 사용하지 않는다. Phase B membership 관리 경로를 사용한다. |
+| active OWNER exists | operator bootstrap을 사용하지 않는다. Membership application service는 있지만 운영 CLI/API는 아직 없으므로 관리 경로 구현·승인 없이 SQL로 보호를 우회하지 않는다. |
 | usable bootstrap already exists | 기존 출력의 row UUID를 확인해 전달하거나 폐기한다. 원문을 잃었다면 폐기 후 재발급한다. |
 | wrong confirmation | `ISSUE`/`REVOKE`를 의도한 작업에만 정확히 설정한다. |
 | consumed invite revoke refusal | membership/user incident로 전환한다. Invite row를 삭제하거나 consumed state를 되돌리지 않는다. |
 | provider outage | 신규 login과 기존 JDBC session을 분리해 확인한다. 기존 session을 임의로 전부 삭제하지 않는다. |
 | session compromise | 대상 user UUID가 확정되면 user별 폐기를 우선하고 범위를 모르면 승인 후 global 폐기를 수행한다. |
-| auth activation regression | `auth-production` profile을 제거해 default-disabled 경계로 rollback하고 API Key ingest/query 회귀를 확인한다. |
+| auth activation regression | 외부 UI를 제한한 뒤 이전 image·환경 조합으로 rollback하고 API Key ingest/query 회귀를 확인한다. 새 Frontend에 API Key를 넣는 방식으로 우회하지 않는다. |
 
 ## 13. 자동 검증
 
@@ -403,9 +411,33 @@ Production __Host cookie의 Secure/HttpOnly/SameSite/Path/no Domain
 
 2026-09-04 격리 Java 21 + tmpfs TimescaleDB에서 auth infrastructure 선택 테스트 39/39와 Backend 전체 29 suite, 130/130이 통과했다. Provider token과 user-info network call은 test stub으로 대체했고 Production OAuth App, secret, DB와 runtime은 변경하지 않았다.
 
+Phase C 검증은 Backend 30 suite, 140 test와 Frontend standalone HTTP 10개 scenario(+parent test)를 추가 확인한다. Backend는 role별 read, 타 tenant/project·cursor 경계, 즉시 membership 회수와 모든 session read의 disabled/absolute expiry를 검증한다. Frontend는 proxy allowlist·Host/Origin/CSRF·Cookie/redirect·cross-user SSR·malformed invite sentinel·safe error를 검증하며 CI에 포함한다. Chromium fixture smoke에서 프로젝트 변경의 이전 상세/커서 제거, 조직 변경, logout과 보호 화면 복귀도 확인했다. 이는 실제 GitHub provider E2E를 대체하지 않는다.
+
 Database backup/restore acceptance는 V1~V9와 auth/session fixture를 full archive로 복원하고 11개 필수 table, aggregate count와 one-way fingerprint가 source/target에서 일치하는지 확인한다.
 
-## 14. Production activation checkpoint
+## 14. Local 준비와 Production activation checkpoint
+
+### 14.1 Local opt-in 구성
+
+Local GitHub OAuth App의 callback을 `http://127.0.0.1:3000/login/oauth2/code/github`로 설정하고 같은 origin으로 Frontend를 연다. 원격 SSH 서버에서 개발할 때도 승인된 port forwarding 등을 통해 브라우저의 loopback과 연결해야 한다. 이 예시를 서버의 public HTTP 주소로 바꾸지 않는다.
+
+```bash
+cp auth.env.example auth.env
+chmod 600 auth.env
+```
+
+`auth.env`에는 Local App client ID/secret과 `SPRING_PROFILES_ACTIVE=auth-local`을 넣는다. `frontend.env`는 `frontend.env.example`을 기준으로 public origin이 같고 insecure flag가 `true`인지 확인한다. Frontend에는 OAuth secret이나 Project API Key를 넣지 않는다. 실제 secret 파일 내용은 출력하지 않는다.
+
+기존 README의 DB/Collector 준비가 끝난 Local 환경에서만 다음 opt-in overlay를 추가한다. 이 명령은 deployment를 수행하므로 Production에는 별도 승인 없이 실행하지 않는다.
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.app.yaml -f docker-compose.auth.yaml --profile app config --quiet
+docker compose -f docker-compose.yaml -f docker-compose.app.yaml -f docker-compose.auth.yaml --profile app up -d --build
+```
+
+첫 OWNER는 3·4절의 operator 절차로 기존 tenant에 invite를 발급하고 `/login`에서 입력한다. `GET /health`는 Frontend 프로세스 liveness만 뜻한다. 실제 완료 조건은 callback 성공, 조직/프로젝트 목록, 권한 있는 Trace 조회와 logout이다. 기존 PowerShell runtime helper는 이 auth overlay를 자동 추가하지 않는다.
+
+### 14.2 Production 승인 조건
 
 Repository 구현만으로 아래 운영 checkpoint가 완료된 것은 아니다. Production login은 각 항목의 evidence와 rollback 승인을 확보한 뒤 별도 change로 활성화한다.
 
@@ -421,11 +453,16 @@ Repository 구현만으로 아래 운영 checkpoint가 완료된 것은 아니�
 - [ ] Local/Production GitHub OAuth App 분리 생성과 secret custody/rotation rehearsal
 - [ ] Production DB backup 승인 뒤 V9 migration 및 auth profile deployment
 - [ ] Edge/IP 분산 rate limit과 auth monitoring/alert
-- [ ] Frontend Phase C same-origin session/CSRF proxy와 API Key 제거
+- [x] Frontend Phase C same-origin session/CSRF proxy와 API Key 제거 (repository)
+- [ ] 실제 GitHub OAuth Local E2E와 Production Frontend/Backend 동시 전환 승인
 - [ ] User/global revoke의 안전한 operator entry point 또는 승인된 SQL rehearsal
 - [ ] 사용자 export/delete, purge와 backup 잔존 기간 확정
 - [ ] Production-sized encrypted off-host backup/upload/download/restore rehearsal
 - [ ] Activation canary, legacy ingest/query 회귀와 default-disabled rollback rehearsal
+
+Production은 별도 OAuth App, HTTPS public origin, `auth-production`과 Frontend insecure flag `false`가 필요하다. Backend/DB를 public에 직접 노출하지 않고 edge는 승인된 public Host를 보존한다. OAuth callback query/code, Cookie, invite body를 edge/access log에 남기지 않도록 검증한다. 기본 Compose port는 개발용이므로 기존 prod/edge overlay와 정책 검토를 생략하지 않는다.
+
+Phase C는 DB schema 변경이 없다. 현재 보류된 production-sized encrypted off-host backup은 실제 사용자 data 수집 전 별도 필수 checkpoint로 유지한다.
 
 ## 15. 관련 문서
 

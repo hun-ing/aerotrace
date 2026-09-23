@@ -1,0 +1,6 @@
+# Explicit opt-in. Supply auth.env and matching frontend.env; see authentication runbook.
+# This file does not enable TLS or make the default development ports safe for public exposure.
+services:
+  backend:
+    env_file:
+      - ./auth.env

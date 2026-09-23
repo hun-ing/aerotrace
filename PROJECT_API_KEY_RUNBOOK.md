@@ -1,10 +1,12 @@
 # AeroTrace Project API Key Lifecycle Runbook
 
-> 마지막 업데이트: 2026-08-25
+> 마지막 업데이트: 2026-09-16
 > 상태: Operator 발급·조회·교체·폐기 구현 및 ephemeral acceptance 완료
-> 범위: 기존 tenant/project에 연결되는 Collector와 Frontend server-side Project API Key
+> 범위: Collector workload API Key와 아직 배포 중인 legacy Frontend Key. Phase C Frontend는 session-only이며 Key를 사용하지 않음
 
 ## 1. 목적과 경계
+
+**먼저 배포 revision을 확인한다.** 현재 repository Phase C Frontend에는 API Key를 주입하지 않는다. 기존 Production image가 legacy일 때만 아래의 두 client 갱신 절차를 사용한다. Phase C가 실제 배포된 뒤에는 Collector와 별도 legacy API Key client만 rotation 대상이며 로그인 UI 조회 성공을 API Key 검증으로 세지 않는다.
 
 Project API Key 원문은 발급 순간에만 확인할 수 있고 DB에는 SHA-256 hash만 저장된다. 원문을 분실하면 복구할 수 없으므로 새 Key를 발급해야 하며, 노출된 Key는 폐기해야 한다.
 
@@ -139,7 +141,11 @@ unset AEROTRACE_API_KEY_NAME AEROTRACE_API_KEY_EXPIRATION_DAYS
 
 원문을 안전하게 저장하기 전에 잃어버렸다면 이전 Key를 폐기하지 않는다. 분실한 새 Key의 metadata를 폐기하고 다른 이름으로 다시 발급한다.
 
-### 5.3 두 사용처 갱신
+### 5.3 사용처 갱신 — 배포 revision별 분기
+
+Phase C session-only Frontend 배포 후에는 `otel-collector.env` 등 실제 workload client의 secret만 교체하고 해당 Collector만 재생성한다. Frontend에는 Key를 넣거나 rotation 목적으로 재생성하지 않는다. Production overlay를 포함한 정확한 명령은 운영 승인 시 확정하며 아래 기본 개발 명령을 그대로 적용하지 않는다.
+
+아래 두 사용처 예시는 **legacy Frontend image가 배포 중일 때만** 적용한다.
 
 현재 runtime에서는 같은 새 원문을 다음 server-side secret에 넣는다.
 
@@ -165,13 +171,13 @@ docker compose \
 
 ### 5.4 새 Key 검증
 
-Frontend BFF query가 200인지 확인한다. 브라우저나 curl에는 원문 Key가 노출되지 않는다.
+Legacy Frontend만 아래 BFF query로 Key 경계를 확인한다. 기간은 예시이며 필요한 조회 범위로 바꾼다. 브라우저나 curl에는 원문 Key가 노출되지 않는다. Phase C에서는 이 Frontend route가 `404`인 것이 정상이며 Collector ingest와 승인된 legacy Backend Key client로 Key를 별도 검증한다.
 
 ```bash
 curl --silent --show-error \
   --output /dev/null \
   --write-out 'frontend_trace_query_http=%{http_code}\n' \
-  'http://127.0.0.1:3000/api/traces?limit=1'
+  'http://127.0.0.1:3000/api/traces?from=2026-09-01T00%3A00%3A00Z&to=2026-09-02T00%3A00%3A00Z&limit=1'
 ```
 
 Collector ingest를 실제로 확인해야 할 때는 승인된 controlled smoke로 한 synthetic span만 전송한다.
@@ -225,7 +231,7 @@ bash ./gradlew manageProjectApiKeys --no-daemon
 unset AEROTRACE_API_KEY_ALLOW_LAST_ACTIVE
 ```
 
-이 명령에도 `ACTION=revoke`, tenant/project slug, row UUID, expected name과 `CONFIRM_REVOKE=REVOKE`가 모두 필요하다. 결과의 active count가 0이면 Collector ingest와 Frontend query는 replacement 배포 전까지 인증 실패한다.
+이 명령에도 `ACTION=revoke`, tenant/project slug, row UUID, expected name과 `CONFIRM_REVOKE=REVOKE`가 모두 필요하다. 결과의 active count가 0이면 Collector ingest와 legacy API Key query는 replacement 배포 전까지 인증 실패한다. Phase C 사용자 session 자체가 이 명령으로 폐기되지는 않는다.
 
 긴급 순서:
 
